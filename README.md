@@ -193,8 +193,8 @@ Installing from here doesn't cut off running work. If coding sessions are
 running, the app asks first: it can install as soon as they finish, starting no
 new work on this computer until then (the menu shows **"Updating after current
 work"**), or keep the update in the menu for later. Choosing to install
-while an update is already waiting offers to install right away instead, which
-stops the sessions still running. If an update you asked for can't install, the
+while an update is already waiting for running sessions offers to install right
+away instead, which stops them. If an update you asked for can't install, the
 app tells you why and keeps it in the menu so you can try again.
 
 If you're already current, it tells you so.

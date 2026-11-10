@@ -2342,6 +2342,153 @@ func TestManualUpdate_CheckAndOfferBuildKeepsTheImmediatePath(t *testing.T) {
 	}
 }
 
+// With nothing running, "install now" has no work to spare, so a click while
+// an update is still downloading must not offer it. The immediate install
+// skips the drain, admission is still open during its download, and a session
+// admitted then is cut off at the restart (11-04: 3.7 s before it). The
+// running attempt takes the request over and waits for that session instead.
+func TestManualUpdate_ClickWhileAnUpdateDownloadsWithNothingRunningJoinsIt(t *testing.T) {
+	r, dialog := newManualRig(t, registeredCfg())
+	dialog.answer = true // asked at all, Yes would install at once
+	r.activeWork = 0
+	seen := observeApply(r)
+	downloading := make(chan struct{})
+	release := make(chan struct{})
+	var downloads atomic.Int32
+	r.au.downloadVerify = func(ctx context.Context, _ *UpdateInfo) (string, error) {
+		if downloads.Add(1) == 1 {
+			close(downloading)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+		return "/tmp/verified.bin", nil
+	}
+	polls := 0
+	r.au.sleep = func(d time.Duration) bool {
+		if r.au.takeoverRequested() {
+			return false
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.clock = r.clock.Add(d)
+		polls++
+		if polls == 2 {
+			r.activeWork = 0 // the session admitted during the download finishes
+		}
+		return true
+	}
+
+	attemptDone := startScheduledAttempt(t, r)
+	receiveWithin(t, downloading, "the scheduled attempt to start its download")
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+	if got := dialog.questions(); len(got) != 0 {
+		t.Fatalf("nothing was running, yet the click asked %q", got)
+	}
+	r.mu.Lock()
+	r.activeWork = 1 // a session admitted while the update downloads
+	r.mu.Unlock()
+	close(release)
+	receiveWithin(t, attemptDone, "the attempt to install")
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(*seen) != 1 {
+		t.Fatalf("installs = %d, want exactly the drained one", len(*seen))
+	}
+	if got := (*seen)[0]; got.work != 0 || !got.draining || got.enters == 0 {
+		t.Fatalf("install started with %+v; the session admitted during the download must finish first, behind a reported drain", got)
+	}
+}
+
+// Once the attempt has closed admission, installing now keeps it closed, so
+// the offer comes back even with nothing running. It is the only way out of a
+// drain the service never accepted: while this computer still counts as
+// connected, that drain holds the install until the 7-day deadline.
+func TestManualUpdate_ClickDuringADrainTheServiceNeverAcceptedStillOffersInstallNow(t *testing.T) {
+	r, dialog := newManualRig(t, registeredCfg())
+	dialog.answer = true
+	r.activeWork = 0
+	seen := observeApply(r)
+	r.au.drainEnter = func(_ context.Context, _, _ string) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.drainEnter++
+		return errors.New("terminal-service unavailable")
+	}
+	polls := steppedSleep(r)
+
+	attemptDone := startScheduledAttempt(t, r)
+	receiveWithin(t, polls, "the scheduled attempt to wait in its drain")
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+	wantTitle, _ := manualInstallNowPrompt(0)
+	if got := dialog.questions(); len(got) != 1 || got[0] != wantTitle {
+		t.Fatalf("questions asked = %q, want exactly %q", got, wantTitle)
+	}
+	receiveWithin(t, attemptDone, "the waiting attempt to yield")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(*seen) != 1 {
+		t.Fatalf("installs = %d, want exactly the immediate one", len(*seen))
+	}
+	if !(*seen)[0].draining {
+		t.Fatal("installing now reopened admission before the install")
+	}
+}
+
+// A request whose attempt finds no newer release when it checks again must
+// not end in silence. Non-prod channels delete and recreate their release, so
+// that check can miss the release the user's own check just found. The user
+// is told, and the release goes back on the menu for another try.
+func TestManualUpdate_NoNewerReleaseOnTheRecheckIsReportedAndOfferedAgain(t *testing.T) {
+	cfg := registeredCfg()
+	cfg.SetAutoUpdate(false) // so only the click can start an attempt
+	r, _ := newManualRig(t, cfg)
+	r.activeWork = 0
+	r.au.checkForUpdate = func(_ context.Context) (*UpdateInfo, error) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.checkCalls++
+		return &UpdateInfo{Available: false, CurrentVersion: Version}, nil // the release is being republished
+	}
+	reported := make(chan error, 1)
+	r.au.manualFailed = func(_ string, err error) { reported <- err }
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+	r.au.tick()
+
+	select {
+	case err := <-reported:
+		if !errors.Is(err, errNoNewerRelease) {
+			t.Fatalf("reported %v, want %v", err, errNoNewerRelease)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the user's request ended without telling them")
+	}
+	if got := GetPendingUpdate(); got != r.info {
+		t.Fatalf("pending update = %+v, want the requested release offered again", got)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.checkCalls != 1 || r.verifyCalls != 0 || r.applyCalls != 0 {
+		t.Fatalf("check=%d verify=%d apply=%d, want one check and nothing installed",
+			r.checkCalls, r.verifyCalls, r.applyCalls)
+	}
+	if len(r.pendingShown) != 1 || r.pendingShown[0] != r.info.LatestVersion {
+		t.Fatalf("menu offers = %v, want Install Update (%s)", r.pendingShown, r.info.LatestVersion)
+	}
+}
+
 func TestRunningSessionsPhrase(t *testing.T) {
 	for n, want := range map[int]string{1: "1 coding session is", 2: "2 coding sessions are", 7: "7 coding sessions are"} {
 		if got := runningSessionsPhrase(n); got != want {

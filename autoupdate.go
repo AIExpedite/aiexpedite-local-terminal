@@ -498,7 +498,8 @@ func (au *autoUpdater) recoveryContext(timeout time.Duration) (context.Context, 
 }
 
 // nudge asks the scheduler to run a check soon without an app restart. Called
-// when the user turns the preference on. Non-blocking / coalescing.
+// when the user turns the preference on, and by requestManualInstall so a
+// user's request starts at once. Non-blocking / coalescing.
 func (au *autoUpdater) nudge() {
 	if au == nil {
 		return
@@ -569,7 +570,7 @@ func (au *autoUpdater) stopForShutdown() (drainAttemptID string, updateHandoff b
 }
 
 // run is the scheduling loop: first check after the initial delay, then every
-// interval, plus on an enable-nudge.
+// interval, plus on a nudge (the preference turned on, or a user's request).
 func (au *autoUpdater) run() {
 	first := time.NewTimer(autoUpdateFirstCheckDelay)
 	defer first.Stop()
@@ -1249,7 +1250,7 @@ func installUpdateManually(info *UpdateInfo) error {
 // Why an attempt stopped short of installing, as the user is told when it was
 // one they asked for (reportManualOutcome).
 var (
-	errNoNewerRelease         = errors.New("no newer release is available")
+	errNoNewerRelease         = errors.New("no newer release was available when the app checked again")
 	errRegistrationInProgress = errors.New("this device is being registered; try again once registration finishes")
 	errEarlierAttemptSettled  = errors.New("AI Expedite finished cleaning up an earlier update attempt; try again")
 	errEarlierAttemptPending  = errors.New("AI Expedite is still cleaning up an earlier update attempt; try again in a few minutes")
@@ -1270,6 +1271,13 @@ var (
 //   - an attempt is already running: it will install once work finishes, so
 //     ask whether to install now instead (which stops running work). Yes is
 //     the immediate install; No leaves it waiting, now as the user's request.
+//     While the attempt is still checking or downloading, admission is open.
+//     If nothing is running then, nothing is asked and the attempt takes the
+//     request over, as No does: installing now would stop nothing, but it
+//     skips the drain, so a session admitted during its download would be cut
+//     off at the restart. Once the attempt has closed admission, installing
+//     now keeps it closed, so the question is asked even with nothing
+//     running: it is the only way out of a drain the service never accepted.
 //   - work is running: ask whether to install once it finishes. Yes queues
 //     the request (requestManualInstall); No keeps the update on the menu.
 //   - nothing is running: queue the request without asking. Going through the
@@ -1289,6 +1297,7 @@ func (au *autoUpdater) handleManualInstall(info *UpdateInfo) error {
 	immediate := au.manualInProgress
 	sealed := au.installing || au.applying
 	waiting := au.inProgress
+	admissionClosed := au.drainAttempt != ""
 	au.mu.Unlock()
 	switch {
 	case stopping:
@@ -1300,6 +1309,13 @@ func (au *autoUpdater) handleManualInstall(info *UpdateInfo) error {
 	}
 
 	running := au.activeWork()
+	if waiting && running == 0 && !admissionClosed {
+		if err := au.requestManualInstall(info); err != nil {
+			return err
+		}
+		fmt.Println("[update] Manual update: an update is already being checked or downloaded and nothing is running; it installs as soon as it is ready")
+		return nil
+	}
 	if waiting {
 		fmt.Printf("[update] Manual update: an update is already waiting for running work (%d running); asking whether to install now\n", running)
 		title, message := manualInstallNowPrompt(running)
@@ -1366,11 +1382,13 @@ func (au *autoUpdater) requestManualInstall(info *UpdateInfo) error {
 // reportManualOutcome tells the user that an update they asked for stopped
 // short of installing, as the immediate install always did ("Update Failed"),
 // and puts the release back on the menu so one click asks again.
+//
+// That includes a check that found nothing newer (errNoNewerRelease). The
+// user's own check found a release moments ago, and a non-prod channel
+// deletes and recreates its release, so this check can miss it. A request
+// that joined a scheduled attempt as its check came up empty also ends here.
+// Either way, an explicit request must not end in silence.
 func (au *autoUpdater) reportManualOutcome(info *UpdateInfo, failure error) {
-	if errors.Is(failure, errNoNewerRelease) {
-		fmt.Println("[update] Manual update: no newer release is available any more; nothing to install")
-		return
-	}
 	if failure == nil {
 		failure = errManualUpdateIncomplete
 	}
