@@ -1256,6 +1256,101 @@ func TestEnsureClaudeStatusLineHookIfStale_RestoresBothHooksAfterARewrite(t *tes
 	}
 }
 
+// A foreign writer (a Claude Code update, a /config change) can rewrite
+// settings.json between our repair write and the stamp we record for it. The
+// reconcile used to re-Stat and record that FOREIGN file as verified, so every
+// later reconcile skipped on the unchanged stamp and the hooks stayed missing
+// until the agent restarted. The stamp is now recorded only for content
+// verified as ours, so the next reconcile repairs again — while a rewrite that
+// keeps our hooks is still verified once and never rewritten.
+func TestEnsureClaudeStatusLineHookIfStale_ForeignRewriteDuringRepairIsRepairedNext(t *testing.T) {
+	cases := []struct {
+		name string
+		// initial is settings.json before the first reconcile; "" = absent, which
+		// takes the full-ensure branch rather than the partial repair.
+		initial string
+		// foreign rewrites the file inside the window; it returns the new content.
+		foreign func(t *testing.T, settingsPath string) []byte
+		// wantRepair: the second reconcile must rewrite the file.
+		wantRepair bool
+	}{
+		{
+			name:       "absent file, hooks dropped in the window",
+			initial:    "",
+			foreign:    func(*testing.T, string) []byte { return []byte(`{"theme":"dark","hooks":{}}`) },
+			wantRepair: true,
+		},
+		{
+			name:       "existing file, hooks dropped in the window",
+			initial:    `{"theme":"dark"}`,
+			foreign:    func(*testing.T, string) []byte { return []byte(`{"theme":"dark","hooks":{}}`) },
+			wantRepair: true,
+		},
+		{
+			name:    "existing file, hooks kept in the window",
+			initial: `{"theme":"dark"}`,
+			foreign: func(t *testing.T, settingsPath string) []byte {
+				settings := readSettingsMap(t, settingsPath)
+				settings["model"] = "opus"
+				b, err := json.Marshal(settings)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return b
+			},
+			wantRepair: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home, settingsPath := armStatusLineReconcile(t)
+			resetClaudeUsageProbeGate()
+			SetClaudeUsageProbeDisabled(false)
+			t.Cleanup(resetClaudeUsageProbeGate)
+			if tc.initial != "" {
+				if err := os.WriteFile(settingsPath, []byte(tc.initial), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			prevSeam := claudeSettingsAfterRepairWrite
+			t.Cleanup(func() { claudeSettingsAfterRepairWrite = prevSeam })
+			fired := false
+			claudeSettingsAfterRepairWrite = func(path string) {
+				if fired {
+					return
+				}
+				fired = true
+				if err := os.WriteFile(path, tc.foreign(t, path), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
+				t.Fatalf("first reconcile: changed=%v err=%v", changed, err)
+			}
+			if !fired {
+				t.Fatal("the foreign rewrite never ran inside the repair window")
+			}
+
+			clearStatusLineReconcileThrottle()
+			changed, err := ensureClaudeStatusLineHookIfStale(home)
+			if err != nil {
+				t.Fatalf("second reconcile: %v", err)
+			}
+			if changed != tc.wantRepair {
+				t.Fatalf("second reconcile changed=%v, want %v", changed, tc.wantRepair)
+			}
+			if sl, re := claudeHookEntries(t, settingsPath); !sl || !re {
+				t.Fatalf("after the second reconcile: statusLine=%v runEnd=%v, want both", sl, re)
+			}
+			if readSettingsMap(t, settingsPath)["theme"] != "dark" {
+				t.Error("the user's other settings were not preserved")
+			}
+		})
+	}
+}
+
 // With `disable_claude_usage_probe` on, the reconcile keeps the status line
 // but removes the run-end hook instead of restoring it.
 func TestEnsureClaudeStatusLineHookIfStale_ProbeOptOutRemovesTheRunEndHook(t *testing.T) {
