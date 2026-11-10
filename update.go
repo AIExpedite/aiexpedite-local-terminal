@@ -376,10 +376,12 @@ func downloadAndVerifyUpdate(info *UpdateInfo) (string, error) {
 }
 
 // downloadAndApplyUpdate downloads + verifies the update and applies it right
-// away (the manual "Update Now" / "Install Update" path — the user asked for it
-// explicitly, so it does NOT drain first). The automatic path calls
-// downloadAndVerifyUpdate and applyVerifiedUpdate separately with a drain in
-// between.
+// away, without a drain. Besides the uncalled legacy checkForUpdate, only the
+// fallbacks use it: a manual install when no update scheduler is running, and
+// the check-and-offer macOS build. A manual "Update Now" otherwise goes
+// through the scheduler's drain and waits for running work
+// (installUpdateManually); the automatic path calls downloadAndVerifyUpdate
+// and applyVerifiedUpdate separately with a drain in between.
 func downloadAndApplyUpdate(info *UpdateInfo) error {
 	// Non-capable macOS channels (dev/stg) publish a signed DMG whose app
 	// bundle is notarized, but the DMG container itself is not, and those

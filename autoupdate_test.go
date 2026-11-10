@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1716,5 +1717,648 @@ func TestExitDrain_SchedulesRetryOnTimeout(t *testing.T) {
 	})
 	if retained != "test-attempt" {
 		t.Fatalf("attempt marker must be retained across timeout, got %q", retained)
+	}
+}
+
+/* ──────────── manual installs ("Update Now") wait for running work ─────────── */
+
+// manualDialog answers the Yes/No questions a manual install asks and records
+// each one, so a test asserts both what was asked and what happened next.
+type manualDialog struct {
+	mu     sync.Mutex
+	answer bool
+	asked  []string // titles, in order
+}
+
+func (d *manualDialog) confirm(title, _ string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.asked = append(d.asked, title)
+	return d.answer
+}
+
+func (d *manualDialog) questions() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.asked...)
+}
+
+// newManualRig is newAutoTestRig installed as the app's scheduler, so a test
+// drives the entry point both tray items call (installUpdateManually).
+func newManualRig(t *testing.T, cfg *Config) (*autoTestRig, *manualDialog) {
+	t.Helper()
+	r := newAutoTestRig(t, cfg)
+	dialog := &manualDialog{}
+	r.au.confirm = dialog.confirm
+
+	previous := globalAutoUpdater
+	globalAutoUpdater = r.au
+	t.Cleanup(func() { globalAutoUpdater = previous })
+
+	updateMutex.Lock()
+	previousPath, previousPending := updatePath, updatePending
+	updatePath, updatePending = "", false
+	updateMutex.Unlock()
+	t.Cleanup(func() {
+		updateMutex.Lock()
+		updatePath, updatePending = previousPath, previousPending
+		updateMutex.Unlock()
+	})
+
+	ClearPendingUpdate()
+	t.Cleanup(ClearPendingUpdate)
+	return r, dialog
+}
+
+// applyObservation is the state the install found when it started.
+type applyObservation struct {
+	work     int  // units of work still running
+	draining bool // admission closed
+	enters   int  // drain reports the service had received
+}
+
+// observeApply records what each install saw. The slice is written under r.mu.
+func observeApply(r *autoTestRig) *[]applyObservation {
+	seen := &[]applyObservation{}
+	r.au.apply = func(_ string, _ *UpdateInfo) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.applyCalls++
+		*seen = append(*seen, applyObservation{work: r.activeWork, draining: isDraining(), enters: r.drainEnter})
+		return r.applyErr
+	}
+	return seen
+}
+
+// steppedSleep parks the attempt at every sleep until the test receives from
+// the returned channel, so a test can act while an attempt waits in its drain.
+// A takeover or stop releases it, as the real sleep does.
+func steppedSleep(r *autoTestRig) <-chan struct{} {
+	polls := make(chan struct{})
+	r.au.sleep = func(d time.Duration) bool {
+		select {
+		case polls <- struct{}{}:
+		case <-r.au.getTakeoverCh():
+			return false
+		case <-r.au.stopCh:
+			return false
+		}
+		r.mu.Lock()
+		r.clock = r.clock.Add(d)
+		r.mu.Unlock()
+		return true
+	}
+	return polls
+}
+
+// startScheduledAttempt runs one scheduled attempt in the background, as the
+// scheduler's tick does, and returns a channel closed when it ends. The
+// attempt is stopped at cleanup if the test left it waiting.
+func startScheduledAttempt(t *testing.T, r *autoTestRig) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		r.au.tick()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		r.au.stop()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("the scheduled attempt did not end after stop")
+		}
+	})
+	return done
+}
+
+func receiveWithin(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// The incident (Ship runs 01M6M2BAMTKPCFVW10R4YQPTZ3 / 01M6MCXA57W6CF02TPPKCP4JH1):
+// "Update Now" with Claude Code sessions running installed at once, the
+// restart orphaned them and their runs parked. The click must instead ask,
+// close admission, tell the service, and install only once the work is done.
+func TestManualUpdate_WaitsForRunningWorkBeforeInstalling(t *testing.T) {
+	r, dialog := newManualRig(t, registeredCfg())
+	dialog.answer = true
+	r.activeWork = 2
+	seen := observeApply(r)
+	polls := 0
+	r.au.sleep = func(d time.Duration) bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.clock = r.clock.Add(d)
+		polls++
+		if polls%3 == 0 && r.activeWork > 0 {
+			r.activeWork-- // a session finishes every third poll
+		}
+		return true
+	}
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+
+	wantTitle, _ := manualWaitForWorkPrompt(2, r.info.LatestVersion)
+	if got := dialog.questions(); len(got) != 1 || got[0] != wantTitle {
+		t.Fatalf("questions asked = %q, want exactly %q", got, wantTitle)
+	}
+	r.mu.Lock()
+	applied, checked := r.applyCalls, r.checkCalls
+	r.mu.Unlock()
+	if applied != 0 || checked != 0 {
+		t.Fatalf("the click itself must not install while work runs (check=%d apply=%d)", checked, applied)
+	}
+	if got := len(r.au.triggerCh); got != 1 {
+		t.Fatalf("the request must wake the scheduler; trigger queue holds %d", got)
+	}
+
+	r.au.tick() // the scheduler, woken by that nudge
+
+	if len(*seen) != 1 {
+		t.Fatalf("installs = %d, want 1 once the work finished", len(*seen))
+	}
+	got := (*seen)[0]
+	if got.work != 0 {
+		t.Fatalf("installed with %d unit(s) of work still running", got.work)
+	}
+	if !got.draining {
+		t.Fatal("admission must be closed when the install starts")
+	}
+	if got.enters == 0 {
+		t.Fatal("the service must have accepted the drain before the install")
+	}
+	if polls < 6 {
+		t.Fatalf("the install did not wait for the work to finish (%d polls)", polls)
+	}
+}
+
+// The preference governs scheduled updates only. A user who turned it off and
+// then clicked Update Now still gets the update, through the drain.
+func TestManualUpdate_InstallsWithAutomaticUpdateOff(t *testing.T) {
+	cfg := registeredCfg()
+	cfg.SetAutoUpdate(false)
+	r, dialog := newManualRig(t, cfg)
+	r.activeWork = 0
+	seen := observeApply(r)
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+	r.au.tick()
+
+	if len(*seen) != 1 {
+		t.Fatalf("installs with the preference off = %d, want 1", len(*seen))
+	}
+	if got := (*seen)[0]; !got.draining || got.enters == 0 {
+		t.Fatalf("the install must go through the drain, saw %+v", got)
+	}
+	if got := dialog.questions(); len(got) != 0 {
+		t.Fatalf("nothing was running, yet the click asked %q", got)
+	}
+}
+
+// Turning the preference off mid-drain cancels a scheduled update. It must
+// not cancel one the user asked for.
+func TestManualUpdate_PreferenceTurnedOffMidDrainDoesNotCancelIt(t *testing.T) {
+	cfg := registeredCfg()
+	r, dialog := newManualRig(t, cfg)
+	dialog.answer = true
+	r.activeWork = 1
+	seen := observeApply(r)
+	polls := 0
+	r.au.sleep = func(d time.Duration) bool {
+		r.mu.Lock()
+		r.clock = r.clock.Add(d)
+		polls++
+		n := polls
+		if n == 3 {
+			r.activeWork = 0
+		}
+		r.mu.Unlock()
+		if n == 1 {
+			cfg.SetAutoUpdate(false) // on the attempt's own goroutine, as in the scheduled-path test
+		}
+		return true
+	}
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+	r.au.tick()
+
+	for _, reason := range r.drainExitR {
+		if reason == "preference_off" {
+			t.Fatalf("a requested update was cancelled by the preference (exits %v)", r.drainExitR)
+		}
+	}
+	if len(*seen) != 1 || (*seen)[0].work != 0 {
+		t.Fatalf("installs = %+v, want one once the work finished", *seen)
+	}
+}
+
+// A device that deferred an update sits out a 24h cooldown. That governs the
+// scheduled checks; the user's click does not wait a day.
+func TestManualUpdate_BypassesTheDeferCooldown(t *testing.T) {
+	r, _ := newManualRig(t, registeredCfg())
+	r.activeWork = 0
+	seen := observeApply(r)
+	r.au.mu.Lock()
+	r.au.deferredUntil = r.au.now().Add(autoUpdateDeferCooldown)
+	r.au.mu.Unlock()
+
+	r.au.tick()
+	if r.checkCalls != 0 {
+		t.Fatalf("a scheduled check ran inside the cooldown (check=%d)", r.checkCalls)
+	}
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+	r.au.tick()
+
+	if len(*seen) != 1 {
+		t.Fatalf("installs = %d, want 1: a request must not wait out the cooldown", len(*seen))
+	}
+	if got := (*seen)[0]; !got.draining || got.enters == 0 {
+		t.Fatalf("the install must go through the drain, saw %+v", got)
+	}
+}
+
+// The download takes a while, and the cloud can send work meanwhile: on 11-04
+// a session was admitted 3.7 s before the restart. Nothing was running at the
+// click, so nothing is asked, but that session must still be waited for
+// rather than cut off.
+func TestManualUpdate_WorkAdmittedDuringTheDownloadIsWaitedFor(t *testing.T) {
+	r, dialog := newManualRig(t, registeredCfg())
+	r.activeWork = 0
+	r.au.downloadVerify = func(_ context.Context, _ *UpdateInfo) (string, error) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.verifyCalls++
+		r.activeWork = 1 // a session admitted while the update downloads
+		return "/tmp/verified.bin", nil
+	}
+	seen := observeApply(r)
+	polls := 0
+	r.au.sleep = func(d time.Duration) bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.clock = r.clock.Add(d)
+		polls++
+		if polls == 3 {
+			r.activeWork = 0
+		}
+		return true
+	}
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+	if got := dialog.questions(); len(got) != 0 {
+		t.Fatalf("nothing was running at the click, yet it asked %q", got)
+	}
+	r.au.tick()
+
+	if len(*seen) != 1 {
+		t.Fatalf("installs = %d, want 1", len(*seen))
+	}
+	if got := (*seen)[0]; got.work != 0 || !got.draining {
+		t.Fatalf("install started with work=%d draining=%v; the session admitted during the download must finish first",
+			got.work, got.draining)
+	}
+}
+
+// With nothing running, the click installs promptly: through the real
+// scheduler loop, and still behind closed admission and a reported drain.
+func TestManualUpdate_NothingRunningInstallsPromptlyThroughTheDrain(t *testing.T) {
+	cfg := registeredCfg()
+	cfg.SetAutoUpdate(false) // so only the click can start an attempt
+	r, dialog := newManualRig(t, cfg)
+	r.activeWork = 0
+	installed := make(chan applyObservation, 1)
+	r.au.apply = func(_ string, _ *UpdateInfo) error {
+		r.mu.Lock()
+		r.applyCalls++
+		obs := applyObservation{work: r.activeWork, draining: isDraining(), enters: r.drainEnter}
+		r.mu.Unlock()
+		installed <- obs
+		return nil
+	}
+	go r.au.run()
+	t.Cleanup(r.au.stop)
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+
+	select {
+	case got := <-installed:
+		if !got.draining || got.enters == 0 {
+			t.Fatalf("install started with draining=%v and %d drain report(s); it must go through the drain",
+				got.draining, got.enters)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the scheduler did not install the requested update")
+	}
+	if got := dialog.questions(); len(got) != 0 {
+		t.Fatalf("nothing was running, yet the click asked %q", got)
+	}
+}
+
+// "No" to waiting keeps the update for later and installs nothing.
+func TestManualUpdate_DeclinedWhileWorkRunsKeepsTheUpdatePending(t *testing.T) {
+	cfg := registeredCfg()
+	cfg.SetAutoUpdate(false) // so a request is the only thing that could start an attempt
+	r, dialog := newManualRig(t, cfg)
+	dialog.answer = false
+	r.activeWork = 1
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+
+	wantTitle, _ := manualWaitForWorkPrompt(1, r.info.LatestVersion)
+	if got := dialog.questions(); len(got) != 1 || got[0] != wantTitle {
+		t.Fatalf("questions asked = %q, want exactly %q", got, wantTitle)
+	}
+	if got := GetPendingUpdate(); got != r.info {
+		t.Fatalf("pending update = %+v, want the declined release kept for later", got)
+	}
+	if len(r.pendingShown) != 1 || r.pendingShown[0] != r.info.LatestVersion {
+		t.Fatalf("menu offers = %v, want Install Update (%s)", r.pendingShown, r.info.LatestVersion)
+	}
+
+	r.au.tick()
+
+	if r.checkCalls != 0 || r.verifyCalls != 0 || r.applyCalls != 0 || isDraining() {
+		t.Fatalf("declining must start nothing (check=%d verify=%d apply=%d draining=%v)",
+			r.checkCalls, r.verifyCalls, r.applyCalls, isDraining())
+	}
+}
+
+// A click while an update already waits for running work offers to install
+// at once; Yes is the immediate install, which does not wait.
+func TestManualUpdate_InstallNowWhileAnUpdateWaitsTakesTheImmediatePath(t *testing.T) {
+	r, dialog := newManualRig(t, registeredCfg())
+	dialog.answer = true
+	r.activeWork = 1 // never finishes on its own
+	seen := observeApply(r)
+	polls := steppedSleep(r)
+
+	attemptDone := startScheduledAttempt(t, r)
+	receiveWithin(t, polls, "the scheduled attempt to wait in its drain")
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+
+	wantTitle, _ := manualInstallNowPrompt(1)
+	if got := dialog.questions(); len(got) != 1 || got[0] != wantTitle {
+		t.Fatalf("questions asked = %q, want exactly %q", got, wantTitle)
+	}
+	receiveWithin(t, attemptDone, "the waiting attempt to yield")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(*seen) != 1 {
+		t.Fatalf("installs = %d, want exactly the immediate one", len(*seen))
+	}
+	if (*seen)[0].work != 1 {
+		t.Fatalf("install now saw work=%d; it must not wait for the session", (*seen)[0].work)
+	}
+}
+
+// "No" to installing now leaves the waiting attempt in place, but it is now
+// the user's request: turning the preference off no longer cancels it.
+func TestManualUpdate_KeepWaitingMakesTheRunningAttemptTheUsersRequest(t *testing.T) {
+	cfg := registeredCfg()
+	r, dialog := newManualRig(t, cfg)
+	dialog.answer = false
+	r.activeWork = 1
+	seen := observeApply(r)
+	polls := steppedSleep(r)
+
+	attemptDone := startScheduledAttempt(t, r)
+	receiveWithin(t, polls, "the scheduled attempt to wait in its drain")
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+	wantTitle, _ := manualInstallNowPrompt(1)
+	if got := dialog.questions(); len(got) != 1 || got[0] != wantTitle {
+		t.Fatalf("questions asked = %q, want exactly %q", got, wantTitle)
+	}
+	r.mu.Lock()
+	applied := r.applyCalls
+	r.mu.Unlock()
+	if applied != 0 {
+		t.Fatal("declining install-now must not install")
+	}
+
+	// Under the persistence lock: the attempt's own marker saves read this field.
+	if err := cfg.SetAndSaveAutoUpdate(false, r.au.savePath); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	r.activeWork = 0
+	r.mu.Unlock()
+	// Let the drain poll until the attempt ends.
+	finished := false
+	for !finished {
+		select {
+		case <-polls:
+		case <-attemptDone:
+			finished = true
+		case <-time.After(5 * time.Second):
+			t.Fatal("the attempt did not finish once the work was done")
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, reason := range r.drainExitR {
+		if reason == "preference_off" {
+			t.Fatalf("the update the user chose to wait for was cancelled by the preference (exits %v)", r.drainExitR)
+		}
+	}
+	if len(*seen) != 1 || (*seen)[0].work != 0 {
+		t.Fatalf("installs = %+v, want one once the work finished", *seen)
+	}
+}
+
+// An update the user asked for that cannot install says why, as the
+// immediate install always did, and goes back on the menu.
+func TestManualUpdate_FailedDownloadIsReportedAndOfferedAgain(t *testing.T) {
+	r, _ := newManualRig(t, registeredCfg())
+	r.activeWork = 0
+	r.verifyErr = errors.New("download interrupted")
+	reported := make(chan error, 1)
+	r.au.manualFailed = func(_ string, err error) { reported <- err }
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+	r.au.tick()
+
+	select {
+	case err := <-reported:
+		if !errors.Is(err, r.verifyErr) {
+			t.Fatalf("reported %v, want the download failure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the failed update was never reported")
+	}
+	if got := GetPendingUpdate(); got != r.info {
+		t.Fatalf("pending update = %+v, want the release offered again", got)
+	}
+	if len(r.pendingShown) != 1 || r.pendingShown[0] != r.info.LatestVersion {
+		t.Fatalf("menu offers = %v, want Install Update (%s)", r.pendingShown, r.info.LatestVersion)
+	}
+	if r.applyCalls != 0 {
+		t.Fatalf("apply calls = %d, want 0", r.applyCalls)
+	}
+}
+
+// A scheduled attempt fails quietly, as it always has; only a user's request
+// is reported.
+func TestManualUpdate_ScheduledFailureIsNotReported(t *testing.T) {
+	r, _ := newManualRig(t, registeredCfg())
+	r.verifyErr = errors.New("download interrupted")
+	reported := make(chan error, 1)
+	r.au.manualFailed = func(_ string, err error) { reported <- err }
+
+	r.au.tick()
+
+	select {
+	case err := <-reported:
+		t.Fatalf("a scheduled attempt reported %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if GetPendingUpdate() != nil {
+		t.Fatal("a scheduled failure must not put an update on the menu")
+	}
+}
+
+// An immediate install answers a request still queued behind it. Left queued,
+// that request would install a second time at some later tick.
+func TestManualUpdate_InstallNowDropsAQueuedRequest(t *testing.T) {
+	cfg := registeredCfg()
+	cfg.SetAutoUpdate(false)
+	r, _ := newManualRig(t, cfg)
+	r.applyErr = errors.New("replacement failed") // so this process keeps running
+
+	if err := r.au.requestManualInstall(r.info); err != nil {
+		t.Fatalf("request refused: %v", err)
+	}
+	if err := r.au.installManually(r.info); err == nil {
+		t.Fatal("want the immediate install's failure returned")
+	}
+	r.mu.Lock()
+	checks := r.checkCalls
+	r.mu.Unlock()
+
+	r.au.tick()
+
+	if r.checkCalls != checks {
+		t.Fatal("a request the immediate install already answered started another attempt")
+	}
+}
+
+// Once a replacement is running, this process is on its way out: a queued
+// request must not start a download or rewrite the attempt marker.
+func TestManualUpdate_NoAttemptStartsAfterAnUpdateHandoff(t *testing.T) {
+	r, _ := newManualRig(t, registeredCfg())
+	SetUpdateHandoff() // restored by the rig's cleanup
+
+	if err := r.au.requestManualInstall(r.info); err != nil {
+		t.Fatalf("request refused: %v", err)
+	}
+	r.au.tick()
+
+	if r.checkCalls != 0 {
+		t.Fatalf("an attempt started after the update handoff (check=%d)", r.checkCalls)
+	}
+}
+
+// The background reconciliation loop acts on whatever attempt marker it finds.
+// While it is still between tries, a new attempt's marker would be taken for
+// an interrupted one, so no attempt starts until the loop is done.
+func TestManualUpdate_WaitsForTheBackgroundReconciliationLoop(t *testing.T) {
+	r, _ := newManualRig(t, registeredCfg())
+	interruptedReconcileRunning.Store(true)
+	t.Cleanup(func() { interruptedReconcileRunning.Store(false) })
+	reported := make(chan error, 1)
+	r.au.manualFailed = func(_ string, err error) { reported <- err }
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+	r.au.tick()
+
+	if r.checkCalls != 0 || isDraining() {
+		t.Fatalf("an attempt started while reconciliation was still running (check=%d draining=%v)",
+			r.checkCalls, isDraining())
+	}
+	select {
+	case err := <-reported:
+		if !errors.Is(err, errEarlierAttemptPending) {
+			t.Fatalf("reported %v, want %v", err, errEarlierAttemptPending)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the user was not told why the update did not start")
+	}
+}
+
+// A check-and-offer macOS build has no drain to wait on: its click only opens
+// the release, exactly as before.
+func TestManualUpdate_CheckAndOfferBuildKeepsTheImmediatePath(t *testing.T) {
+	prev := silentUpdateCapableFlag
+	silentUpdateCapableFlag = "false"
+	t.Cleanup(func() { silentUpdateCapableFlag = prev })
+	if silentUpdateCapable() {
+		t.Skip("only macOS builds can be check-and-offer")
+	}
+
+	r, dialog := newManualRig(t, registeredCfg())
+	r.activeWork = 1
+	opened := 0
+	r.au.manualApply = func(_ *UpdateInfo) error { opened++; return nil }
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+	if opened != 1 {
+		t.Fatalf("release opened %d time(s), want 1", opened)
+	}
+	if got := dialog.questions(); len(got) != 0 {
+		t.Fatalf("a check-and-offer click asked %q", got)
+	}
+}
+
+func TestRunningSessionsPhrase(t *testing.T) {
+	for n, want := range map[int]string{1: "1 coding session is", 2: "2 coding sessions are", 7: "7 coding sessions are"} {
+		if got := runningSessionsPhrase(n); got != want {
+			t.Errorf("runningSessionsPhrase(%d) = %q, want %q", n, got, want)
+		}
+	}
+
+	if _, msg := manualWaitForWorkPrompt(1, "v9.9.9"); !strings.Contains(msg, "1 coding session is running") ||
+		!strings.Contains(msg, "install v9.9.9 as soon as it finishes") {
+		t.Errorf("wait prompt for one session = %q", msg)
+	}
+	if _, msg := manualWaitForWorkPrompt(3, "v9.9.9"); !strings.Contains(msg, "as soon as they finish") {
+		t.Errorf("wait prompt for three sessions = %q", msg)
+	}
+	for n, want := range map[int]string{0: "stops any coding session still running", 1: "stops it.", 2: "stops them."} {
+		if _, msg := manualInstallNowPrompt(n); !strings.Contains(msg, want) {
+			t.Errorf("install-now prompt for %d session(s) = %q, want it to say %q", n, msg, want)
+		}
 	}
 }
