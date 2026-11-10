@@ -955,7 +955,6 @@ func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
 				}
 				changed = changed || c
 			}
-			claudeSettingsAfterRepairWrite(settingsPath)
 			recordClaudeSettingsStampIfReconciled(settingsPath)
 			return changed, nil
 		}
@@ -987,13 +986,12 @@ func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
 	// (a Claude Code update, a /config change) landing between our write and the
 	// stamp would otherwise be recorded as "verified", and every later tick would
 	// skip on the unchanged stamp with the hooks missing until the agent restarts.
-	claudeSettingsAfterRepairWrite(settingsPath)
 	recordClaudeSettingsStampIfReconciled(settingsPath)
 	return changed, nil
 }
 
-// claudeSettingsAfterRepairWrite runs after a reconcile's repair writes and
-// before the verify-and-record step. A no-op in production; a test seam that
+// claudeSettingsAfterRepairWrite runs after a reconcile's repair writes, at the
+// start of recordClaudeSettingsStampIfReconciled. A no-op in production; a test seam that
 // lets a test land a foreign rewrite inside that window deterministically.
 var claudeSettingsAfterRepairWrite = func(settingsPath string) {}
 
@@ -1011,8 +1009,10 @@ func recordClaudeSettingsStamp(st os.FileInfo) {
 // write between our repair and this call then either fails the check (nothing
 // recorded, the next reconcile repairs) or lands after the stat (stamp
 // mismatch, the next reconcile re-verifies). A file that cannot be stat'ed,
-// read or parsed records nothing, like any reconcile that failed.
+// read or parsed records nothing, like any reconcile that failed. Call it only
+// after a repair write: the "already reconciled" path records the stat it read.
 func recordClaudeSettingsStampIfReconciled(settingsPath string) {
+	claudeSettingsAfterRepairWrite(settingsPath)
 	st, err := os.Stat(settingsPath)
 	if err != nil {
 		return
