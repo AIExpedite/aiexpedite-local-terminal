@@ -932,11 +932,9 @@ func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
 			slOK := claudeStatusLineHookReconciled(settings)
 			reOK := claudeRunEndHookReconciled(settings)
 			if slOK && reOK {
-				claudeStatusLineReconcile.mu.Lock()
-				claudeStatusLineReconcile.seen = true
-				claudeStatusLineReconcile.mtime = st.ModTime()
-				claudeStatusLineReconcile.size = st.Size()
-				claudeStatusLineReconcile.mu.Unlock()
+				// st was taken BEFORE the read, so a write after the read leaves a
+				// stamp that no longer matches and the next reconcile re-verifies.
+				recordClaudeSettingsStamp(st)
 				return false, nil
 			}
 
@@ -957,13 +955,8 @@ func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
 				}
 				changed = changed || c
 			}
-			if st, err := os.Stat(settingsPath); err == nil {
-				claudeStatusLineReconcile.mu.Lock()
-				claudeStatusLineReconcile.seen = true
-				claudeStatusLineReconcile.mtime = st.ModTime()
-				claudeStatusLineReconcile.size = st.Size()
-				claudeStatusLineReconcile.mu.Unlock()
-			}
+			claudeSettingsAfterRepairWrite(settingsPath)
+			recordClaudeSettingsStampIfReconciled(settingsPath)
 			return changed, nil
 		}
 	}
@@ -988,17 +981,48 @@ func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
 		// verified.
 		return false, err
 	}
-	// Re-Stat AFTER the write so the recorded stamp describes the file as it now
-	// stands — otherwise our own write would look like a foreign change and every
-	// subsequent reconcile would rewrite settings.json.
-	if st, err := os.Stat(settingsPath); err == nil {
-		claudeStatusLineReconcile.mu.Lock()
-		claudeStatusLineReconcile.seen = true
-		claudeStatusLineReconcile.mtime = st.ModTime()
-		claudeStatusLineReconcile.size = st.Size()
-		claudeStatusLineReconcile.mu.Unlock()
-	}
+	// Record the stamp of the file as it now stands — otherwise our own write
+	// would look like a foreign change and every later reconcile would rewrite
+	// settings.json — but ONLY for content verified as ours. A foreign write
+	// (a Claude Code update, a /config change) landing between our write and the
+	// stamp would otherwise be recorded as "verified", and every later tick would
+	// skip on the unchanged stamp with the hooks missing until the agent restarts.
+	claudeSettingsAfterRepairWrite(settingsPath)
+	recordClaudeSettingsStampIfReconciled(settingsPath)
 	return changed, nil
+}
+
+// claudeSettingsAfterRepairWrite runs after a reconcile's repair writes and
+// before the verify-and-record step. A no-op in production; a test seam that
+// lets a test land a foreign rewrite inside that window deterministically.
+var claudeSettingsAfterRepairWrite = func(settingsPath string) {}
+
+// recordClaudeSettingsStamp records settings.json's mtime + size as verified.
+func recordClaudeSettingsStamp(st os.FileInfo) {
+	claudeStatusLineReconcile.mu.Lock()
+	claudeStatusLineReconcile.seen = true
+	claudeStatusLineReconcile.mtime = st.ModTime()
+	claudeStatusLineReconcile.size = st.Size()
+	claudeStatusLineReconcile.mu.Unlock()
+}
+
+// recordClaudeSettingsStampIfReconciled records settings.json's stamp only when
+// the file, read AFTER the stat, still carries both reconciled hooks. A foreign
+// write between our repair and this call then either fails the check (nothing
+// recorded, the next reconcile repairs) or lands after the stat (stamp
+// mismatch, the next reconcile re-verifies). A file that cannot be stat'ed,
+// read or parsed records nothing, like any reconcile that failed.
+func recordClaudeSettingsStampIfReconciled(settingsPath string) {
+	st, err := os.Stat(settingsPath)
+	if err != nil {
+		return
+	}
+	settings, exists, err := readClaudeSettings(settingsPath)
+	if err != nil || !exists ||
+		!claudeStatusLineHookReconciled(settings) || !claudeRunEndHookReconciled(settings) {
+		return
+	}
+	recordClaudeSettingsStamp(st)
 }
 
 // claudeStatusLineReconcileWait bounds how long a run start will wait on the
