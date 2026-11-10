@@ -44,12 +44,16 @@
 // (cliagent_usage_opencode_capture.go), and the direct-run reader
 // (cliagent_usage_opencode_direct.go) folds in every other run from OpenCode's
 // own store. The card publishes today's bucket for this install's account:
-// "Tokens today" and, when above zero, "Cost today", each with the newest step
-// as observedAt and the next local midnight as resetAt. ParseContext only reads
-// the ledger; the reader never runs inside the gather. While no scan has read
-// the store today (an unrecognised layout, or one the agent cannot see), only
-// the agent's own runs are counted and the row says so: "Tokens today (agent
-// runs)".
+// "Tokens today" and, when above zero, "Cost today", with the next local
+// midnight as resetAt. Their observedAt is the newest step's time, or — while
+// the store covers the day and no run's spend is on its way — the time the
+// direct reader last confirmed the store holds nothing newer
+// (openCodeUsageObservedAtMs), so an idle computer's reading stays fresh rather
+// than aging from its last run. ParseContext only reads the ledger and that
+// in-memory confirmation; the reader never runs inside the gather. While no
+// scan has read the store today (an unrecognised layout, or one the agent
+// cannot see), only the agent's own runs are counted and the row says so:
+// "Tokens today (agent runs)".
 //
 // SECRETS: this parser reads provider NAMES and model IDS only. It never reads,
 // logs, or forwards a token value from auth.json. The ledger holds counts and
@@ -220,7 +224,16 @@ func (p openCodeUsageParser) ParseContext(ctx context.Context, home string, dete
 	}
 	adopted := adoptPendingOpenCodeUsageBuckets(usage.AccountFingerprint)
 	day := openCodeUsageDayFor(usage.AccountFingerprint, now)
-	usage.Metrics = openCodeUsageMetrics(day.Bucket, day.OK, day.Direct, now)
+	// The direct reader's confirmation vouches for the whole day only when the
+	// store is the day's source (Direct), no run's spend is still on its way
+	// (Settled) and no pending spend was left out (adopted). Otherwise the rows
+	// keep the newest step's time, and age as any reading does — the
+	// "(agent runs)" row, read while the store is not covered, always does.
+	var confirmedAtMs int64
+	if day.Direct && day.Settled && adopted {
+		confirmedAtMs = openCodeDirectConfirmedAt()
+	}
+	usage.Metrics = openCodeUsageMetrics(day.Bucket, day.OK, day.Direct, confirmedAtMs, now)
 	if day.Direct {
 		usage.DataSource = "opencode store"
 	}
@@ -803,6 +816,12 @@ func openCodeSingleModel(ids []string) string {
 // running session may use a different model than the card shows — the card
 // labels the value as the device default for exactly that reason. Resolving
 // per-repo would need a cwd this discovery pass does not have.
+//
+// Both files are read as JSONC, as OpenCode itself parses them: a config with
+// comments or a trailing comma is still a config, and a `//` inside a string (a
+// provider's baseURL) is not a comment. Before opencode.jsonc was read here, a
+// computer configured only through it reported no default at all, so the
+// platform could not see that OpenCode's own pick was a provider with no key.
 func readOpenCodeConfiguredModel(home string) string {
 	for _, path := range openCodeGlobalConfigPaths(home) {
 		if path == "" {
@@ -811,7 +830,7 @@ func readOpenCodeConfiguredModel(home string) string {
 		var cfg struct {
 			Model string `json:"model"`
 		}
-		if readJSONFile(path, &cfg) {
+		if readJSONCFileWithin(path, openCodeConfigMaxBytes, &cfg) {
 			if m := strings.TrimSpace(cfg.Model); m != "" {
 				return m
 			}
@@ -820,19 +839,34 @@ func readOpenCodeConfiguredModel(home string) string {
 	return ""
 }
 
-// openCodeGlobalConfigPaths lists the global config locations OpenCode has used
-// across releases, most-current first.
+// openCodeConfigMaxBytes bounds one config read. A real config is a few KB; a
+// file past this reads as absent rather than being loaded whole.
+const openCodeConfigMaxBytes = 1 << 20
+
+// openCodeGlobalConfigNames are the global config files OpenCode reads from one
+// directory, in the order this reader asks them: OpenCode merges opencode.json
+// and then opencode.jsonc over it, so a model the .jsonc file sets wins.
+var openCodeGlobalConfigNames = []string{"opencode.jsonc", "opencode.json"}
+
+// openCodeGlobalConfigPaths lists the global config files OpenCode has used
+// across releases, most-current directory first.
 func openCodeGlobalConfigPaths(home string) []string {
-	var paths []string
+	var dirs []string
 	if cfgHome := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); cfgHome != "" {
-		paths = append(paths, filepath.Join(cfgHome, "opencode", "opencode.json"))
+		dirs = append(dirs, filepath.Join(cfgHome, "opencode"))
 	}
 	if home != "" {
-		paths = append(paths,
-			expandHome(home, filepath.Join(".config", "opencode", "opencode.json")),
-			expandHome(home, filepath.Join(".opencode", "opencode.json")),
-			expandHome(home, "opencode.json"),
+		dirs = append(dirs,
+			expandHome(home, filepath.Join(".config", "opencode")),
+			expandHome(home, ".opencode"),
+			home,
 		)
+	}
+	var paths []string
+	for _, dir := range dirs {
+		for _, name := range openCodeGlobalConfigNames {
+			paths = append(paths, filepath.Join(dir, name))
+		}
 	}
 	return paths
 }

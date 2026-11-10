@@ -221,7 +221,10 @@ type openCodeUsageBucket struct {
 	CacheReadTokens    int64   `json:"cacheReadTokens"`
 	CacheWriteTokens   int64   `json:"cacheWriteTokens"`
 	CostUsd            float64 `json:"costUsd"`
-	// ObservedAtMs is the newest contributing step's end time.
+	// ObservedAtMs is the newest contributing step's end time — never a read or
+	// confirmation time: openCodeDirectScanFloor starts a cursor-less scan there
+	// and capOpenCodeUsageBuckets evicts by it. The card's fresher observedAt is
+	// openCodeUsageObservedAtMs.
 	ObservedAtMs int64 `json:"observedAtMs"`
 }
 
@@ -685,10 +688,16 @@ type openCodeUsageDay struct {
 	// so the bucket counts every OpenCode run on the computer, not only the
 	// agent's own.
 	Direct bool
+	// Settled reports that no managed run's spend is still on its way to the
+	// bucket: the ledger holds no debt, armed or owed, and no run this process
+	// armed is holding the reader (a refused debt write leaves only that). The
+	// direct reader's confirmation speaks for the day only while it holds.
+	Settled bool
 }
 
 // openCodeUsageDayFor reads the bucket for (fingerprint, the local date of now),
-// the ledger's generation and the direct reader's coverage.
+// the ledger's generation, the direct reader's coverage and whether any run's
+// spend is still on its way.
 func openCodeUsageDayFor(fingerprint string, now time.Time) openCodeUsageDay {
 	today, _ := openCodeLocalDay(now)
 	// Not under openCodeUsageMu: the card's gather must not queue behind a
@@ -697,6 +706,7 @@ func openCodeUsageDayFor(fingerprint string, now time.Time) openCodeUsageDay {
 	day := openCodeUsageDay{
 		Generation: ledger.Generation,
 		Direct:     ledger.DirectCoverage != nil && ledger.DirectCoverage.LastOkLocalDate == today,
+		Settled:    len(ledger.Debts) == 0 && openCodeUsageArmedHoldMs(now) == 0,
 	}
 	for _, b := range ledger.Buckets {
 		if b.AccountFingerprint == fingerprint && b.LocalDate == today {
@@ -724,13 +734,15 @@ const (
 // openCodeUsageMetrics turns today's bucket into the card's rows: tokens
 // always, cost only when above zero — a local model or a subscription
 // provider reports 0, and "$0.00" would read as free rather than unmetered. No
-// bucket, no rows. direct labels the tokens row by coverage.
-func openCodeUsageMetrics(bucket openCodeUsageBucket, ok, direct bool, now time.Time) []cliAgentUsageMetric {
+// bucket, no rows. direct labels the tokens row by coverage. Both rows carry
+// openCodeUsageObservedAtMs as observedAt; confirmedAtMs is the direct
+// reader's confirmation the caller vouches for, 0 for none.
+func openCodeUsageMetrics(bucket openCodeUsageBucket, ok, direct bool, confirmedAtMs int64, now time.Time) []cliAgentUsageMetric {
 	if !ok || (bucket.tokens() <= 0 && bucket.CostUsd <= 0) {
 		return nil
 	}
 	_, resetAt := openCodeLocalDay(now)
-	observedAt := time.UnixMilli(bucket.ObservedAtMs).UTC().Format(time.RFC3339)
+	observedAt := time.UnixMilli(openCodeUsageObservedAtMs(bucket, direct, confirmedAtMs, now)).UTC().Format(time.RFC3339)
 	reset := resetAt.Format(time.RFC3339)
 	tokens := float64(bucket.tokens())
 	label := openCodeTokensTodayAgentRunsLabel
@@ -757,6 +769,23 @@ func openCodeUsageMetrics(bucket openCodeUsageBucket, ok, direct bool, now time.
 		})
 	}
 	return metrics
+}
+
+// openCodeUsageObservedAtMs is when today's reading was last known to be
+// current, in Unix ms. It is the bucket's newest step — or, when later, the
+// direct reader's confirmation that the store holds nothing the bucket does not
+// (openCodeDirectConfirmedAt): the OpenCode store is a source the device reads
+// itself, and such sources stamp the read time. The confirmation counts only
+// for a reading the store covers (direct), only from today's local midnight —
+// one from yesterday says nothing about today's spend — and never from the
+// future (a clock stepped back). It stays out of the ledger, whose ObservedAtMs
+// seeds the scan floor and bucket eviction.
+func openCodeUsageObservedAtMs(bucket openCodeUsageBucket, direct bool, confirmedAtMs int64, now time.Time) int64 {
+	if direct && confirmedAtMs > bucket.ObservedAtMs &&
+		confirmedAtMs >= openCodeLocalMidnight(now).UnixMilli() && confirmedAtMs <= now.UnixMilli() {
+		return confirmedAtMs
+	}
+	return bucket.ObservedAtMs
 }
 
 // openCodeUsagePublishedCost rounds a day's cost to four decimals without an

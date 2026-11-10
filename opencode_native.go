@@ -528,6 +528,12 @@ func (m *OpenCodeNativeManager) SendTurn(id, text string, publishFn PublishFunc,
 	// stdout carried diagnostic text — never claim success or append the
 	// diagnostics to the transcript as an assistant turn.
 	if result.exitCode != 0 {
+		if result.authRefused {
+			// No key for the model's provider: say so, and end the error with
+			// the sanitized record the cloud reads the provider from
+			// (opencode_auth_refusal.go) — never OpenCode's own message.
+			return m.publishTurnError(session, publishFn, openCodeAuthRefusalTurnError(result.authProviderID))
+		}
 		detail := strings.TrimSpace(result.text)
 		if detail == "" {
 			detail = strings.TrimSpace(result.stderr)
@@ -661,17 +667,21 @@ func withOpenCodeCompletion(msg resultMsg, text, finalText string, usedReplay bo
 // openCodeRunResult is one `opencode run` invocation's outcome. `text` is the
 // assistant content coalesced from the streamed JSON events; `finalText` is
 // the final answer within it (openCodeFinalAnswer); `sessionID` is the native
-// id if any event carried one.
+// id if any event carried one. `authRefused` reports OpenCode's
+// ProviderAuthError record in the stream, and `authProviderID` the provider it
+// named ("" when none usable) — see opencode_auth_refusal.go.
 type openCodeRunResult struct {
-	text          string
-	finalText     string
-	rawStdout     string
-	stderr        string
-	sessionID     string
-	exitCode      int
-	timedOut      bool
-	frameOverflow bool
-	err           error
+	text           string
+	finalText      string
+	rawStdout      string
+	stderr         string
+	sessionID      string
+	exitCode       int
+	timedOut       bool
+	frameOverflow  bool
+	authRefused    bool
+	authProviderID string
+	err            error
 }
 
 // killOpenCodeProcessTree force-kills the `opencode` process and its tool
@@ -839,14 +849,16 @@ func (m *OpenCodeNativeManager) runOneShot(
 		errOut = strings.TrimSpace(stderrBuf.b.String())
 	}
 	return openCodeRunResult{
-		text:          strings.TrimSpace(stream.text.String()),
-		finalText:     strings.TrimSpace(stream.answer.text()),
-		rawStdout:     strings.TrimSpace(stream.raw.String()),
-		stderr:        errOut,
-		sessionID:     stream.sessionID,
-		exitCode:      exitCode,
-		timedOut:      timedOutFlag.Load(),
-		frameOverflow: stream.overflow,
+		text:           strings.TrimSpace(stream.text.String()),
+		finalText:      strings.TrimSpace(stream.answer.text()),
+		rawStdout:      strings.TrimSpace(stream.raw.String()),
+		stderr:         errOut,
+		sessionID:      stream.sessionID,
+		exitCode:       exitCode,
+		timedOut:       timedOutFlag.Load(),
+		frameOverflow:  stream.overflow,
+		authRefused:    stream.authRefused,
+		authProviderID: stream.authProviderID,
 	}
 }
 
@@ -863,6 +875,10 @@ type openCodeStreamState struct {
 	raw       strings.Builder
 	sessionID string
 	overflow  bool
+	// authRefused: a line was OpenCode's ProviderAuthError record, naming
+	// authProviderID ("" when it named none usable). The first one stands.
+	authRefused    bool
+	authProviderID string
 	// bytes counts raw stdout consumed so a pathological run cannot buffer
 	// unbounded assistant text into memory.
 	bytes int
@@ -918,6 +934,11 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 			if sid != "" && state.sessionID == "" {
 				state.sessionID = sid
 			}
+		}
+		if !state.authRefused {
+			// Read here, reported by SendTurn only if the turn then exits
+			// non-zero (openCodeAuthRefusalTurnError).
+			state.authProviderID, state.authRefused = openCodeProviderAuthRefusal(line)
 		}
 		if isOpenCodeToolBoundary(line) {
 			state.answer.toolCall()

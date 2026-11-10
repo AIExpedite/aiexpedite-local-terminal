@@ -483,7 +483,7 @@ CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, kin
 	if c := loadOpenCodeUsageLedger().DirectCoverage; c != nil {
 		t.Fatalf("coverage = %+v for an unknown store", c)
 	}
-	raw, _ := json.Marshal(openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, ObservedAtMs: clock.ms(0)}, true, openCodeUsageDayFor("", clock.now).Direct, clock.now))
+	raw, _ := json.Marshal(openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, ObservedAtMs: clock.ms(0)}, true, openCodeUsageDayFor("", clock.now).Direct, 0, clock.now))
 	if !strings.Contains(string(raw), "Tokens today (agent runs)") {
 		t.Fatalf("label = %s", raw)
 	}

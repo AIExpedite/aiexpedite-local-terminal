@@ -77,8 +77,10 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// the re-link carry-over; `cliSessionDiscovery` with finding and
 			// adopting coding-agent sessions AI Expedite did not start;
 			// `nativeLaunchArgs` with the one-shot managers applying a START's
-			// model and effort to every turn.
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":1},"worktreeBuiltIns":true,"signedExecutionId":true,"whatsapp":`+string(waRaw)+`}` {
+			// model and effort to every turn; `openCodeAuthRefusalFrame` with an
+			// OpenCode turn that fails on a missing provider key naming the
+			// provider in its error frame.
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":1},"worktreeBuiltIns":true,"signedExecutionId":true,"whatsapp":`+string(waRaw)+`}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})
@@ -117,5 +119,10 @@ func TestCapabilities_RegistrationCarriesRelayFlags(t *testing.T) {
 	// doc through the same registration payload as the relay flags.
 	if caps["nativeLaunchArgs"] != true {
 		t.Fatalf("registration capabilities = %v, want nativeLaunchArgs true", caps)
+	}
+	// terminal-service reads a provider from an OpenCode turn's error frame
+	// only on a device that writes the sanitized record there.
+	if caps["openCodeAuthRefusalFrame"] != true {
+		t.Fatalf("registration capabilities = %v, want openCodeAuthRefusalFrame true", caps)
 	}
 }

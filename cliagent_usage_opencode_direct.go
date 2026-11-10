@@ -40,9 +40,17 @@
 //     cursor waits for it. Sessions are listed from the cursor even across
 //     midnight, so a turn begun before midnight is found once it finishes.
 //   - Triggers: once at startup (runs made while the agent was down or
-//     mid-update), on the propagator's 60 s tick only while the store's change
-//     marker moved or the last scan left work, and on a Refresh click. One
-//     single flight is shared by all three; ParseContext never scans.
+//     mid-update), on the propagator's 10 s fallback poll
+//     (cliUsageClaudeFallbackPoll) only while the store's change marker moved
+//     or the last scan left work, and on a Refresh click. One single flight is
+//     shared by all three; ParseContext never scans.
+//   - Freshness: a scan that read the store whole, and every unchanged poll
+//     after one, CONFIRM the store — nothing was written that the ledger does
+//     not hold. The time of the newest confirmation is kept in memory
+//     (openCodeDirectConfirmedAt) and published as the card's observedAt
+//     (openCodeUsageMetrics), so an idle computer's "Tokens today" does not
+//     read as stale for being idle. It is never written into the ledger: a
+//     bucket's ObservedAtMs seeds the scan floor and bucket eviction.
 //   - Triggers: Refresh also pays owed debts from the store
 //     (payOwedOpenCodeUsageFromStore), inside the click's budget and without
 //     spending a ladder attempt or spawning an export.
@@ -274,7 +282,35 @@ var (
 	openCodeDirectGateMu     sync.Mutex
 	openCodeDirectLastMarker string
 	openCodeDirectAgain      bool
+	// openCodeDirectLastComplete reports that the last scan read the store
+	// whole (openCodeDirectScanComplete), so a marker unchanged since it means
+	// the ledger still holds everything the store does. A scan that could not
+	// read the store — an unknown layout among them, which leaves no work for
+	// a later scan — clears it, and the polls after it confirm nothing.
+	openCodeDirectLastComplete bool
+	// openCodeDirectConfirmedAtMs is when the store was last CONFIRMED: the
+	// start of a complete scan, or of an unchanged poll after one. It only
+	// moves forward. In memory only, and never written into a bucket's
+	// ObservedAtMs, which seeds openCodeDirectScanFloor and bucket eviction.
+	openCodeDirectConfirmedAtMs int64
 )
+
+// openCodeDirectConfirmedAt is when this process last confirmed the store, in
+// Unix ms; 0 before its first complete scan.
+func openCodeDirectConfirmedAt() int64 {
+	openCodeDirectGateMu.Lock()
+	defer openCodeDirectGateMu.Unlock()
+	return openCodeDirectConfirmedAtMs
+}
+
+// openCodeDirectScanComplete reports a scan that read the store whole: its
+// marker listing finished, it read and committed what it found — or found
+// nothing new — and it left no work: no cap, hold, incomplete message,
+// revisit or settle window. A truncated scan (a cap, or records skipped), a
+// failed read, a busy ledger and an unknown layout never are.
+func openCodeDirectScanComplete(markerOK bool, label string, again bool) bool {
+	return markerOK && !again && (label == "direct_scanned" || label == "direct_unchanged")
+}
 
 /* --------------------------------------------------------------------------
    Triggers
@@ -293,6 +329,10 @@ func openCodeDirectScanAtStartup() {
 // OpenCode is detected, the agent is online and not draining or shutting down,
 // and the store changed since the last scan (or that scan left work). An idle
 // computer pays a few stats or one directory listing.
+//
+// An unchanged marker after a complete scan also confirms the store as of this
+// poll (openCodeDirectConfirmedAt): nothing was written since that scan read
+// it whole. Every gate above it confirms nothing.
 func openCodeDirectScanIfChanged() {
 	if !openCodeDirectScanEnabled || IsShutdownInProgress() || isDraining() || IsOffline() || !openCodeDirectDetected() {
 		return
@@ -301,6 +341,10 @@ func openCodeDirectScanIfChanged() {
 	if layout == openCodeStoreLayoutUnknown {
 		return
 	}
+	// Read BEFORE the stat: a write that lands after it moves the marker for
+	// the next poll, so the store is confirmed only as of a time before that
+	// write.
+	checkedAt := openCodeDirectNow()
 	ctx, cancel := context.WithTimeout(context.Background(), openCodeDirectTickBudget)
 	marker, _, ok := openCodeStoreMarker(ctx, layout, root)
 	cancel()
@@ -312,6 +356,9 @@ func openCodeDirectScanIfChanged() {
 	}
 	openCodeDirectGateMu.Lock()
 	unchanged := marker == openCodeDirectLastMarker && !openCodeDirectAgain
+	if unchanged && openCodeDirectLastComplete {
+		openCodeDirectConfirmedAtMs = max(openCodeDirectConfirmedAtMs, checkedAt.UnixMilli())
+	}
 	openCodeDirectGateMu.Unlock()
 	if unchanged {
 		return
@@ -342,13 +389,17 @@ func openCodeDirectScanOnRefresh(ctx context.Context) string {
 }
 
 // openCodeDirectScanShared runs one scan, or shares the one in flight, and
-// records what the tick gate needs. It returns the scan's label.
+// records what the tick gate needs. It returns the scan's label. A complete
+// scan (openCodeDirectScanComplete) confirms the store as of its start.
 func openCodeDirectScanShared(budget time.Duration) string {
 	v, _, _ := openCodeDirectGroup.Do("scan", func() (any, error) {
 		layout, root := openCodeStoreLayout()
 		// One budget covers the marker and the read.
 		ctx, cancel := context.WithTimeout(context.Background(), budget)
 		defer cancel()
+		// Read before the marker, as the tick reads it before its stat: the
+		// scan confirms the store only as of a time no later than its marker.
+		markedAt := openCodeDirectNow()
 		// The marker is taken BEFORE the read, so a write that lands during it
 		// moves the marker again for the next tick.
 		marker, changedAt, ok := openCodeStoreMarker(ctx, layout, root)
@@ -359,8 +410,13 @@ func openCodeDirectScanShared(budget time.Duration) string {
 		if time.Since(changedAt) < openCodeDirectSettleWindow {
 			again = true
 		}
+		complete := openCodeDirectScanComplete(ok, label, again)
 		openCodeDirectGateMu.Lock()
 		openCodeDirectLastMarker, openCodeDirectAgain = marker, again
+		openCodeDirectLastComplete = complete
+		if complete {
+			openCodeDirectConfirmedAtMs = max(openCodeDirectConfirmedAtMs, markedAt.UnixMilli())
+		}
 		openCodeDirectGateMu.Unlock()
 		logOpenCodeUsageCapture(label)
 		return label, nil
@@ -916,9 +972,10 @@ func minNonZero(a, b int64) int64 {
 	return min(a, b)
 }
 
-// resetOpenCodeDirectScan forgets the tick gate (tests).
+// resetOpenCodeDirectScan forgets the tick gate and the confirmation (tests).
 func resetOpenCodeDirectScan() {
 	openCodeDirectGateMu.Lock()
 	openCodeDirectLastMarker, openCodeDirectAgain = "", false
+	openCodeDirectLastComplete, openCodeDirectConfirmedAtMs = false, 0
 	openCodeDirectGateMu.Unlock()
 }
