@@ -251,3 +251,130 @@ func TestGrokManagedBillingPayload_KeepsOmittedAndUnusableApart(t *testing.T) {
 		})
 	}
 }
+
+// grokZeroEntry is a live-cache entry holding xAI's omitted zero.
+func grokZeroEntry(fingerprint string, at, periodEnd time.Time) grokBillingLiveCache {
+	return grokBillingLiveFromSnapshot(grokBillingSnapshot{ObservedAt: at, PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: periodEnd, HasPeriodEnd: true, UsageOmitted: true}, fingerprint)
+}
+
+// A zero stamped by a clock that runs ahead renders Unknown until its time is
+// trusted, so the generation versioning it waits with it: published while the
+// row is Unknown, it would be applied downstream and the 0% that appears later
+// would ride a generation terminal-service already holds.
+func TestGrokUsageParser_WithholdsTheGenerationWhileAZeroIsFutureDated(t *testing.T) {
+	grokLiveCacheFixture(t, 8140)
+	home := t.TempDir()
+	base := filepath.Join(home, ".grok")
+	t.Setenv("GROK_HOME", "")
+	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{
+		"email": "ada@example.com", "user_id": "acct-1",
+	})
+	fingerprint := grokAccountFingerprintFor(base)
+	now := time.Date(2026, 11, 9, 23, 0, 0, 0, time.UTC)
+	saveGrokBillingLive(grokLiveEntry(fingerprint, now.Add(-2*time.Hour), floatPtr(100), now.Add(-time.Hour)))
+	saveGrokBillingLive(grokZeroEntry(fingerprint, now.Add(time.Hour), now.Add(7*24*time.Hour)))
+	if g := readGrokLiveCacheFile(t).Generation; g == nil || *g != gen(8140, 2) {
+		t.Fatalf("generation = %+v, want the zero's commit at {8140,2}", g)
+	}
+	grokGenerationRotated.Store(true)
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || len(usage.Metrics) != 1 || !usage.Metrics[0].Unknown {
+		t.Fatalf("usage = %+v, want Unknown while the zero is future-dated", usage)
+	}
+	if usage.UsageGeneration != nil {
+		t.Fatalf("usageGeneration = %+v, want none while the zero it versions is withheld", usage.UsageGeneration)
+	}
+
+	later := now.Add(2 * time.Hour)
+	usage, ok = grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, later)
+	if !ok || len(usage.Metrics) != 1 || !grokZeroUsedRow(usage.Metrics[0], usage.Metrics[0].ObservedAt) {
+		t.Fatalf("usage = %+v, want the 0%% once its time has passed", usage)
+	}
+	if usage.UsageGeneration == nil || *usage.UsageGeneration != gen(8140, 2) {
+		t.Fatalf("usageGeneration = %+v, want {8140,2} published with the 0%%", usage.UsageGeneration)
+	}
+}
+
+// Startup recovery applies the same rule: a generation versioning a
+// future-dated zero is rotated but not hinted, and is hinted once it renders.
+func TestGrokRecovery_WithholdsAHintWhileAZeroIsFutureDated(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8142)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", h.clock().Add(-2*time.Hour), floatPtr(100), h.clock().Add(-time.Hour)))
+	saveGrokBillingLive(grokZeroEntry("fp-ada", h.clock().Add(time.Hour), h.clock().Add(7*24*time.Hour)))
+	codexProcessGenerationEpoch.Store(8143)
+	grokGenerationRotated.Store(false)
+
+	g, refused := grokRecoveryGeneration(h.clock())
+	if g != nil || !refused {
+		t.Fatalf("recovery = %+v refused=%t, want the hint withheld and retried while the zero is future-dated", g, refused)
+	}
+	if on := readGrokLiveCacheFile(t).Generation; on == nil || *on != gen(8143, 1) {
+		t.Fatalf("cache generation = %+v, want the rotation committed anyway", on)
+	}
+	h.advance(2 * time.Hour)
+	g, refused = grokRecoveryGeneration(h.clock())
+	if refused || g == nil || *g != gen(8143, 1) {
+		t.Fatalf("recovery = %+v refused=%t, want {8143,1} hinted once the zero renders", g, refused)
+	}
+}
+
+// A zero replaced by an answer that renders no figure (an unusable
+// percentage) moves the card from 0% to Unknown: a versioned clear, hinted and
+// published. A zero after that clear is a change again.
+func TestGrokUsage_AZeroReplacedByNoFigureIsAVersionedClear(t *testing.T) {
+	a := newGrokAcceptance(t, 7340)
+	fingerprint := grokAccountFingerprintFor(a.home)
+	a.start()
+	now := time.Now()
+	end := now.Add(7 * 24 * time.Hour)
+	waitHint := func(counter int64) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if hints := a.grokHints(); len(hints) > 0 && hints[len(hints)-1].Generation == counter {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("grok hints = %+v, want generation %d hinted", a.grokHints(), counter)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	saveGrokBillingLive(grokZeroEntry(fingerprint, now.Add(-30*time.Minute), end))
+	waitHint(1)
+	saveGrokBillingLive(grokLiveEntry(fingerprint, now.Add(-20*time.Minute), nil, end)) // unusable
+	if entry := readGrokLiveCacheFile(t); !entry.Cleared || entry.UsageOmitted || entry.Generation == nil || *entry.Generation != gen(7340, 2) {
+		t.Fatalf("cache = %+v, want the zero's removal versioned as a clear at {7340,2}", entry)
+	}
+	waitHint(2)
+	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || len(usage.Metrics) != 1 || !usage.Metrics[0].Unknown {
+		t.Fatalf("usage = %+v, want Unknown after the zero's removal", usage)
+	}
+	if usage.UsageGeneration == nil || *usage.UsageGeneration != gen(7340, 2) {
+		t.Fatalf("usageGeneration = %+v, want the clear's {7340,2} published", usage.UsageGeneration)
+	}
+
+	saveGrokBillingLive(grokZeroEntry(fingerprint, now.Add(-10*time.Minute), end))
+	if entry := readGrokLiveCacheFile(t); entry.Cleared || entry.Generation == nil || *entry.Generation != gen(7340, 3) {
+		t.Fatalf("cache = %+v, want the zero back at {7340,3}, not a clear", entry)
+	}
+	waitHint(3)
+}
+
+// Another account's zero is never kept, and replacing it with an answer that
+// renders no figure is a clear as well.
+func TestGrokLiveCache_AnotherAccountsZeroReplacedByNoFigureIsAClear(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8144)
+	end := h.clock().Add(7 * 24 * time.Hour)
+	saveGrokBillingLive(grokZeroEntry("fp-bob", h.clock().Add(-time.Minute), end))
+	saveGrokBillingLive(grokLiveEntry("fp-ada", h.clock(), nil, end))
+	if entry := readGrokLiveCacheFile(t); !entry.Cleared || entry.Generation == nil || *entry.Generation != gen(8144, 2) {
+		t.Fatalf("cache = %+v, want another account's zero replaced as a clear at {8144,2}", entry)
+	}
+}

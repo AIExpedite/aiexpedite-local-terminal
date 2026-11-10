@@ -732,7 +732,9 @@ func saveGrokBillingLive(entry grokBillingLiveCache) bool {
 //     mark without advancing again. Dropping only this account's on-demand
 //     pool under a kept percentage advances the generation the same way
 //     (without the mark: the percentage still renders). Replacing another
-//     account's numeric cache with an unmetered read is a clear as well.
+//     account's numeric cache with an unmetered read is a clear as well, and
+//     so is replacing an omitted zero (this account's or another's) with an
+//     answer that renders no figure.
 //   - A same-account read older than the cached answer is superseded: it
 //     reports committed (the cache already holds a newer answer) and writes
 //     nothing — unless the cached answer is more than grokBillingMaxClockSkew
@@ -772,9 +774,9 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 		}
 	}
 	prevNumericAt, prevNumeric := prev.numericObservedAt()
-	// Another account's number is never kept, but replacing it still changes
-	// the card (below).
-	prevOtherNumeric := hasPrev && !sameAccount && (prevNumeric || prev.hasNumericOnDemand())
+	// Another account's number (or omitted zero) is never kept, but replacing it
+	// still changes the card (below).
+	prevOtherNumeric := hasPrev && !sameAccount && (prevNumeric || prev.hasNumericOnDemand() || prev.omittedZero())
 	prevNumeric = prevNumeric && sameAccount
 
 	entry.NumericObservedAt = ""
@@ -826,8 +828,12 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 			!prev.sameOnDemand(entry)
 	}
 	if !advanced && sameAccount && !entry.hasNumericOnDemand() {
+		// An omitted zero renders as 0%, so an answer that is NOT one (an
+		// unusable percentage) replacing it is a clear like a number's removal.
+		// A same-period zero replacing a zero changes nothing (above).
+		prevZeroReplaced := prev.omittedZero() && !entry.omittedZero()
 		switch {
-		case entry.UsedPercent == nil && (prevNumeric || prev.hasNumericOnDemand()):
+		case entry.UsedPercent == nil && (prevNumeric || prev.hasNumericOnDemand() || prevZeroReplaced):
 			advanced, entry.Cleared = true, true
 		case entry.UsedPercent == nil && prev.Cleared:
 			entry.Cleared = true

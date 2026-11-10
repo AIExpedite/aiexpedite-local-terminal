@@ -265,6 +265,18 @@ type grokBillingSnapshot struct {
 	SubscriptionTier   string
 }
 
+// rendersOmittedZero reports a snapshot grokBillingMetrics plots as 0% used
+// although it carries no percentage: xAI omitted the key (UsageOmitted) under a
+// recognized period with a parseable end. Whether that end has passed is the
+// caller's question (an ended period renders Unknown).
+func (s grokBillingSnapshot) rendersOmittedZero() bool {
+	if s.HasUsedPercent || !s.UsageOmitted || !s.HasPeriodEnd {
+		return false
+	}
+	_, _, known := grokBillingPeriodKind(s.PeriodType)
+	return known
+}
+
 // onDemandObservedAt is when the on-demand pool was observed: its own time
 // when it has one, else the snapshot's.
 func (s grokBillingSnapshot) onDemandObservedAt() time.Time {
@@ -1780,7 +1792,7 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 				// case below removes for a still-live window.
 				credits.ObservedAt = ""
 			}
-		case !snap.HasUsedPercent && snap.UsageOmitted && snap.HasPeriodEnd:
+		case snap.rendersOmittedZero():
 			// A CURRENT period with no usage figure is a period with NOTHING used
 			// yet. xAI's billing answer omits a zero-valued creditUsagePercent
 			// (only the {"val":…} wrapped pools keep their zeros), and Grok's own
@@ -1866,7 +1878,9 @@ func grokBillingValueWithheld(snap grokBillingSnapshot, now time.Time) bool {
 // falls inside grokBillingMaxClockSkew and renders. Zero when nothing is
 // withheld.
 func grokBillingWithheldFor(snap grokBillingSnapshot, now time.Time) time.Duration {
-	if !snap.HasUsedPercent && !snap.HasOnDemand {
+	// An omitted zero is a figure too: a future-dated one renders Unknown now
+	// and 0% once trusted, so the generation that versions it must wait with it.
+	if !snap.HasUsedPercent && !snap.rendersOmittedZero() && !snap.HasOnDemand {
 		return 0
 	}
 	newest := snap.ObservedAt
