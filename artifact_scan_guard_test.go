@@ -1,7 +1,8 @@
 // File: artifact_scan_guard_test.go
 // Unit tests for artifactScanRootRefusal — the guard that keeps the media scan
-// out of filesystem roots, the home folder and the folders above it — and for
-// how the command and session paths report a refused root.
+// out of filesystem roots, the home folder and the folders above it — for how
+// the command and session paths report a refused root, and for the bound on
+// the one-shot command scan.
 package main
 
 import (
@@ -239,18 +240,81 @@ func TestScanCommandArtifacts_RefusedRootIsReportedAsSkipped(t *testing.T) {
 	}
 }
 
-// The one-shot command scan is bounded like a session's. It used to run on a
-// Background context with no limit, so nothing could stop it; now a scan the
-// bound cut short hands nothing to the upload.
-func TestScanCommandArtifacts_BoundExpiredUploadsNothing(t *testing.T) {
+// The one-shot command scan's bound reaches the walk. It used to run on a
+// Background context with no limit, so nothing could stop it. Within its bound
+// it finds the screenshot; with a bound that has already passed, the walk stops
+// at its first entry with nothing collected, and the log says the scan did not
+// finish instead of "scanned … → 0", which would report a walk the bound
+// stopped as one that found nothing. A walk past an expired bound never gets as
+// far as a file, so dropping files a cut-short walk had already found is pinned
+// by TestScanCommandArtifacts_CutShortScanUploadsNothing.
+func TestScanCommandArtifacts_ExpiredBoundStopsTheWalk(t *testing.T) {
 	start := time.Now()
 	_, _, project := fakeArtifactScanHome(t, start)
 
-	if got := baseNames(scanCommandArtifacts("cmd-in-time", project, start, artifactScanTestDeadline)); len(got) != 1 || got[0] != "shot.png" {
+	var files []string
+	out := captureStdout(t, func() {
+		files = scanCommandArtifacts("cmd-in-time", project, start, artifactScanTestDeadline)
+	})
+	if got := baseNames(files); len(got) != 1 || got[0] != "shot.png" {
 		t.Fatalf("within its bound the scan must find the screenshot, got %v", got)
 	}
-	// A bound of zero has expired before the walk starts.
-	if got := scanCommandArtifacts("cmd-out-of-time", project, start, 0); len(got) != 0 {
-		t.Fatalf("a scan past its bound returned %v for upload", got)
+	if want := "Command cmd-in-time: scanned " + project + " since "; !strings.Contains(out, want) {
+		t.Fatalf("the log does not report the finished scan; want %q in:\n%s", want, out)
+	}
+
+	// A bound of zero has passed before the walk starts.
+	out = captureStdout(t, func() {
+		files = scanCommandArtifacts("cmd-out-of-time", project, start, 0)
+	})
+	if len(files) != 0 {
+		t.Fatalf("a scan past its bound returned %v for upload", files)
+	}
+	if want := "Command cmd-out-of-time: media scan of " + project + " did not finish within 0s (0 file(s) found so far, none uploaded)"; !strings.Contains(out, want) {
+		t.Fatalf("the log does not report the unfinished scan; want %q in:\n%s", want, out)
+	}
+	if strings.Contains(out, "Command cmd-out-of-time: scanned") {
+		t.Fatalf("the log reports a scan the bound stopped as finished:\n%s", out)
+	}
+}
+
+// A walk the bound cut short may already have found files. They are a partial
+// list, so none of them is uploaded, and the log says the scan did not finish
+// and how many it had found. A real walk cannot be made to find files and then
+// outrun its bound on cue, so the walk is stood in: it finds two files, waits
+// until the bound has passed, and returns them.
+func TestScanCommandArtifacts_CutShortScanUploadsNothing(t *testing.T) {
+	dir := tempRootDir(t)
+	start := time.Now()
+	const bound = time.Millisecond
+
+	original := scanOutputFilesSinceFn
+	scanOutputFilesSinceFn = func(ctx context.Context, workDir string, _ time.Time) ([]string, string) {
+		found := []string{filepath.Join(workDir, "early.png"), filepath.Join(workDir, "shot.png")}
+		select {
+		case <-ctx.Done():
+		case <-time.After(artifactScanTestDeadline):
+			// Not t.Fatal: this runs inside captureStdout, which must get to
+			// put os.Stdout back.
+			t.Errorf("the scan's context was still live %s after its %s bound; the bound does not reach the walk",
+				artifactScanTestDeadline, bound)
+		}
+		return found, ""
+	}
+	t.Cleanup(func() { scanOutputFilesSinceFn = original })
+
+	var files []string
+	out := captureStdout(t, func() {
+		files = scanCommandArtifacts("cmd-cut-short", dir, start, bound)
+	})
+
+	if files != nil {
+		t.Fatalf("a scan the bound cut short returned %v for upload", files)
+	}
+	if want := "Command cmd-cut-short: media scan of " + dir + " did not finish within " + bound.String() + " (2 file(s) found so far, none uploaded)"; !strings.Contains(out, want) {
+		t.Fatalf("the log does not report the cut-short scan; want %q in:\n%s", want, out)
+	}
+	if strings.Contains(out, "Command cmd-cut-short: scanned") {
+		t.Fatalf("the log reports a scan the bound cut short as finished:\n%s", out)
 	}
 }

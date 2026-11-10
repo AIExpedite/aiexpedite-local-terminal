@@ -49,6 +49,29 @@ const (
 // /System/Volumes/Data/Users/<name>. Apart from root itself, only the home
 // folder and its ancestors are stat'ed, so nothing else inside the home folder
 // is touched before the walk would start.
+//
+// # WHAT IT COSTS
+//
+// Two losses are accepted:
+//
+//   - A session started in the home-folder fallback collects no media. With
+//     no repository mapping and no Default working directory, terminal-service
+//     starts a session on the owner's own computer in the device's registered
+//     working directory, Config.WorkingDirectory, by default the home folder.
+//     Its scan is refused like a command's, so a screenshot it writes into a
+//     project below home (`cd ~/repo && npx playwright test`) is not uploaded.
+//     The walk of home used to find such a file: usually on Linux, where the
+//     dot-folders that hold most of home are pruned; sometimes on Windows,
+//     where it walked AppData first; rarely on macOS, where it walked
+//     ~/Library first and ran into the two-minute bound. A session collects
+//     media when it is started in the project folder.
+//   - A drive root is refused by its text alone, before the identity check,
+//     so a drive letter that is a subst or mapped alias of a project folder
+//     (`subst P: C:\Users\x\repo`, or Z:\ mapped to a project share) is
+//     refused too, although the same folder is scanned under its own path.
+//     terminal-service neither derives a drive root as a working directory
+//     nor saves one as the Default working directory, so only work that names
+//     the drive root itself, as its cwd or through a `cd`, is affected.
 func artifactScanRootRefusal(root string) string {
 	if root == "" {
 		return ""
