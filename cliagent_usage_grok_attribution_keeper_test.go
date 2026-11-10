@@ -86,7 +86,7 @@ func TestGrokBillingAttributionKeeper_RepairsDisplacementDuringALiveSession(t *t
 
 	// A record the still-running CLI writes now is ours again.
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine("2026-08-19T12:10:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:10:00Z", grokBillingLogMessage))
 	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
 		time.Date(2026, 8, 19, 12, 11, 0, 0, time.UTC))
 	if !ok {
@@ -213,7 +213,7 @@ func TestEnsureGrokBillingAttribution_ContestsInsteadOfNamingANewAccountOverALiv
 	// The acct-1 child's next record is unattributable rather than published as
 	// acct-2's, which is the boundary this rule exists to hold.
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine(time.Now().UTC().Format(time.RFC3339), grokBillingLogMessage))
+		grokPercentLessLine(time.Now().UTC().Format(time.RFC3339), grokBillingLogMessage))
 	for _, account := range []string{"acct-1", "acct-2"} {
 		if _, ok := readGrokBillingSnapshot(base, []string{account}); ok {
 			t.Fatalf("a record under the contested marker was attributed to %s", account)
@@ -256,7 +256,7 @@ func TestGrokBillingAttributionKeeper_MarksTheLogContestedWhenArmedRunsDisagree(
 
 	// A record written under the contested marker is refused for BOTH accounts.
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine(time.Now().UTC().Format(time.RFC3339), grokBillingLogMessage))
+		grokPercentLessLine(time.Now().UTC().Format(time.RFC3339), grokBillingLogMessage))
 	for _, account := range []string{"acct-1", "acct-2"} {
 		if _, ok := readGrokBillingSnapshot(base, []string{account}); ok {
 			t.Fatalf("a record under the contested marker was attributed to %s", account)
@@ -283,7 +283,7 @@ func TestPersistGrokManagedBillingSnapshot_SerializesWithDirectAttribution(t *te
 	isolated := helperGrokHomeWithAccount(t, "acct-managed")
 	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-managed"))
 	helperAppendGrokLogLine(t, isolated,
-		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
 
 	grokBillingAttributionSerialize.Lock()
 	done := make(chan struct{})
@@ -392,7 +392,7 @@ func TestPersistGrokManagedBillingSnapshot_RepairsAnArmedDirectRunImmediately(t 
 	isolated := helperGrokHomeWithAccount(t, "acct-managed")
 	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-managed"))
 	helperAppendGrokLogLine(t, isolated,
-		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
 
 	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil ||
 		outcome != grokManagedBillingPersisted {
@@ -402,7 +402,7 @@ func TestPersistGrokManagedBillingSnapshot_RepairsAnArmedDirectRunImmediately(t 
 	// A record the still-running direct CLI writes right after the merge is
 	// ours again — with no keeper tick in between.
 	helperAppendGrokLogLine(t, persistent,
-		grokUnmeteredLine("2026-08-19T12:21:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:21:00Z", grokBillingLogMessage))
 	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
 		time.Date(2026, 8, 19, 12, 22, 0, 0, time.UTC))
 	if !ok {
@@ -426,7 +426,7 @@ func TestPersistGrokManagedBillingSnapshot_DoesNotRepairWhenNoDirectRunIsArmed(t
 	isolated := helperGrokHomeWithAccount(t, "acct-managed")
 	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-managed"))
 	helperAppendGrokLogLine(t, isolated,
-		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
 
 	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil {
 		t.Fatalf("persist: %v", err)
@@ -458,7 +458,7 @@ func TestPersistGrokManagedBillingSnapshot_RepairsInTheSameAtomicWrite(t *testin
 	isolated := helperGrokHomeWithAccount(t, "acct-managed")
 	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-managed"))
 	helperAppendGrokLogLine(t, isolated,
-		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
 
 	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil ||
 		outcome != grokManagedBillingPersisted {
@@ -502,7 +502,7 @@ func TestPersistGrokManagedBillingSnapshot_SkipsRepairForTheSameAccount(t *testi
 	isolated := helperGrokHomeWithAccount(t, "acct-1")
 	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-1"))
 	helperAppendGrokLogLine(t, isolated,
-		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
 
 	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil ||
 		outcome != grokManagedBillingPersisted {
@@ -534,7 +534,7 @@ func TestPersistGrokManagedBillingSnapshot_ArmDuringTheWriteStillRepairs(t *test
 	isolated := helperGrokHomeWithAccount(t, "acct-managed")
 	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-managed"))
 	helperAppendGrokLogLine(t, isolated,
-		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
 
 	grokBillingAttributionSerialize.Lock()
 	done := make(chan error, 1)
@@ -656,7 +656,7 @@ func TestGrokBillingAttributionKeeper_LastReleaseSealsAttribution(t *testing.T) 
 	finish := startGrokBillingAttributionKeeper("acct-1")
 	ensureGrokBillingIdentityNamed(base, "acct-1")
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine("2026-08-19T12:00:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:00:00Z", grokBillingLogMessage))
 	before := grokIdentityLineCount(t, base)
 
 	finish()
@@ -679,7 +679,7 @@ func TestGrokBillingAttributionKeeper_LastReleaseSealsAttribution(t *testing.T) 
 	// A record written AFTER the seal — the out-of-agent account switch this
 	// exists for — is refused rather than published as acct-1's.
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine("2026-08-19T12:05:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:05:00Z", grokBillingLogMessage))
 	usage, ok = grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
 		time.Date(2026, 8, 19, 12, 6, 0, 0, time.UTC))
 	if !ok {
@@ -895,7 +895,7 @@ func TestGrokBillingAttributionKeeper_ContestsAnUnresolvedArm(t *testing.T) {
 			"live run", last)
 	}
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine(time.Now().UTC().Format(time.RFC3339), grokBillingLogMessage))
+		grokPercentLessLine(time.Now().UTC().Format(time.RFC3339), grokBillingLogMessage))
 	if _, ok := readGrokBillingSnapshot(base, []string{"acct-1"}); ok {
 		t.Fatal("a record written while an unresolved run was live was attributed to acct-1")
 	}
@@ -929,7 +929,7 @@ func TestGrokBillingAttribution_UnresolvedArmContestsAnEarlierAccountMarker(t *t
 	}
 
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine(time.Now().UTC().Format(time.RFC3339), grokBillingLogMessage))
+		grokPercentLessLine(time.Now().UTC().Format(time.RFC3339), grokBillingLogMessage))
 	if _, ok := readGrokBillingSnapshot(base, []string{"acct-1"}); ok {
 		t.Fatal("a record written by an unresolved direct run was attributed to acct-1")
 	}
@@ -978,7 +978,7 @@ func TestGrokBillingAttributionKeeper_ReassertionWithNoArmedRunsReaffirmsTheSeal
 	}
 
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine("2026-08-19T12:40:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:40:00Z", grokBillingLogMessage))
 	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
 		time.Date(2026, 8, 19, 12, 41, 0, 0, time.UTC))
 	if !ok {
@@ -1040,7 +1040,7 @@ func TestGrokBillingAttributionKeeper_InFlightTickDoesNotOutliveTheSeal(t *testi
 	// The hazard the seal exists for: a record an out-of-agent run writes next
 	// stays unattributable rather than inheriting acct-1.
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine("2026-08-19T12:30:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:30:00Z", grokBillingLogMessage))
 	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
 		time.Date(2026, 8, 19, 12, 31, 0, 0, time.UTC))
 	if !ok {

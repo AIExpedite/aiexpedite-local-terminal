@@ -1086,8 +1086,8 @@ func TestGrokACPLifecycle_PersistsFreshRedactedBillingForRefresh(t *testing.T) {
 		t.Fatalf("managed billing parse failed: %+v", usage)
 	}
 	metric := usage.Metrics[0]
-	if !metric.Unknown || metric.ObservedAt == "" || metric.ResetAt == "" {
-		t.Fatalf("managed run must match direct confirmed-unmetered capture: %+v", metric)
+	if metric.ObservedAt == "" || !grokZeroUsedRow(metric, metric.ObservedAt) {
+		t.Fatalf("managed run must match the direct run's fresh 0%%-used capture: %+v", metric)
 	}
 	out, err := json.Marshal(usage)
 	if err != nil {

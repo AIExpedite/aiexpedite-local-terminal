@@ -1,6 +1,6 @@
 // cliagent_usage_grok_unified_billing_test.go
 // -----------------------------------------------------------------------------
-// Grok 1.0 stopped emitting `creditUsagePercent`.
+// A billing record with no `creditUsagePercent`.
 //
 // From a real machine's ~/.grok/logs/unified.jsonl, the same `msg` across an
 // upgrade — every other key identical, one gone:
@@ -13,6 +13,13 @@
 // PRE-UPGRADE one. The card then published a four-day-old reading whose billing
 // period had since ended, rendering as "Usage unobservable — Last observed
 // 8/13 (6 days ago)" while a current period sat unread in the same file.
+//
+// That record was read as "Grok 1.0 stopped emitting the percentage". It did
+// not: it was fetched 34 minutes after its period began (22:28:32Z), and xAI
+// omits a ZERO creditUsagePercent. Live reads carried a percentage all through
+// 2026-11-06..09 and none from the 11-09 weekly reset on, while Grok's own TUI
+// drew that percent-less answer as "Weekly limit (SuperGrok) 0%". The card now
+// reads it the same way.
 // -----------------------------------------------------------------------------
 
 package main
@@ -84,8 +91,9 @@ func TestGrokBillingReadsTheNewestRecordEvenWithoutAUsagePercent(t *testing.T) {
 	}
 }
 
-// The card: a current period with an honest reset, and no invented number.
-func TestGrokCardReportsTheCurrentPeriodWithUsageUnobservable(t *testing.T) {
+// The card: a current period with an honest reset, read as the TUI reads it —
+// nothing used yet.
+func TestGrokCardReportsTheCurrentPeriodAsZeroUsed(t *testing.T) {
 	base := writeGrokLog(t, grokIdentityLine, grokLegacyBillingLine, grokUnifiedBillingLine)
 	now := time.Date(2026, 8, 19, 23, 0, 0, 0, time.UTC) // inside the 1.0 period
 
@@ -98,25 +106,14 @@ func TestGrokCardReportsTheCurrentPeriodWithUsageUnobservable(t *testing.T) {
 		t.Fatalf("len(metrics) = %d, want 1", len(metrics))
 	}
 	m := metrics[0]
-	if !m.Unknown {
-		t.Fatalf("metric = %+v, want Unknown — Grok 1.0 publishes no usage figure", m)
-	}
-	if m.Consumed != nil {
-		t.Fatalf("Consumed = %v, want nil", *m.Consumed)
-	}
 	if want := "2026-08-24T22:28:32Z"; m.ResetAt != want {
 		t.Fatalf("ResetAt = %q, want the CURRENT period %q", m.ResetAt, want)
-	}
-	// No number was exposed, but the provider did freshly confirm the current
-	// unmetered period. The timestamp distinguishes that from a placeholder.
-	if m.ObservedAt != "2026-08-17T23:02:12Z" {
-		t.Fatalf("ObservedAt = %q, want the confirmed-unmetered observation", m.ObservedAt)
 	}
 	if m.Label != "Weekly credits" || m.Kind != limitKindWeekly {
 		t.Fatalf("metric label/kind = %q/%q, want the weekly credits row", m.Label, m.Kind)
 	}
 	assertGrokMetricsJSON(t, metrics,
-		`[{"kind":"weekly","label":"Weekly credits","unit":"%","resetAt":"2026-08-24T22:28:32Z","observedAt":"2026-08-17T23:02:12Z","unknown":true}]`)
+		`[{"kind":"weekly","label":"Weekly credits","unit":"%","total":100,"remaining":100,"consumed":0,"resetAt":"2026-08-24T22:28:32Z","observedAt":"2026-08-17T23:02:12Z"}]`)
 }
 
 // The exact shape that produced `observableMetricCount 0` with no
@@ -217,8 +214,8 @@ func TestGrokOnDemandSurvivesAMissingUsagePercent(t *testing.T) {
 	if onDemand.Consumed == nil || *onDemand.Consumed != 12 || onDemand.Total == nil || *onDemand.Total != 50 {
 		t.Fatalf("on-demand = %+v, want 12 of 50", onDemand)
 	}
-	if !metrics[0].Unknown {
-		t.Fatalf("credits row = %+v, want Unknown", metrics[0])
+	if !grokZeroUsedRow(metrics[0], "2026-08-17T23:02:12Z") {
+		t.Fatalf("credits row = %+v, want 0%% used", metrics[0])
 	}
 }
 

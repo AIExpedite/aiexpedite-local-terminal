@@ -110,6 +110,11 @@ type grokBillingLiveCache struct {
 	PeriodEnd          string   `json:"periodEnd,omitempty"`
 	OnDemandCap        *float64 `json:"onDemandCap,omitempty"`
 	OnDemandUsed       *float64 `json:"onDemandUsed,omitempty"`
+	// UsageOmitted, only with UsedPercent nil, records that xAI's answer had
+	// no usage key at all — its encoding of 0% (grokBillingSnapshot) — rather
+	// than one it could not use. Additive: an entry written before it reads as
+	// unusable until the next read.
+	UsageOmitted bool `json:"usageOmitted,omitempty"`
 	// NumericObservedAt is set only when UsedPercent was kept from an earlier
 	// numeric read under a newer unmetered answer for the same open period
 	// (ObservedAt is then that answer's): the percentage's own observation
@@ -122,7 +127,8 @@ type grokBillingLiveCache struct {
 	// Cleared reports that Generation versions a clear: this account's
 	// numeric reading was replaced by an answer with no number (a new
 	// period, or one whose kept figure has ended). The parser publishes and
-	// recovery re-hints that generation although the card renders Unknown.
+	// recovery re-hints that generation although the card renders no number
+	// of its own (Unknown, or 0% for an omitted figure).
 	Cleared bool `json:"cleared,omitempty"`
 }
 
@@ -649,6 +655,8 @@ func grokBillingLiveFromSnapshot(snap grokBillingSnapshot, fingerprint string) g
 	}
 	if snap.HasUsedPercent {
 		out.UsedPercent = floatPtr(snap.UsedPercent)
+	} else {
+		out.UsageOmitted = snap.UsageOmitted
 	}
 	if snap.HasPeriodEnd {
 		out.PeriodEnd = snap.PeriodEnd.UTC().Format(time.RFC3339)
@@ -762,6 +770,7 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 		if kept.samePeriod(incoming) && entryAt.Before(incoming.PeriodEnd) {
 			percent := *prev.UsedPercent
 			entry.UsedPercent = &percent
+			entry.UsageOmitted = false
 			entry.NumericObservedAt = prevNumericAt.UTC().Format(time.RFC3339Nano)
 		}
 	case incomingNumeric:
@@ -1078,6 +1087,8 @@ func grokBillingLiveCacheSnapshot(entry grokBillingLiveCache, observed time.Time
 	if entry.UsedPercent != nil && grokFiniteNumber(*entry.UsedPercent) {
 		snap.UsedPercent = clampPercent(*entry.UsedPercent)
 		snap.HasUsedPercent = true
+	} else {
+		snap.UsageOmitted = entry.UsageOmitted && entry.UsedPercent == nil
 	}
 	if end, err := time.Parse(time.RFC3339, entry.PeriodEnd); err == nil {
 		snap.PeriodEnd = end
