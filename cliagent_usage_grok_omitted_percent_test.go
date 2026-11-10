@@ -98,8 +98,9 @@ func TestGrokLiveCache_OmittedAnswerKeepsTheSamePeriodsNumber(t *testing.T) {
 	}
 }
 
-// Across a weekly reset the omitted answer is the new period's 0%, published
-// under the clear's generation so terminal-service applies it.
+// Across a weekly reset the omitted answer is the new period's 0%: a reading
+// versioned like a number (never a clear), published under its generation so
+// terminal-service applies it.
 func TestGrokUsage_ARolloverToAnOmittedPercentPublishesAVersionedZero(t *testing.T) {
 	a := newGrokAcceptance(t, 7320)
 	fingerprint := grokAccountFingerprintFor(a.home)
@@ -112,8 +113,8 @@ func TestGrokUsage_ARolloverToAnOmittedPercentPublishesAVersionedZero(t *testing
 		ObservedAt: time.Now().Add(-time.Minute), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
 		PeriodEnd: time.Now().Add(7 * 24 * time.Hour), HasPeriodEnd: true, UsageOmitted: true,
 	}, fingerprint))
-	if entry := readGrokLiveCacheFile(t); !entry.Cleared || !entry.UsageOmitted || entry.Generation == nil || *entry.Generation != gen(7320, 2) {
-		t.Fatalf("cache = %+v, want the omitted answer versioned as a clear at {7320,2}", entry)
+	if entry := readGrokLiveCacheFile(t); entry.Cleared || !entry.UsageOmitted || entry.Generation == nil || *entry.Generation != gen(7320, 2) {
+		t.Fatalf("cache = %+v, want the omitted answer versioned as a reading (not a clear) at {7320,2}", entry)
 	}
 
 	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true}, time.Now())
@@ -122,6 +123,74 @@ func TestGrokUsage_ARolloverToAnOmittedPercentPublishesAVersionedZero(t *testing
 	}
 	if usage.UsageGeneration == nil || *usage.UsageGeneration != gen(7320, 2) {
 		t.Fatalf("usageGeneration = %+v, want {7320,2} published with the 0%%", usage.UsageGeneration)
+	}
+}
+
+// Every omitted zero after the first is a reading too: a newer one in the same
+// period and a second rollover each advance and are hinted, so a new reset
+// never rides the generation terminal-service already applied. A number kept
+// over a later omitted answer in its own period advances nothing.
+func TestGrokUsage_ConsecutiveOmittedZerosAcrossPeriodsAdvanceAndHint(t *testing.T) {
+	a := newGrokAcceptance(t, 7330)
+	fingerprint := grokAccountFingerprintFor(a.home)
+	a.start()
+	now := time.Now()
+	weekB := now.Add(7 * 24 * time.Hour)
+	weekC := now.Add(14 * 24 * time.Hour)
+	save := func(at time.Time, end time.Time, percent *float64) {
+		t.Helper()
+		snap := grokBillingSnapshot{ObservedAt: at, PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+			PeriodEnd: end, HasPeriodEnd: true, UsageOmitted: percent == nil}
+		if percent != nil {
+			snap.UsedPercent, snap.HasUsedPercent = *percent, true
+		}
+		saveGrokBillingLive(grokBillingLiveFromSnapshot(snap, fingerprint))
+	}
+	wantGen := func(counter int64, why string) {
+		t.Helper()
+		entry := readGrokLiveCacheFile(t)
+		if entry.Generation == nil || *entry.Generation != gen(7330, counter) || entry.Cleared {
+			t.Fatalf("%s: cache = %+v, want {7330,%d} and no clear", why, entry, counter)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			hints := a.grokHints()
+			if len(hints) > 0 && hints[len(hints)-1].Generation == counter {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: grok hints = %+v, want generation %d hinted", why, hints, counter)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	save(now.Add(-3*time.Hour), now.Add(-time.Hour), floatPtr(100)) // week A, spent
+	wantGen(1, "week A's number")
+	save(now.Add(-50*time.Minute), weekB, nil)
+	wantGen(2, "the rollover to week B's zero")
+	save(now.Add(-40*time.Minute), weekB, nil)
+	wantGen(3, "a newer zero in week B")
+	save(now.Add(-30*time.Minute), weekC, nil)
+	wantGen(4, "a second rollover, to week C's zero")
+
+	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || len(usage.Metrics) != 1 || !grokZeroUsedRow(usage.Metrics[0], usage.Metrics[0].ObservedAt) ||
+		usage.Metrics[0].ResetAt != weekC.UTC().Format(time.RFC3339) {
+		t.Fatalf("usage = %+v, want week C at 0%%", usage)
+	}
+	if usage.UsageGeneration == nil || *usage.UsageGeneration != gen(7330, 4) {
+		t.Fatalf("usageGeneration = %+v, want week C's zero published as {7330,4}", usage.UsageGeneration)
+	}
+
+	// A real number in week C, then an omitted answer in the same period: the
+	// number is kept and the omitted answer advances nothing.
+	save(now.Add(-20*time.Minute), weekC, floatPtr(12))
+	wantGen(5, "week C's number")
+	save(now.Add(-10*time.Minute), weekC, nil)
+	if entry := readGrokLiveCacheFile(t); entry.UsedPercent == nil || *entry.UsedPercent != 12 ||
+		entry.Generation == nil || *entry.Generation != gen(7330, 5) {
+		t.Fatalf("cache = %+v, want 12%% kept at {7330,5}", entry)
 	}
 }
 

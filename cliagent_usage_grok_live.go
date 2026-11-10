@@ -146,6 +146,28 @@ func (c grokBillingLiveCache) numericObservedAt() (time.Time, bool) {
 	return t, err == nil
 }
 
+// omittedZeroAt is when an entry holding xAI's omitted zero was observed: no
+// percentage, the key absent (UsageOmitted), under a recognized period whose
+// parseable end was still ahead of the answer. grokBillingMetrics renders that
+// as 0% used, so it is a reading in its own right. ok is false otherwise.
+func (c grokBillingLiveCache) omittedZeroAt() (time.Time, bool) {
+	if c.UsedPercent != nil || !c.UsageOmitted {
+		return time.Time{}, false
+	}
+	if _, _, known := grokBillingPeriodKind(c.PeriodType); !known {
+		return time.Time{}, false
+	}
+	end, err := time.Parse(time.RFC3339, c.PeriodEnd)
+	if err != nil {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(time.RFC3339Nano, c.ObservedAt)
+	if err != nil || !at.Before(end) {
+		return time.Time{}, false
+	}
+	return at, true
+}
+
 // hasNumericOnDemand reports whether the entry carries an on-demand pool that
 // grokBillingMetrics renders as numbers (a cap with a usage figure inside it):
 // a reading of its own, versioned even while the credits window is unmetered.
@@ -696,6 +718,10 @@ func saveGrokBillingLive(entry grokBillingLiveCache) bool {
 //     observation, a changed percentage, or a new billing period (another
 //     account is all three). An unmetered read never advances it on the
 //     percentage's behalf, except as a clear (below).
+//   - xAI's omitted zero (omittedZeroAt) is a reading the card renders as 0%,
+//     so when no number is kept over it, it advances by the numeric rule —
+//     the first after any other answer, a newer one, or a new period — and is
+//     never marked Cleared.
 //   - A numeric on-demand pool is versioned on its own terms: a read carrying
 //     one advances the generation when it is newer than the cached pool, its
 //     figures changed, or there was no same-account numeric pool — so fresh
@@ -777,6 +803,18 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 		advanced = !prevNumeric ||
 			(entryErr == nil && entryAt.After(prevNumericAt)) ||
 			*prev.UsedPercent != *entry.UsedPercent ||
+			prev.PeriodType != entry.PeriodType || prev.PeriodEnd != entry.PeriodEnd
+	}
+	if _, zero := entry.omittedZeroAt(); zero && !advanced {
+		// xAI's omitted zero renders as 0% (it was not replaced by a kept
+		// number above), so it is versioned by the numeric rule: the first after
+		// any other answer, a newer one, or a new period advances. Otherwise a
+		// second rollover to a zero would reuse the first one's generation and
+		// never be hinted.
+		prevZeroAt, prevZero := prev.omittedZeroAt()
+		prevZero = prevZero && sameAccount
+		advanced = !prevZero ||
+			(entryErr == nil && entryAt.After(prevZeroAt)) ||
 			prev.PeriodType != entry.PeriodType || prev.PeriodEnd != entry.PeriodEnd
 	}
 	if !advanced && entry.hasNumericOnDemand() {
