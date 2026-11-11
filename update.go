@@ -438,6 +438,9 @@ func installUpdatable() (bool, string) {
 			return false, "Automatic update unavailable — run the installer once to move AI Expedite to a per-user location"
 		}
 	case "darwin":
+		if darwinMovedWhileRunning(exe, pathExists) {
+			return false, "Automatic update unavailable — AI Expedite was moved while it was running; quit and open it again"
+		}
 		if ok, reason := darwinLocationSupported(exe); !ok {
 			return false, reason
 		}
@@ -464,7 +467,7 @@ func installUpdatable() (bool, string) {
 // translocated path) stays refused either way.
 func installUpdatableOnRequest() (bool, string) {
 	if runtime.GOOS == "darwin" {
-		if exe, err := runningUpdateTarget(); err == nil && darwinDownloadsCopyReplaceable(exe, dirWritable) {
+		if exe, err := runningUpdateTarget(); err == nil && darwinDownloadsCopyReplaceable(exe, dirWritable, pathExists) {
 			return true, ""
 		}
 	}
@@ -472,10 +475,33 @@ func installUpdatableOnRequest() (bool, string) {
 }
 
 // darwinDownloadsCopyReplaceable reports whether exe is a bundle in ~/Downloads
-// whose parent folder accepts the replacement.
-func darwinDownloadsCopyReplaceable(exe string, writable func(string) bool) bool {
+// that is still there and whose parent folder accepts the replacement.
+func darwinDownloadsCopyReplaceable(exe string, writable, exists func(string) bool) bool {
 	bundle := darwinBundlePath(filepath.ToSlash(exe))
-	return bundle != "" && darwinBundleInDownloads(bundle) && writable(filepath.Dir(bundle))
+	return bundle != "" && darwinBundleInDownloads(bundle) && exists(bundle) && writable(filepath.Dir(bundle))
+}
+
+// darwinMovedWhileRunning reports whether the bundle this process was started
+// from is no longer at that path. macOS lets a running app be moved, and the
+// executable path the process knows does not follow it, so an update would
+// drain, then fail to replace a bundle that is not there.
+func darwinMovedWhileRunning(exe string, exists func(string) bool) bool {
+	bundle := darwinBundlePath(filepath.ToSlash(exe))
+	return bundle != "" && !exists(bundle)
+}
+
+// darwinRepointsAutoStart reports whether replacing the bundle should point
+// the login LaunchAgent at it. Not for a copy in ~/Downloads: Update Now may
+// replace one, but it is rarely the copy meant to open at login, and pointing
+// login at it would stop the installed copy from starting and updating.
+func darwinRepointsAutoStart(bundle string) bool {
+	return !darwinBundleInDownloads(bundle)
+}
+
+// pathExists reports whether p exists.
+func pathExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 // darwinBundleInDownloads reports whether bundle (slash-separated) sits under

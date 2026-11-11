@@ -207,8 +207,11 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 		return err
 	}
 	// Re-point the LaunchAgent at the (unchanged-path but freshly written)
-	// bundle so its ProgramArguments stay valid, then relaunch and quit.
-	_ = ensureAutoStart()
+	// bundle so its ProgramArguments stay valid, then relaunch and quit. A
+	// copy in ~/Downloads leaves login as it was (darwinRepointsAutoStart).
+	if darwinRepointsAutoStart(currentBundle) {
+		_ = ensureAutoStart()
+	}
 
 	fmt.Printf("[update] Replaced macOS bundle at %s; relaunching\n", currentBundle)
 	// The replacement must be able to acquire the per-account singleton as

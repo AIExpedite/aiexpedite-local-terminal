@@ -179,8 +179,10 @@ it if you'd rather not wait: new work can start again and the update stays in
 the menu for later.
 
 On the rare installation that can't replace itself — for example, an app copied
-somewhere read-only — the menu shows **"Automatic update unavailable"** with
-the reason, and you can update by downloading the latest version manually.
+somewhere read-only, or moved while it was running — the menu shows
+**"Automatic update unavailable"** with the reason, and you can update by
+downloading the latest version manually. An app moved while running updates
+again once you quit it and open it from its new place.
 
 Uncheck the item if you'd rather decide when to update.
 
@@ -195,14 +197,16 @@ Installing from here doesn't cut off running work. If coding sessions are
 running, the app asks first: it can install as soon as they finish, starting no
 new work on this computer until then (the menu shows **"Updating after current
 work"**), or keep the update in the menu for later. **Cancel Update** in the
-menu calls off an update you've asked for, while it downloads or waits. Choosing
-to install while an update is already waiting for running sessions offers to
-install right away instead, which stops them; no new session starts from that
-moment. If an update you asked for can't install, the app tells you why and
-keeps it in the menu so you can try again.
+menu calls off an update while it downloads or waits for work to finish; the
+next automatic update then waits a day. Choosing to install while an update is
+already waiting for running sessions offers to install right away instead,
+which stops them; no new session starts from that moment, and that install
+can't be cancelled. If an update you asked for can't install, the app tells you
+why and keeps it in the menu so you can try again.
 
 A copy running from your Downloads folder on a Mac doesn't update automatically,
-but choosing **Update Now** updates that copy.
+but choosing **Update Now** updates that copy. It doesn't change which copy
+opens when you log in.
 
 If you're already current, it tells you so.
 

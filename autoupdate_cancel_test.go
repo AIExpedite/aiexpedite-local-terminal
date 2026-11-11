@@ -751,25 +751,30 @@ func TestDarwinDownloadsCopyReplaceable(t *testing.T) {
 	t.Setenv("USERPROFILE", home)
 	writable := func(string) bool { return true }
 	readOnly := func(string) bool { return false }
+	present := func(string) bool { return true }
+	moved := func(string) bool { return false }
 	inDownloads := filepath.Join(home, "Downloads", "AI Expedite.app", "Contents", "MacOS", "aix")
 	inApplications := filepath.Join(home, "Applications", "AI Expedite.app", "Contents", "MacOS", "aix")
 	lookalike := filepath.Join(home, "DownloadsOld", "AI Expedite.app", "Contents", "MacOS", "aix")
 	rawBinary := filepath.Join(home, "Downloads", "aix")
 
-	if !darwinDownloadsCopyReplaceable(inDownloads, writable) {
+	if !darwinDownloadsCopyReplaceable(inDownloads, writable, present) {
 		t.Fatal("a writable copy in ~/Downloads is exactly what Update Now may replace")
 	}
-	if darwinDownloadsCopyReplaceable(inDownloads, readOnly) {
+	if darwinDownloadsCopyReplaceable(inDownloads, readOnly, present) {
 		t.Fatal("a read-only copy cannot be replaced")
 	}
-	if darwinDownloadsCopyReplaceable(inApplications, writable) {
+	if darwinDownloadsCopyReplaceable(inApplications, writable, present) {
 		t.Fatal("only ~/Downloads gets the exception; other locations use the ordinary rule")
 	}
-	if darwinDownloadsCopyReplaceable(lookalike, writable) {
+	if darwinDownloadsCopyReplaceable(lookalike, writable, present) {
 		t.Fatal("a folder that merely starts with Downloads is not ~/Downloads")
 	}
-	if darwinDownloadsCopyReplaceable(rawBinary, writable) {
+	if darwinDownloadsCopyReplaceable(rawBinary, writable, present) {
 		t.Fatal("a raw executable has no bundle to replace")
+	}
+	if darwinDownloadsCopyReplaceable(inDownloads, writable, moved) {
+		t.Fatal("a copy moved away while running is not there to replace")
 	}
 	if !darwinBundleInDownloads(filepath.ToSlash(filepath.Join(home, "Downloads", "AI Expedite.app"))) {
 		t.Fatal("the automatic rule and the exception must agree on what ~/Downloads is")
