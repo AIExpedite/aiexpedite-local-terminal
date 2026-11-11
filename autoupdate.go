@@ -1311,8 +1311,8 @@ func (au *autoUpdater) installManually(info *UpdateInfo) error {
 	// download would be cut off moments later; the choice to stop work was
 	// only made about the work already running. Admission closes first.
 	reportDrain := false
-	// reported is false only for this install's own drain while it has not
-	// told the service (forgetUnreportedAttempt). A drain taken over from an
+	// reported is false only for this install's own drain when it could not
+	// tell the service (forgetUnreportedAttempt). A drain taken over from an
 	// attempt may have been reported, so it keeps its marker as before.
 	reported := true
 	if attemptID == "" && silentUpdateCapable() {
@@ -1329,7 +1329,6 @@ func (au *autoUpdater) installManually(info *UpdateInfo) error {
 		au.drainAttempt = attemptID
 		au.mu.Unlock()
 		reportDrain = true
-		reported = false
 	}
 
 	// A manual check can select a newer release than the one that started the

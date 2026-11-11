@@ -164,10 +164,14 @@ func TestCancelUpdate_NoWhileTheCancelledAttemptLeavesStartsNothing(t *testing.T
 
 	attemptDone := startScheduledAttempt(t, r)
 	receiveWithin(t, polls, "the scheduled attempt to wait in its drain")
+	var offeredBeforeNo int
 	r.au.confirm = func(string, string) bool {
 		if err := cancelUpdateManually(); err != nil {
 			t.Errorf("cancelUpdateManually: %v", err)
 		}
+		r.mu.Lock()
+		offeredBeforeNo = r.showCancel
+		r.mu.Unlock()
 		return false
 	}
 
@@ -181,6 +185,13 @@ func TestCancelUpdate_NoWhileTheCancelledAttemptLeavesStartsNothing(t *testing.T
 	r.au.mu.Unlock()
 	if requested || len(r.au.triggerCh) != 0 {
 		t.Fatalf("No must not queue the update the user cancelled (requested=%v, nudges=%d)", requested, len(r.au.triggerCh))
+	}
+	// Nor make the leaving attempt the user's request, which would offer
+	// Cancel Update again for an update already called off.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.showCancel != offeredBeforeNo {
+		t.Fatalf("No offered Cancel Update again for a cancelled update (shown %d, then %d)", offeredBeforeNo, r.showCancel)
 	}
 }
 
