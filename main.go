@@ -565,13 +565,18 @@ func onTrayReady(cfg *Config) func() {
 					}()
 
 				case <-mInstallUpdate.ClickedCh:
-					// Install pending update
+					// Install pending update. Off the tray loop, as Check for
+					// Updates is: the install can ask a question, and while
+					// this loop waits on a dialog every other click (Cancel
+					// Update among them) is dropped.
 					if info := GetPendingUpdate(); info != nil {
-						fmt.Printf("[update] Installing pending update: %s\n", info.LatestVersion)
-						if err := installUpdateManually(info); err != nil {
-							fmt.Println("[update] Failed:", err)
-							ShowErrorDialog("Update Failed", err.Error())
-						}
+						go func() {
+							fmt.Printf("[update] Installing pending update: %s\n", info.LatestVersion)
+							if err := installUpdateManually(info); err != nil {
+								fmt.Println("[update] Failed:", err)
+								ShowErrorDialog("Update Failed", err.Error())
+							}
+						}()
 					}
 
 				case <-mCancelUpdate.ClickedCh:
