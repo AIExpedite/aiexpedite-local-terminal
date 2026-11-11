@@ -156,6 +156,39 @@ func TestCancelUpdate_NoAfterTheAttemptEndedStartsNothing(t *testing.T) {
 	}
 }
 
+// The question can name an older release than the one the running attempt
+// found (an Install Update item left from earlier). Cancelling puts the newer
+// one on the menu, and the No that follows must not put the older one back.
+func TestCancelUpdate_NoForAnOlderReleaseKeepsTheNewerOnTheMenu(t *testing.T) {
+	r, _ := newManualRig(t, registeredCfg())
+	r.activeWork = 1
+	polls := steppedSleep(r)
+	older := &UpdateInfo{Available: true, LatestVersion: "v9.9.8", CurrentVersion: Version}
+
+	attemptDone := startScheduledAttempt(t, r)
+	receiveWithin(t, polls, "the scheduled attempt to wait in its drain")
+	r.au.confirm = func(string, string) bool {
+		if err := cancelUpdateManually(); err != nil {
+			t.Errorf("cancelUpdateManually: %v", err)
+		}
+		receiveWithin(t, attemptDone, "the cancelled attempt to end")
+		return false
+	}
+
+	if err := installUpdateManually(older); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+
+	if got := GetPendingUpdate(); got == nil || got.LatestVersion != r.info.LatestVersion {
+		t.Fatalf("Install Update would act on %+v, want %s", got, r.info.LatestVersion)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if last := r.pendingShown[len(r.pendingShown)-1]; last != r.info.LatestVersion {
+		t.Fatalf("the menu shows %s last, want %s (shown %v)", last, r.info.LatestVersion, r.pendingShown)
+	}
+}
+
 // The same, with No answered while the cancelled attempt is still leaving.
 func TestCancelUpdate_NoWhileTheCancelledAttemptLeavesStartsNothing(t *testing.T) {
 	r, _ := newManualRig(t, registeredCfg())

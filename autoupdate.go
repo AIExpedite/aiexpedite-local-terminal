@@ -42,6 +42,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/mod/semver"
 )
 
 const updateAppliedArg = "--update-applied"
@@ -1576,7 +1578,7 @@ func (au *autoUpdater) handleManualInstall(info *UpdateInfo) error {
 		}
 		if !joined {
 			fmt.Println("[update] Manual update: the update this asked about has ended; keeping it in the menu")
-			au.offerForLater(info)
+			au.offerUnlessNewerPending(info)
 			return nil
 		}
 		fmt.Println("[update] Manual update: keeping the update that waits for running work")
@@ -1697,6 +1699,18 @@ func (au *autoUpdater) reportManualOutcome(info *UpdateInfo, failure error) {
 		// the next attempt.
 		go au.manualFailed(version, failure)
 	}
+}
+
+// offerUnlessNewerPending is offerForLater, except that it never replaces a
+// newer release already on the menu. A question left open while an attempt
+// ran can name an older release than the one that attempt found and offered.
+func (au *autoUpdater) offerUnlessNewerPending(info *UpdateInfo) {
+	if pending := GetPendingUpdate(); pending != nil && info != nil &&
+		semver.IsValid(pending.LatestVersion) && semver.IsValid(info.LatestVersion) &&
+		semver.Compare(pending.LatestVersion, info.LatestVersion) > 0 {
+		return
+	}
+	au.offerForLater(info)
 }
 
 // offerForLater keeps an update on the menu as "Install Update (vX)".
