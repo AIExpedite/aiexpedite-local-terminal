@@ -73,6 +73,8 @@ type autoTestRig struct {
 	showBlocked  int
 	showDraining int
 	hideDraining int
+	showCancel   int
+	hideCancel   int
 	pendingShown []string
 }
 
@@ -172,6 +174,8 @@ func newAutoTestRig(t *testing.T, cfg *Config) *autoTestRig {
 			r.pendingShown = append(r.pendingShown, v)
 			r.mu.Unlock()
 		},
+		showCancel: func() { r.mu.Lock(); r.showCancel++; r.mu.Unlock() },
+		hideCancel: func() { r.mu.Lock(); r.hideCancel++; r.mu.Unlock() },
 	}
 	r.au = au
 	return r
@@ -1792,16 +1796,21 @@ func observeApply(r *autoTestRig) *[]applyObservation {
 
 // steppedSleep parks the attempt at every sleep until the test receives from
 // the returned channel, so a test can act while an attempt waits in its drain.
-// A takeover or stop releases it, as the real sleep does.
+// A takeover, stop or cancel releases it, as the real sleep does.
 func steppedSleep(r *autoTestRig) <-chan struct{} {
 	polls := make(chan struct{})
 	r.au.sleep = func(d time.Duration) bool {
+		r.au.mu.Lock()
+		cancelled := r.au.cancelRequested
+		r.au.mu.Unlock()
 		select {
 		case polls <- struct{}{}:
 		case <-r.au.getTakeoverCh():
 			return false
 		case <-r.au.stopCh:
 			return false
+		case <-cancelled:
+			return true
 		}
 		r.mu.Lock()
 		r.clock = r.clock.Add(d)

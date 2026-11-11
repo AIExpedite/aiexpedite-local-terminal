@@ -339,6 +339,10 @@ func onTrayReady(cfg *Config) func() {
 		mDraining := systray.AddMenuItem("Updating after current work", "Finishing current work before updating")
 		mDraining.Disable()
 		mDraining.Hide()
+		// The way out of an update that is downloading or waiting for work.
+		// Hidden unless there is one to call off.
+		mCancelUpdate := systray.AddMenuItem("Cancel Update", "Stop this update; new work can start on this computer again")
+		mCancelUpdate.Hide()
 		mUpdateBlocked := systray.AddMenuItem("Automatic update unavailable", "This installation cannot update itself")
 		mUpdateBlocked.Disable()
 		mUpdateBlocked.Hide()
@@ -406,6 +410,8 @@ func onTrayReady(cfg *Config) func() {
 				mInstallUpdate.SetTooltip("Click to install the pending update")
 				mInstallUpdate.Show()
 			},
+			showCancel: func() { mCancelUpdate.Show() },
+			hideCancel: func() { mCancelUpdate.Hide() },
 		}
 		StartAutoUpdateScheduler(cfg, trayHandles, registrationInProgress)
 
@@ -567,6 +573,14 @@ func onTrayReady(cfg *Config) func() {
 							ShowErrorDialog("Update Failed", err.Error())
 						}
 					}
+
+				case <-mCancelUpdate.ClickedCh:
+					go func() {
+						if err := cancelUpdateManually(); err != nil {
+							fmt.Println("[update] Could not cancel the update:", err)
+							ShowErrorDialog("Cancel Update", err.Error())
+						}
+					}()
 
 				case <-mRegister.ClickedCh:
 					// If already registered, show info dialog

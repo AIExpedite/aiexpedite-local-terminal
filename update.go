@@ -456,6 +456,35 @@ func installUpdatable() (bool, string) {
 	return true, ""
 }
 
+// installUpdatableOnRequest is installUpdatable for an update a user asked
+// for. The one difference is a macOS copy in ~/Downloads: a scheduled update
+// leaves it alone, since a copy there is rarely the one the user means to keep
+// current, but a user who clicks Update Now on it means exactly that copy. A
+// location the update cannot replace (a mounted disk image, a read-only or
+// translocated path) stays refused either way.
+func installUpdatableOnRequest() (bool, string) {
+	if runtime.GOOS == "darwin" {
+		if exe, err := runningUpdateTarget(); err == nil && darwinDownloadsCopyReplaceable(exe, dirWritable) {
+			return true, ""
+		}
+	}
+	return installUpdatable()
+}
+
+// darwinDownloadsCopyReplaceable reports whether exe is a bundle in ~/Downloads
+// whose parent folder accepts the replacement.
+func darwinDownloadsCopyReplaceable(exe string, writable func(string) bool) bool {
+	bundle := darwinBundlePath(filepath.ToSlash(exe))
+	return bundle != "" && darwinBundleInDownloads(bundle) && writable(filepath.Dir(bundle))
+}
+
+// darwinBundleInDownloads reports whether bundle (slash-separated) sits under
+// the user's ~/Downloads.
+func darwinBundleInDownloads(bundle string) bool {
+	home, _ := os.UserHomeDir()
+	return home != "" && strings.HasPrefix(bundle, filepath.ToSlash(filepath.Join(home, "Downloads"))+"/")
+}
+
 var (
 	fallbackUpdateTarget string
 )
@@ -532,7 +561,7 @@ func darwinLocationSupportedWithWritable(exe string, writable func(string) bool)
 	if strings.HasPrefix(lower, "/volumes/") {
 		return false, "Automatic update unavailable — running from a mounted disk image; move AI Expedite to ~/Applications"
 	}
-	if home != "" && strings.HasPrefix(bundle, filepath.ToSlash(filepath.Join(home, "Downloads"))+"/") {
+	if darwinBundleInDownloads(bundle) {
 		return false, "Automatic update unavailable — running from Downloads; move AI Expedite to ~/Applications"
 	}
 

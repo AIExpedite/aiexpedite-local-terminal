@@ -174,7 +174,9 @@ versions on its own.
 
 Updates never interrupt work: if a task is running when an update is ready, the
 app waits for it to finish. While it's waiting, the menu shows
-**"Updating after current work"** as a status line.
+**"Updating after current work"** as a status line, with **Cancel Update** below
+it if you'd rather not wait: new work can start again and the update stays in
+the menu for later.
 
 On the rare installation that can't replace itself — for example, an app copied
 somewhere read-only — the menu shows **"Automatic update unavailable"** with
@@ -192,10 +194,15 @@ install it whenever it suits you.
 Installing from here doesn't cut off running work. If coding sessions are
 running, the app asks first: it can install as soon as they finish, starting no
 new work on this computer until then (the menu shows **"Updating after current
-work"**), or keep the update in the menu for later. Choosing to install
-while an update is already waiting for running sessions offers to install right
-away instead, which stops them. If an update you asked for can't install, the
-app tells you why and keeps it in the menu so you can try again.
+work"**), or keep the update in the menu for later. **Cancel Update** in the
+menu calls off an update you've asked for, while it downloads or waits. Choosing
+to install while an update is already waiting for running sessions offers to
+install right away instead, which stops them; no new session starts from that
+moment. If an update you asked for can't install, the app tells you why and
+keeps it in the menu so you can try again.
+
+A copy running from your Downloads folder on a Mac doesn't update automatically,
+but choosing **Update Now** updates that copy.
 
 If you're already current, it tells you so.
 
