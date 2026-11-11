@@ -205,6 +205,10 @@ type trayUpdateHandles struct {
 	// Used by the macOS check-and-offer fallback, which does NOT drain or
 	// restart itself — it surfaces the pending update for the user to click.
 	showPendingInstall func(version string)
+	// showCancel / hideCancel control the "Cancel Update" item, offered while
+	// an update can still be called off (cancelUpdate).
+	showCancel func()
+	hideCancel func()
 }
 
 func (t *trayUpdateHandles) draining(on bool) {
@@ -217,6 +221,19 @@ func (t *trayUpdateHandles) draining(on bool) {
 		}
 	} else if t.hideDraining != nil {
 		t.hideDraining()
+	}
+}
+
+func (t *trayUpdateHandles) cancelable(on bool) {
+	if t == nil {
+		return
+	}
+	if on {
+		if t.showCancel != nil {
+			t.showCancel()
+		}
+	} else if t.hideCancel != nil {
+		t.hideCancel()
 	}
 }
 
@@ -251,6 +268,8 @@ type autoUpdater struct {
 	activeWork     func() int
 	claimInstall   func() bool
 	installable    func() (bool, string)
+	// manualLocation is installable for an update a user asked for.
+	manualLocation func() (bool, string)
 	registering    func() bool
 	cloudConnected func() bool
 	drainEnter     func(ctx context.Context, attemptID, target string) error
@@ -298,6 +317,12 @@ type autoUpdater struct {
 	// installing (noteAttemptFailure); attemptInstalled records that it did.
 	attemptFailure   error
 	attemptInstalled bool
+	// attemptCancelled records that the user called the running attempt off
+	// (cancelUpdate). cancelRequested is closed at the same moment, to wake
+	// the attempt from whatever it is waiting on. tick creates it with the
+	// attempt, so it is non-nil whenever inProgress is true.
+	attemptCancelled bool
+	cancelRequested  chan struct{}
 
 	attemptSeq atomic.Uint64
 	stopCh     chan struct{}
@@ -321,6 +346,7 @@ func newAutoUpdater(cfg *Config, tray *trayUpdateHandles) *autoUpdater {
 		claimInstall:   sealDrainForInstall,
 		installable:    installUpdatable,
 		registering:    func() bool { return false },
+		manualLocation: installUpdatableOnRequest,
 		savePath:       ConfigPath(),
 		stopCh:         make(chan struct{}),
 		triggerCh:      make(chan struct{}, 1),
@@ -381,37 +407,38 @@ func (au *autoUpdater) getTakeoverCh() chan struct{} {
 	return au.manualTakeover
 }
 
-// realSleep waits d unless the updater is stopped or manual takeover was requested.
-// Returns false if stopped or canceled.
+// realSleep waits d unless the updater is stopped, manual takeover was
+// requested, or the user cancelled the attempt. Returns false if stopped or
+// taken over. A cancel returns true: the caller's next check acts on it, and
+// the drain has to be left properly rather than abandoned.
 func (au *autoUpdater) realSleep(d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
-	takeover := au.getTakeoverCh()
-	if takeover != nil {
-		select {
-		case <-t.C:
-			return true
-		case <-au.stopCh:
-			return false
-		case <-takeover:
-			return false
-		}
-	}
+	au.mu.Lock()
+	takeover := au.manualTakeover
+	cancelled := au.cancelRequested
+	au.mu.Unlock()
+	// A nil channel never fires, so an absent one simply drops out.
 	select {
 	case <-t.C:
 		return true
 	case <-au.stopCh:
 		return false
+	case <-takeover:
+		return false
+	case <-cancelled:
+		return true
 	}
 }
 
 // attemptContext returns a context that is canceled when manualTakeover is triggered,
-// the updater is stopped, or cancel is explicitly invoked.
+// the updater is stopped, the user cancels the attempt, or cancel is explicitly invoked.
 func (au *autoUpdater) attemptContext() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	au.mu.Lock()
 	stopCh := au.stopCh
 	takeoverCh := au.manualTakeover
+	cancelledCh := au.cancelRequested
 	au.attemptCancel = cancel
 	au.mu.Unlock()
 
@@ -424,6 +451,8 @@ func (au *autoUpdater) attemptContext() (context.Context, context.CancelFunc) {
 			if takeoverCh != nil {
 				cancel()
 			}
+		case <-cancelledCh:
+			cancel()
 		}
 	}()
 
@@ -621,6 +650,8 @@ func (au *autoUpdater) tick() {
 	au.attemptManualInfo = requested
 	au.attemptFailure = nil
 	au.attemptInstalled = false
+	au.attemptCancelled = false
+	au.cancelRequested = make(chan struct{})
 	au.manualRequested = false
 	au.manualInfo = nil
 	au.autoDone = make(chan struct{})
@@ -628,14 +659,19 @@ func (au *autoUpdater) tick() {
 	done := au.autoDone
 	takeover := au.manualTakeover
 	au.mu.Unlock()
+	if manual {
+		au.tray.cancelable(true)
+	}
 
 	defer func() {
 		au.mu.Lock()
 		// Read in the same critical section that ends the attempt, so a
 		// request that joins it (requestManualInstall) is either reported
 		// here or starts an attempt of its own, never neither. An install
-		// that took the attempt over, or shutdown, owns the outcome instead.
-		reportManual := au.attemptManual && !au.attemptInstalled &&
+		// that took the attempt over, shutdown, or the user cancelling it
+		// owns the outcome instead.
+		cancelled := au.attemptCancelled
+		reportManual := au.attemptManual && !au.attemptInstalled && !cancelled &&
 			!au.stopping && !channelClosed(takeover)
 		manualInfo := au.attemptManualInfo
 		failure := au.attemptFailure
@@ -643,6 +679,8 @@ func (au *autoUpdater) tick() {
 		au.attemptManualInfo = nil
 		au.attemptFailure = nil
 		au.attemptInstalled = false
+		au.attemptCancelled = false
+		au.cancelRequested = nil
 		au.inProgress = false
 		au.autoDone = nil
 		au.manualTakeover = nil
@@ -653,10 +691,20 @@ func (au *autoUpdater) tick() {
 		au.installing = false
 		au.applying = false
 		au.drainAttempt = ""
+		requestWaiting := au.manualRequested
 		close(done)
 		au.mu.Unlock()
+		au.tray.cancelable(false)
+		if cancelled {
+			au.offerForLater(manualInfo)
+		}
 		if reportManual {
 			au.reportManualOutcome(manualInfo, failure)
+		}
+		if requestWaiting {
+			// A request made while this attempt was on its way out after a
+			// cancel; only a tick can start it (requestManualInstall).
+			au.nudge()
 		}
 	}()
 
@@ -747,7 +795,7 @@ func (au *autoUpdater) runAttempt() {
 
 	// A read-only / not-yet-relocated install cannot update itself. Say so in
 	// the tray and stop — never retry silently in a loop.
-	if ok, reason := au.installable(); !ok {
+	if ok, reason := au.updatableLocation(); !ok {
 		fmt.Printf("[autoupdate] Install location not updatable: %s\n", reason)
 		au.tray.blocked(true, reason)
 		au.noteAttemptFailure(errors.New(reason))
@@ -781,6 +829,23 @@ func (au *autoUpdater) runAttempt() {
 	// is a choice made in the manual dialog and must not suppress an enabled
 	// automatic update. The manual flow keeps honouring it.
 	au.drainAndInstall(ctx, newAttemptID(au.now(), au.attemptSeq.Add(1)), info, path)
+}
+
+// updatableLocation applies the install-location rule for this attempt: an
+// update a user asked for may go ahead in places a scheduled one may not
+// (installUpdatableOnRequest).
+func (au *autoUpdater) updatableLocation() (bool, string) {
+	if au.isManualAttempt() && au.manualLocation != nil {
+		return au.manualLocation()
+	}
+	return au.installable()
+}
+
+// updateCancelled reports whether the user called the running attempt off.
+func (au *autoUpdater) updateCancelled() bool {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	return au.attemptCancelled
 }
 
 // checkOnlyWithRetry runs the metadata check (no download) with bounded
@@ -882,8 +947,12 @@ func (au *autoUpdater) drainAndInstall(attemptCtx context.Context, attemptID str
 	// excluded by au.mu. A manual click therefore either wins before draining
 	// starts, or captures the exact drain it must restore if its install fails.
 	au.mu.Lock()
-	if au.stopping || channelClosed(au.manualTakeover) {
+	if au.stopping || channelClosed(au.manualTakeover) || au.attemptCancelled {
+		cancelled := au.attemptCancelled
 		au.mu.Unlock()
+		if cancelled {
+			au.offerForLater(info)
+		}
 		return
 	}
 	au.drainAttempt = attemptID
@@ -896,6 +965,7 @@ func (au *autoUpdater) drainAndInstall(attemptCtx context.Context, attemptID str
 	}
 	au.mu.Unlock()
 	au.tray.draining(true)
+	au.tray.cancelable(true)
 	if err := au.persistAttempt(attemptID, info.LatestVersion); err != nil {
 		fmt.Printf("[autoupdate] Could not persist attempt marker; abandoning update: %v\n", err)
 		au.noteAttemptFailure(fmt.Errorf("could not save the update's progress: %w", err))
@@ -963,6 +1033,15 @@ func (au *autoUpdater) drainAndInstall(attemptCtx context.Context, attemptID str
 		stopping := au.stopping
 		au.mu.Unlock()
 		if stopping {
+			return
+		}
+		// The user called the update off from the menu. Leave the drain the way
+		// a deferral does, cooldown included, so the next scheduled check does
+		// not start waiting again straight away; the release stays on the menu.
+		if au.updateCancelled() {
+			fmt.Printf("[autoupdate] Update to %s cancelled by the user; accepting work again\n", info.LatestVersion)
+			au.exitDrain(attemptID, "deferred", true)
+			au.offerForLater(info)
 			return
 		}
 		// Preference turned off before replacement began — cancel cleanly and
@@ -1039,9 +1118,10 @@ func (au *autoUpdater) drainAndInstall(attemptCtx context.Context, attemptID str
 			// explicit exit sets stopping, this process can no longer launch a
 			// replacement even if teardown makes ActiveWork fall to zero.
 			au.mu.Lock()
-			if !au.stopping && au.claimInstall() {
+			if !au.stopping && !au.attemptCancelled && au.claimInstall() {
 				au.installing = true
 				au.mu.Unlock()
+				au.tray.cancelable(false)
 				break
 			}
 			au.mu.Unlock()
@@ -1174,6 +1254,34 @@ func (au *autoUpdater) installManually(info *UpdateInfo) error {
 		au.mu.Unlock()
 	}()
 
+	// The attempt may have left its drain on the way out (a cancel or the
+	// preference, racing this click). Nothing is held closed for this install
+	// then, so it needs its own.
+	if attemptID != "" && (!isDraining() || drainingAttempt() != attemptID) {
+		attemptID = ""
+	}
+	// The release may still have to download, and the restart stops whatever
+	// is running by then. With admission open, a session started during the
+	// download would be cut off moments later; the choice to stop work was
+	// only made about the work already running. Admission closes first.
+	reportDrain := false
+	if attemptID == "" && silentUpdateCapable() {
+		attemptID = newAttemptID(au.now(), au.attemptSeq.Add(1))
+		au.mu.Lock()
+		if au.stopping {
+			au.mu.Unlock()
+			return errUpdaterStopping
+		}
+		if !closeAdmission(attemptID) {
+			au.mu.Unlock()
+			return errRegistrationInProgress
+		}
+		au.drainAttempt = attemptID
+		au.mu.Unlock()
+		au.tray.draining(true)
+		reportDrain = true
+	}
+
 	// A manual check can select a newer release than the one that started the
 	// automatic drain. Retarget the durable marker before applying so the
 	// replacement's --update-applied signal reconciles against the version that
@@ -1191,6 +1299,9 @@ func (au *autoUpdater) installManually(info *UpdateInfo) error {
 			}
 			return fmt.Errorf("could not persist manual update target: %w", err)
 		}
+	}
+	if reportDrain {
+		au.reportImmediateInstallDrain(attemptID, info.LatestVersion)
 	}
 
 	var (
@@ -1238,6 +1349,21 @@ func (au *autoUpdater) installManually(info *UpdateInfo) error {
 	return err
 }
 
+// reportImmediateInstallDrain tells the service that an immediate install has
+// closed admission, so it stops routing work here before the restart. Best
+// effort: this computer already refuses new work, and the user asked for the
+// install now, so a service that cannot be reached does not hold it up.
+func (au *autoUpdater) reportImmediateInstallDrain(attemptID, target string) {
+	if !au.cloudConnected() {
+		return
+	}
+	ctx, cancel := au.recoveryContext(5 * time.Second)
+	defer cancel()
+	if err := au.drainEnter(ctx, attemptID, target); err != nil {
+		fmt.Printf("[update] Could not tell the service about the install; continuing: %v\n", err)
+	}
+}
+
 // installUpdateManually is what "Update Now" (Check for Updates) and the
 // "Install Update (vX)" menu item run.
 func installUpdateManually(info *UpdateInfo) error {
@@ -1264,6 +1390,53 @@ var (
 	errImmediateInstallBusy = errors.New("an update install is already in progress")
 	errUpdateSealed         = errors.New("the update is already being installed")
 )
+
+// cancelUpdateManually is what the "Cancel Update" menu item runs.
+func cancelUpdateManually() error {
+	if globalAutoUpdater == nil {
+		return nil
+	}
+	return globalAutoUpdater.cancelUpdate()
+}
+
+// cancelUpdate calls off the update the app is working on, at the user's
+// request: the download stops, admission reopens, the service resumes routing
+// work here, and the release stays on the menu as "Install Update (vX)". Work
+// already running is not touched. The next scheduled attempt waits out the
+// same cooldown a deferral does.
+//
+// It refuses once the install has begun, since a replacement cannot be taken
+// back at that point.
+func (au *autoUpdater) cancelUpdate() error {
+	au.mu.Lock()
+	switch {
+	case au.stopping:
+		au.mu.Unlock()
+		return errUpdaterStopping
+	case au.manualInProgress:
+		au.mu.Unlock()
+		return errImmediateInstallBusy
+	case au.installing || au.applying:
+		au.mu.Unlock()
+		return errUpdateSealed
+	}
+	waitingRequest := au.manualRequested
+	waitingInfo := au.manualInfo
+	au.manualRequested = false
+	au.manualInfo = nil
+	if au.inProgress && !au.attemptCancelled {
+		au.attemptCancelled = true
+		close(au.cancelRequested)
+	}
+	au.mu.Unlock()
+
+	au.tray.cancelable(false)
+	if waitingRequest {
+		au.offerForLater(waitingInfo)
+	}
+	fmt.Println("[update] Update cancelled from the menu")
+	return nil
+}
 
 // handleManualInstall decides what a click on "Update Now" or "Install Update"
 // does. Nothing here cuts off running work unless the user says so:
@@ -1296,8 +1469,10 @@ func (au *autoUpdater) handleManualInstall(info *UpdateInfo) error {
 	stopping := au.stopping
 	immediate := au.manualInProgress
 	sealed := au.installing || au.applying
-	waiting := au.inProgress
-	admissionClosed := au.drainAttempt != ""
+	// An attempt the user just cancelled is leaving: this click starts over
+	// (requestManualInstall) rather than being offered that attempt to join.
+	waiting := au.inProgress && !au.attemptCancelled
+	admissionClosed := au.drainAttempt != "" && !au.attemptCancelled
 	au.mu.Unlock()
 	switch {
 	case stopping:
@@ -1364,12 +1539,21 @@ func (au *autoUpdater) requestManualInstall(info *UpdateInfo) error {
 	case au.manualInProgress:
 		au.mu.Unlock()
 		return errImmediateInstallBusy
+	case au.inProgress && au.attemptCancelled:
+		// The running attempt was cancelled and is on its way out. The user
+		// has changed their mind, so this starts an attempt of its own when
+		// that one ends (tick's exit nudges the scheduler).
+		au.manualRequested = true
+		au.manualInfo = info
+		au.mu.Unlock()
+		return nil
 	case au.inProgress:
 		au.attemptManual = true
 		if info != nil {
 			au.attemptManualInfo = info
 		}
 		au.mu.Unlock()
+		au.tray.cancelable(true)
 		return nil
 	}
 	au.manualRequested = true
@@ -1448,7 +1632,7 @@ func manualWaitForWorkPrompt(running int, version string) (title, message string
 	return "Update After Current Work?", fmt.Sprintf(
 		"%s running on this computer.\n\n"+
 			"AI Expedite can install %s as soon as %s, starting no new work on this computer until then.\n\n"+
-			"Yes: install when %s.\n"+
+			"Yes: install when %s. You can call it off with Cancel Update in the menu.\n"+
 			"No: keep the update in the menu for later.",
 		runningSessionsPhrase(running), version, finish, finish)
 }
@@ -1466,7 +1650,7 @@ func manualInstallNowPrompt(running int) (title, message string) {
 	return "Install Update Now?", "AI Expedite is already updating, and will install as soon as the work running on this computer finishes.\n\n" +
 		stops + "\n\n" +
 		"Yes: install now.\n" +
-		"No: keep waiting for the work to finish."
+		"No: keep waiting for the work to finish. To stop waiting, choose Cancel Update in the menu."
 }
 
 // canInstallNow decides whether a drained agent may install:
