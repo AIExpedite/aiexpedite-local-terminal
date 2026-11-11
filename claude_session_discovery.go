@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"cloud.google.com/go/pubsub/v2"
@@ -47,8 +48,16 @@ const (
 // The one engine this build discovers (shared-constants CLI_SESSION_ENGINES).
 const cliSessionEngineClaudeCode = "claudeCode"
 
-// cliSessionDiscoveryProtocol is advertised in capabilitiesInfo.
-const cliSessionDiscoveryProtocol = 1
+// cliSessionDiscoveryProtocol is advertised in capabilitiesInfo
+// (shared-constants CLI_SESSION_DISCOVERY_PROTOCOL; a reader accepts any value
+// at or above its own). 2 adds, all additive:
+//   - rows (and the probe) carry `startedVia` / `lastVia`, the raw entrypoint
+//     Claude Code recorded when the session started and when it was last driven;
+//   - a scan cut short by the time budget keeps what it read and says
+//     `truncated: true`;
+//   - the claude_native_outside_writer frame names the agent (`agentId`,
+//     `bootId`), and a --fork-session copy never watches the original.
+const cliSessionDiscoveryProtocol = 2
 
 // Sources (shared-constants CLI_SESSION_SOURCES).
 const (
@@ -93,6 +102,13 @@ const (
 	cliSessionMaxRows             = 500
 	// The whole discovery answers inside this budget (terminal-service waits 8 s).
 	cliSessionDiscoverBudget = 6 * time.Second
+	// The source readers stop this long before the budget ends (at most a
+	// quarter of what is left), so the collector, which waits for the whole
+	// budget, still receives what each one read in time instead of abandoning
+	// a slow transcript scan's partial answer at the deadline.
+	cliSessionSourceDeadlineGrace = 750 * time.Millisecond
+	// A `startedVia` / `lastVia` value is cut to this many characters.
+	cliSessionViaMaxChars = 40
 	// A prompt-based fallback label is cut to this many characters (after masking).
 	cliSessionFallbackLabelMaxChars = 80
 	// A title of any kind is cut to this many characters.
@@ -141,6 +157,14 @@ type cliSessionRow struct {
 	Editors             []cliSessionEditorRef `json:"editors"`
 	StartedByAiExpedite bool                  `json:"startedByAiExpedite"`
 	Resumable           bool                  `json:"resumable"`
+	// Where the session was started and where it was last driven, as Claude
+	// Code recorded it in the transcript (`entrypoint`: "claude-vscode",
+	// "claude-desktop", "cli", "sdk-cli", …), raw and capped; absent when the
+	// transcript names none. A value this build does not know passes through
+	// unchanged: readers map it through their own allowlist (shared-constants
+	// CLI_SESSION_ENTRYPOINTS). Protocol 2.
+	StartedVia string `json:"startedVia,omitempty"`
+	LastVia    string `json:"lastVia,omitempty"`
 }
 
 type cliSessionSkip struct {
@@ -224,6 +248,30 @@ func claudeResumeIDFromArgs(args []string) string {
 	return ""
 }
 
+// claudeForkSessionFromArgs reports whether a start COPIES the session it
+// resumes (`--fork-session`, the adopt flow's "continue from a copy",
+// residentChatStartRoute.js): Claude then runs a NEW session id whose history
+// starts as the original's, and the original is left alone.
+func claudeForkSessionFromArgs(args []string) bool {
+	for _, a := range args {
+		if a == "--fork-session" || a == "--fork-session=true" {
+			return true
+		}
+	}
+	return false
+}
+
+// claudeResumedInPlaceID is the session id a start continues IN PLACE — its
+// --resume id — or "" for a fresh start and for a --fork-session copy. Only a
+// session continued in place is AI Expedite's to claim and watch for another
+// writer; a copy's own id is learnt from its init frame like a fresh one's.
+func claudeResumedInPlaceID(args []string) string {
+	if claudeForkSessionFromArgs(args) {
+		return ""
+	}
+	return claudeResumeIDFromArgs(args)
+}
+
 // claudeInitSessionID returns the session_id of a stream-json system/init
 // frame, or "" for any other line.
 func claudeInitSessionID(line string) string {
@@ -260,6 +308,27 @@ func cliSessionLabel(text string, max int) string {
 	return strings.TrimSpace(string(runes[:max-1])) + "…"
 }
 
+// cliSessionViaValue is an entrypoint value as a row reports it: trimmed and
+// cut to cliSessionViaMaxChars, "" for an empty value or one that is not a
+// single printable line (never a code). Any other value passes through as
+// Claude wrote it — there is no allowlist here, so a new entrypoint reaches
+// the server unchanged.
+func cliSessionViaValue(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" || !utf8.ValidString(v) {
+		return ""
+	}
+	for _, r := range v {
+		if !unicode.IsPrint(r) {
+			return ""
+		}
+	}
+	if utf8.RuneCountInString(v) > cliSessionViaMaxChars {
+		v = string([]rune(v)[:cliSessionViaMaxChars])
+	}
+	return v
+}
+
 func isDefaultClaudeTitle(title string) bool {
 	return strings.EqualFold(strings.Join(strings.Fields(title), " "), claudeDefaultSessionTitle)
 }
@@ -280,6 +349,9 @@ func editorTitleExtends(tabTitle, full string) bool {
 /* Discovery                                                                  */
 /* -------------------------------------------------------------------------- */
 
+// claudeStoreReader reads Claude's transcript store (readClaudeStore).
+type claudeStoreReader func(ctx context.Context, configDir string, since time.Time, maxRows int) claudeSourceOutcome
+
 // claudeDiscoveryEnv is everything discovery reads from, injectable for tests.
 type claudeDiscoveryEnv struct {
 	configDir    string            // Claude's config dir (~/.claude or CLAUDE_CONFIG_DIR)
@@ -289,6 +361,9 @@ type claudeDiscoveryEnv struct {
 	maxRows      int
 	isOwnSession func(string) bool
 	isOwnPID     func(int) bool
+	// readStore reads the transcript store; nil is readClaudeStore. A seam
+	// for tests (a scan still running at the deadline).
+	readStore claudeStoreReader
 }
 
 func defaultClaudeDiscoveryEnv(lookBackDays, maxRows int) claudeDiscoveryEnv {
@@ -331,9 +406,42 @@ type claudeSourceOutcome struct {
 	trunc         bool
 }
 
+// claudeSourceContext is the context the source readers run under: it ends
+// cliSessionSourceDeadlineGrace (at most a quarter of the time left) before
+// ctx does, so a reader that stops on it still has time to hand its partial
+// outcome to the collector, which waits on ctx itself. Without a deadline on
+// ctx the readers simply share its cancellation.
+func claudeSourceContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return context.WithCancel(ctx)
+	}
+	grace := cliSessionSourceDeadlineGrace
+	if quarter := time.Until(deadline) / 4; quarter < grace {
+		grace = quarter
+	}
+	if grace < 0 {
+		grace = 0
+	}
+	return context.WithDeadline(ctx, deadline.Add(-grace))
+}
+
 // discoverClaudeSessions runs every source under ctx, merges by session id and
 // returns the result rows newest first, capped at env.maxRows.
+//
+// A scan that does not finish inside the budget still answers with what it
+// read: the readers stop a little before ctx ends (claudeSourceContext) and
+// the collector keeps waiting for their partial outcomes until ctx does. The
+// answer then says `truncated: true`, so a reader never takes "no match" in a
+// partial scan for "no such session".
 func discoverClaudeSessions(ctx context.Context, env claudeDiscoveryEnv) cliSessionsDiscoverResult {
+	srcCtx, cancelSources := claudeSourceContext(ctx)
+	defer cancelSources()
+	readStore := env.readStore
+	if readStore == nil {
+		readStore = readClaudeStore
+	}
+
 	type job struct {
 		source string
 		run    func() claudeSourceOutcome
@@ -343,13 +451,13 @@ func discoverClaudeSessions(ctx context.Context, env claudeDiscoveryEnv) cliSess
 		src := src
 		root := env.editorRoots[src]
 		jobs = append(jobs, job{src, func() claudeSourceOutcome {
-			return readEditorClaudeTabs(ctx, src, root, env.now.Add(-env.lookBack))
+			return readEditorClaudeTabs(srcCtx, src, root, env.now.Add(-env.lookBack))
 		}})
 	}
 	jobs = append(jobs,
 		job{cliSessionSourceClaudeRegistry, func() claudeSourceOutcome { return readClaudeRegistry(env.configDir) }},
 		job{cliSessionSourceClaudeStore, func() claudeSourceOutcome {
-			return readClaudeStore(ctx, env.configDir, env.now.Add(-env.lookBack), env.maxRows)
+			return readStore(srcCtx, env.configDir, env.now.Add(-env.lookBack), env.maxRows)
 		}},
 	)
 
@@ -397,11 +505,15 @@ collect:
 		}
 	}
 
-	store := outcomes[cliSessionSourceClaudeStore].store
+	storeOutcome, storeAnswered := outcomes[cliSessionSourceClaudeStore]
+	store := storeOutcome.store
 	if store == nil {
 		store = map[string]*claudeTranscriptInfo{}
 	}
-	res.Truncated = outcomes[cliSessionSourceClaudeStore].trunc
+	// The store is the only source that lists every session, so an answer
+	// without all of it (no answer at all, a scan cut by the budget, or more
+	// transcripts than maxRows) may be missing sessions.
+	res.Truncated = !storeAnswered || storeOutcome.trunc || storeOutcome.skip == cliSessionSkipTimeout
 	tabsByID := map[string][]claudeEditorTab{}
 	for _, src := range []string{cliSessionSourceVSCode, cliSessionSourceVSCodeInsiders, cliSessionSourceCursor} {
 		for _, t := range outcomes[src].tabs {
@@ -427,11 +539,13 @@ collect:
 				continue
 			}
 			ids[id] = true
-			if _, ok := store[id]; ok || lookups >= cliSessionMaxExtraLookups || ctx.Err() != nil {
+			if lookups >= cliSessionMaxExtraLookups || ctx.Err() != nil {
+				// Unread: its row is dropped, or reported not resumable.
+				res.Truncated = true
 				continue
 			}
 			lookups++
-			if info := lookupClaudeTranscript(env.configDir, outcomes[cliSessionSourceClaudeStore], id); info != nil {
+			if info := lookupClaudeTranscript(env.configDir, storeOutcome, id); info != nil {
 				store[id] = info
 			}
 		}
@@ -505,6 +619,7 @@ func buildClaudeSessionRow(id string, info *claudeTranscriptInfo, tabs []claudeE
 	if info != nil {
 		row.Cwd = info.Cwd
 		row.LastActiveAt = info.ModifiedAt
+		row.StartedVia, row.LastVia = info.FirstEntrypoint, info.LastEntrypoint
 	}
 	if len(live) > 0 {
 		r := newestRegistryEntry(live)

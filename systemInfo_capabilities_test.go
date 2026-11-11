@@ -75,12 +75,14 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// with the signed-executionId device half, `whatsapp` with the
 			// WhatsApp bridge, and its `protocol` (2) with sticky identities and
 			// the re-link carry-over; `cliSessionDiscovery` with finding and
-			// adopting coding-agent sessions AI Expedite did not start;
+			// adopting coding-agent sessions AI Expedite did not start, and its
+			// `protocol` (2) with startedVia / lastVia, the partial scan kept at
+			// the deadline and the outside-writer frame naming the agent;
 			// `nativeLaunchArgs` with the one-shot managers applying a START's
 			// model and effort to every turn; `openCodeAuthRefusalFrame` with an
 			// OpenCode turn that fails on a missing provider key naming the
 			// provider in its error frame.
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":1},"worktreeBuiltIns":true,"signedExecutionId":true,"whatsapp":`+string(waRaw)+`}` {
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"whatsapp":`+string(waRaw)+`}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})

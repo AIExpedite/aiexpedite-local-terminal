@@ -11,9 +11,11 @@
 //	                       includeHistory is "1" (the adopt flow's one probe) —
 //	                       up to 5 recent turns, masked and capped.
 //	watcher                for every claude_native session started with a
-//	                       `--resume=<id>`, poll the running registry every 5 s
-//	                       and publish claude_native_outside_writer only when
-//	                       the state another process holds changes.
+//	                       `--resume=<id>` and no `--fork-session` (a copy runs
+//	                       under its own new id), poll the running registry
+//	                       every 5 s and publish claude_native_outside_writer,
+//	                       naming this agent, only when the state another
+//	                       process holds changes.
 //
 // Both are READ-ONLY: nothing here locks, writes or renames an editor or
 // Claude Code file. The transcript is located by session id (never by the
@@ -84,7 +86,10 @@ type cliSessionProbeResult struct {
 	OpenInEditors       []string           `json:"openInEditors"`
 	TranscriptWrittenAt int64              `json:"transcriptWrittenAt"`
 	RecentTurns         []cliSessionTurn   `json:"recentTurns,omitempty"`
-	Error               string             `json:"error,omitempty"`
+	// As on a discovery row (cliSessionRow.StartedVia / LastVia). Protocol 2.
+	StartedVia string `json:"startedVia,omitempty"`
+	LastVia    string `json:"lastVia,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 type cliSessionOutsideWriter struct {
@@ -94,11 +99,29 @@ type cliSessionOutsideWriter struct {
 	At         int64  `json:"at"`
 }
 
-// claudeEditorForEntrypoint names the editor a registry entrypoint stands for,
-// "" when it is not an editor (cli, sdk-cli, …).
+// Claude Code's own `entrypoint` values for the apps that host it
+// (shared-constants CLI_SESSION_ENTRYPOINTS). Undocumented storage: a value
+// not listed here maps to no editor and is still reported raw.
+const (
+	claudeEntrypointVSCode  = "claude-vscode"
+	claudeEntrypointDesktop = "claude-desktop"
+)
+
+// cliSessionEditorClaudeDesktop names the Claude desktop app as the program
+// holding a session (shared-constants CODING_SESSION_STARTED_FROM.CLAUDE_DESKTOP).
+// It is never a discovery source: the desktop app keeps no tab list this
+// agent reads.
+const cliSessionEditorClaudeDesktop = "claudeDesktop"
+
+// claudeEditorForEntrypoint names the app a registry entrypoint stands for, ""
+// when it is not one (cli, sdk-cli, …). The VS Code extension reports
+// claude-vscode inside Insiders and Cursor too, so all three read as VS Code.
 func claudeEditorForEntrypoint(entrypoint string) string {
-	if entrypoint == "claude-vscode" {
+	switch entrypoint {
+	case claudeEntrypointVSCode:
 		return cliSessionSourceVSCode
+	case claudeEntrypointDesktop:
+		return cliSessionEditorClaudeDesktop
 	}
 	return ""
 }
@@ -197,6 +220,9 @@ func probeClaudeSession(ctx context.Context, env claudeDiscoveryEnv, sessionID s
 		}
 	}
 	res.Title, res.TitleSource, _ = claudeSessionTitle(info, tabs, running)
+	if info != nil {
+		res.StartedVia, res.LastVia = info.FirstEntrypoint, info.LastEntrypoint
+	}
 	if includeHistory && info != nil {
 		res.RecentTurns = claudeRecentTurns(path, cliSessionProbeMaxTurns)
 	}
@@ -322,9 +348,33 @@ func claudeOutsideWriterWatch(stop <-chan struct{}, interval time.Duration, poll
 	}
 }
 
-// startClaudeOutsideWriterWatcher watches a resumed claude_native session for
-// another process holding the same Claude session id, until it exits.
-func startClaudeOutsideWriterWatcher(session *ClaudeNativeSession, claudeSessionID string, publishFn PublishFunc) {
+// claudeOutsideWriterFrame is the claude_native_outside_writer result for one
+// observed change. terminal-service records it only when `agentId` and `uid`
+// name the session's own computer and owner (adoptedSessionClaims.service.js
+// recordOutsideWriter) and drops it otherwise, so the frame must name this
+// agent; `bootId` says which agent process saw it. The wire shape is pinned by
+// testdata/claude_native_outside_writer_frame.json, the fixture
+// terminal-service's tests read too.
+func claudeOutsideWriterFrame(session *ClaudeNativeSession, agentID string, w cliSessionOutsideWriter, ts int64) resultMsg {
+	return resultMsg{
+		ID:            session.ID,
+		WorkspaceID:   session.WorkspaceID,
+		UID:           session.UID,
+		AgentID:       agentID,
+		Status:        "success",
+		Ts:            ts,
+		Version:       Version,
+		Type:          claudeOutsideWriterResultType,
+		SessionID:     session.ID,
+		OutsideWriter: &w,
+		BootID:        agentBootID,
+	}
+}
+
+// startClaudeOutsideWriterWatcher watches a claude_native session resumed in
+// place for another process holding the same Claude session id, until it
+// exits. agentID is this agent's id (ClaudeNativeManager.frameAgentID).
+func startClaudeOutsideWriterWatcher(session *ClaudeNativeSession, claudeSessionID, agentID string, publishFn PublishFunc) {
 	if session == nil || publishFn == nil || !isClaudeSessionID(claudeSessionID) {
 		return
 	}
@@ -335,16 +385,6 @@ func startClaudeOutsideWriterWatcher(session *ClaudeNativeSession, claudeSession
 			return claudeOtherWriters(entries, claudeSessionID, isClaudeOwnPID)
 		},
 		func(w cliSessionOutsideWriter) {
-			publishFn(resultMsg{
-				ID:            session.ID,
-				WorkspaceID:   session.WorkspaceID,
-				UID:           session.UID,
-				Status:        "success",
-				Ts:            time.Now().UnixMilli(),
-				Version:       Version,
-				Type:          claudeOutsideWriterResultType,
-				SessionID:     session.ID,
-				OutsideWriter: &w,
-			})
+			publishFn(claudeOutsideWriterFrame(session, agentID, w, time.Now().UnixMilli()))
 		})
 }

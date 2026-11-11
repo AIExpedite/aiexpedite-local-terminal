@@ -12,6 +12,8 @@
 //     transcript per session. Only its head and tail (≤64 KB each) are read,
 //     and only allowlisted records: custom-title, ai-title, summary,
 //     last-prompt, plus the first `user` record as the last fallback label.
+//     Every record's top-level `entrypoint` string is read too (where the CLI
+//     was driven from), passed on raw and capped, never interpreted here.
 //
 // configDir honours CLAUDE_CONFIG_DIR (claudeConfigDir). Read-only.
 package main
@@ -263,6 +265,13 @@ type claudeTranscriptInfo struct {
 	FirstPrompt  string
 	ModifiedAt   int64
 	Recognised   bool // at least one record of a known type was read
+	// The `entrypoint` of the earliest and of the latest record read
+	// (cliSessionViaValue), "" when none carries one. Only the head and tail
+	// are read, so the earliest is the head's first when the head holds a
+	// complete record that names one, else the tail's first: a session whose
+	// first prompt fills the head (a pasted file) is dated by its tail.
+	FirstEntrypoint string
+	LastEntrypoint  string
 }
 
 type claudeTranscriptRecord struct {
@@ -274,6 +283,24 @@ type claudeTranscriptRecord struct {
 	Cwd         string          `json:"cwd"`
 	IsMeta      bool            `json:"isMeta"`
 	Message     json.RawMessage `json:"message"`
+	// Where the CLI was driven from when it wrote this record ("claude-vscode",
+	// "claude-desktop", "cli", "sdk-cli", …; user, assistant, attachment and
+	// system records carry it). Raw so a value that is not a string never
+	// makes the whole record unreadable.
+	Entrypoint json.RawMessage `json:"entrypoint"`
+}
+
+// claudeRecordEntrypoint is a record's entrypoint as a row reports it, "" when
+// it has none or it is not a string.
+func claudeRecordEntrypoint(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return cliSessionViaValue(s)
 }
 
 // claudeRecordText returns a user/assistant record's plain text ("" for tool
@@ -408,6 +435,14 @@ func parseClaudeTranscript(sessionID, path string) (*claudeTranscriptInfo, error
 		if out.Cwd == "" && filepath.IsAbs(rec.Cwd) {
 			out.Cwd = rec.Cwd
 		}
+		// Head lines come before tail lines, so the first value seen is the
+		// earliest readable one and the last value seen the latest.
+		if ep := claudeRecordEntrypoint(rec.Entrypoint); ep != "" {
+			if out.FirstEntrypoint == "" {
+				out.FirstEntrypoint = ep
+			}
+			out.LastEntrypoint = ep
+		}
 		switch rec.Type {
 		case "custom-title":
 			out.Recognised = true
@@ -487,7 +522,9 @@ type claudeTranscriptFile struct {
 }
 
 // readClaudeStore lists transcripts modified since `since`, newest first, and
-// parses at most maxRows of them.
+// parses at most maxRows of them. When ctx ends first it stops and returns
+// what it has, marked `trunc` and skipped as `timeout`: the listing may miss
+// sessions and the newest-first parse may have stopped short of maxRows.
 func readClaudeStore(ctx context.Context, configDir string, since time.Time, maxRows int) claudeSourceOutcome {
 	out := claudeSourceOutcome{
 		source: cliSessionSourceClaudeStore,
@@ -543,6 +580,7 @@ func readClaudeStore(ctx context.Context, configDir string, since time.Time, max
 		}
 	}
 	out.pathsComplete = ctx.Err() == nil
+	timedOut := !out.pathsComplete
 	sort.Slice(files, func(i, j int) bool { return files[i].modified.After(files[j].modified) })
 	if len(files) > maxRows {
 		files = files[:maxRows]
@@ -551,7 +589,7 @@ func readClaudeStore(ctx context.Context, configDir string, since time.Time, max
 	parsed, failed, unrecognised := 0, 0, 0
 	for _, f := range files {
 		if ctx.Err() != nil {
-			out.trunc = true
+			timedOut = true
 			break
 		}
 		if prev, ok := out.store[f.sessionID]; ok && prev.ModifiedAt >= f.modified.UnixMilli() {
@@ -570,7 +608,12 @@ func readClaudeStore(ctx context.Context, configDir string, since time.Time, max
 		out.store[f.sessionID] = info
 	}
 	out.checked = true
+	if timedOut {
+		out.trunc = true
+	}
 	switch {
+	case timedOut:
+		out.skip = cliSessionSkipTimeout
 	case parsed > 0:
 	case unrecognised > 0:
 		out.skip = cliSessionSkipUnrecognised

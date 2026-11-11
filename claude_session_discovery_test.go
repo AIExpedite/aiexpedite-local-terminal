@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -248,14 +249,18 @@ func TestDiscoverAndProbeAreInternalDemandCommands(t *testing.T) {
 	}
 }
 
+// Protocol 2 (startedVia / lastVia, the partial scan, the outside-writer
+// frame's agentId) is additive: terminal-service accepts any protocol at or
+// above its own CLI_SESSION_DISCOVERY_PROTOCOL (1), so older servers keep
+// discovering through a newer agent.
 func TestCapabilityAdvertisesClaudeDiscovery(t *testing.T) {
 	caps := newMachineCapabilities()
-	if caps.CliSessionDiscovery == nil || caps.CliSessionDiscovery.Protocol != 1 ||
+	if caps.CliSessionDiscovery == nil || caps.CliSessionDiscovery.Protocol != 2 ||
 		len(caps.CliSessionDiscovery.Engines) != 1 || caps.CliSessionDiscovery.Engines[0] != "claudeCode" {
 		t.Fatalf("capability = %+v", caps.CliSessionDiscovery)
 	}
 	b, _ := json.Marshal(caps)
-	if !strings.Contains(string(b), `"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":1}`) {
+	if !strings.Contains(string(b), `"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2}`) {
 		t.Fatalf("wire shape: %s", b)
 	}
 }
@@ -381,6 +386,384 @@ func TestTranscriptChunksKeepRecordsCrossingTheChunkBoundary(t *testing.T) {
 		}
 		if last := fmt.Sprintf("{\"n\":%d}", i-1); lines[len(lines)-1] != last {
 			t.Fatalf("size %d: last line %q, want %q", b.Len(), lines[len(lines)-1], last)
+		}
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/* Protocol 2: a partial scan is kept, entrypoints, editor window order       */
+/* -------------------------------------------------------------------------- */
+
+func skipReason(res cliSessionsDiscoverResult, source string) string {
+	for _, s := range res.SourcesSkipped {
+		if s.Source == source {
+			return s.Reason
+		}
+	}
+	return ""
+}
+
+// A transcript scan still running when the budget ends must not lose what it
+// read. Before protocol 2 the store reader and the collector shared one
+// context, so the collector stopped at the very moment the reader could
+// answer: the scan's rows were dropped, and "truncated" was copied from the
+// missing answer as false, so "no match" read as "no such session".
+func TestDiscoverKeepsPartialStoreAtDeadline(t *testing.T) {
+	configDir := t.TempDir()
+	now := time.Now()
+	pathA := writeTranscript(t, configDir, "-w", sidA, now.Add(-time.Minute),
+		userRecord("/w", "fix the login"), map[string]any{"type": "custom-title", "customTitle": "Login fix"})
+	writeTranscript(t, configDir, "-w", sidB, now.Add(-2*time.Minute), userRecord("/w", "not reached in time"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	budgetEnds, _ := ctx.Deadline()
+	released := make(chan time.Time, 1)
+	env := testDiscoveryEnv(configDir, nil)
+	// A slow scan: it has parsed the newest transcript and is still working
+	// when its context ends, and then answers with what it has, marked the way
+	// readClaudeStore marks a scan its context cut short.
+	env.readStore = func(storeCtx context.Context, dir string, since time.Time, maxRows int) claudeSourceOutcome {
+		info, err := parseClaudeTranscript(sidA, pathA)
+		if err != nil {
+			t.Errorf("parse: %v", err)
+		}
+		<-storeCtx.Done()
+		released <- time.Now()
+		return claudeSourceOutcome{
+			source: cliSessionSourceClaudeStore, checked: true, skip: cliSessionSkipTimeout, trunc: true,
+			store: map[string]*claudeTranscriptInfo{sidA: info},
+			paths: map[string]string{sidA: pathA},
+		}
+	}
+
+	res := discoverClaudeSessions(ctx, env)
+
+	select {
+	case at := <-released:
+		if !at.Before(budgetEnds) {
+			t.Fatalf("the store's context ended at %v, not before the budget (%v): no time is left to collect it", at, budgetEnds)
+		}
+	default:
+		t.Fatal("the store reader never answered")
+	}
+	a := rowByID(res.Rows, sidA)
+	if a == nil || a.Title != "Login fix" || !a.Resumable {
+		t.Fatalf("rows = %+v, want the partial scan's session kept, resumable", res.Rows)
+	}
+	if !res.Truncated {
+		t.Fatal("a scan the budget cut short must answer truncated")
+	}
+	if got := skipReason(res, cliSessionSourceClaudeStore); got != cliSessionSkipTimeout {
+		t.Fatalf("claudeStore skip = %q, want timeout (sourcesSkipped %+v)", got, res.SourcesSkipped)
+	}
+}
+
+// A store reader that does not answer at all by the end of the budget (a hung
+// disk) still yields an answer, and that answer says it may be missing
+// sessions.
+func TestDiscoverIsTruncatedWhenTheStoreNeverAnswers(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	env := testDiscoveryEnv(t.TempDir(), nil)
+	env.readStore = func(context.Context, string, time.Time, int) claudeSourceOutcome {
+		<-release // ignores its context
+		return claudeSourceOutcome{source: cliSessionSourceClaudeStore, checked: true}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	res := discoverClaudeSessions(ctx, env)
+	if !res.Truncated {
+		t.Fatal("no store answer must read as truncated, not as a complete empty scan")
+	}
+	if got := skipReason(res, cliSessionSourceClaudeStore); got != cliSessionSkipTimeout {
+		t.Fatalf("claudeStore skip = %q, want timeout", got)
+	}
+}
+
+// Truncation follows the store's own answer: a scan that timed out, or that
+// stopped at maxRows, may be missing sessions; a complete one is not truncated.
+func TestDiscoverTruncationFollowsTheStoreOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		outcome claudeSourceOutcome
+		want    bool
+	}{
+		{"complete", claudeSourceOutcome{checked: true}, false},
+		{"stopped at maxRows", claudeSourceOutcome{checked: true, trunc: true}, true},
+		{"timed out", claudeSourceOutcome{checked: true, skip: cliSessionSkipTimeout}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testDiscoveryEnv(t.TempDir(), nil)
+			env.readStore = func(context.Context, string, time.Time, int) claudeSourceOutcome {
+				o := tc.outcome
+				o.source, o.pathsComplete = cliSessionSourceClaudeStore, true
+				return o
+			}
+			if res := discoverClaudeSessions(context.Background(), env); res.Truncated != tc.want {
+				t.Fatalf("truncated = %v, want %v", res.Truncated, tc.want)
+			}
+		})
+	}
+}
+
+// A session an editor tab names but the store did not list is looked up on
+// its own, at most cliSessionMaxExtraLookups of them. One left unread may be a
+// missing row, so the answer then says truncated; at the cap nothing is left.
+func TestDiscoverIsTruncatedWhenTabLookupsAreCapped(t *testing.T) {
+	for _, tc := range []struct {
+		tabs int
+		want bool
+	}{
+		{cliSessionMaxExtraLookups, false},
+		{cliSessionMaxExtraLookups + 1, true},
+	} {
+		t.Run(fmt.Sprintf("%d tabs", tc.tabs), func(t *testing.T) {
+			vscode := t.TempDir()
+			tabs := []map[string]any{}
+			for i := 0; i < tc.tabs; i++ {
+				tabs = append(tabs, map[string]any{"sessionId": fmt.Sprintf("5%07x-aaaa-4bbb-8ccc-%012x", i, i), "title": "tab"})
+			}
+			raw, _ := json.Marshal(map[string]any{"panelTabSessions": tabs})
+			writeEditorState(t, vscode, "w1", string(raw))
+			env := testDiscoveryEnv(t.TempDir(), map[string]string{cliSessionSourceVSCode: vscode})
+
+			res := discoverClaudeSessions(context.Background(), env)
+			if res.Truncated != tc.want {
+				t.Fatalf("%d tab sessions to look up with a cap of %d: truncated = %v, want %v",
+					tc.tabs, cliSessionMaxExtraLookups, res.Truncated, tc.want)
+			}
+			if !containsString(res.SourcesChecked, cliSessionSourceVSCode) {
+				t.Fatalf("sourcesChecked = %v, want the editor read", res.SourcesChecked)
+			}
+		})
+	}
+}
+
+func TestClaudeSourceContextEndsBeforeTheBudget(t *testing.T) {
+	for _, tc := range []struct {
+		budget, wantGrace time.Duration
+	}{
+		{cliSessionDiscoverBudget, cliSessionSourceDeadlineGrace},
+		{400 * time.Millisecond, 100 * time.Millisecond}, // at most a quarter of what is left
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), tc.budget)
+		src, cancelSrc := claudeSourceContext(ctx)
+		outer, _ := ctx.Deadline()
+		inner, ok := src.Deadline()
+		grace := outer.Sub(inner)
+		if !ok || grace <= 0 || grace > tc.wantGrace || grace < tc.wantGrace-50*time.Millisecond {
+			t.Fatalf("budget %v: readers stop %v before it, want about %v", tc.budget, grace, tc.wantGrace)
+		}
+		cancelSrc()
+		cancel()
+	}
+	src, cancelSrc := claudeSourceContext(context.Background())
+	defer cancelSrc()
+	if _, ok := src.Deadline(); ok {
+		t.Fatal("a context without a deadline gained one")
+	}
+}
+
+// errAfterCtx answers nil to its first n Err() calls and DeadlineExceeded
+// after them: a context that ends part-way through a reader.
+type errAfterCtx struct {
+	context.Context
+	left atomic.Int64
+}
+
+func (c *errAfterCtx) Err() error {
+	if c.left.Add(-1) < 0 {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// readClaudeStore stopped by its context reports what it parsed, marked as a
+// truncated, timed-out scan, wherever the context ends.
+func TestStoreReportsATimeoutWhenItsContextEndsMidScan(t *testing.T) {
+	configDir := t.TempDir()
+	now := time.Now()
+	ids := []string{sidA, sidB, sidC}
+	for i, id := range ids {
+		writeTranscript(t, configDir, "-w", id, now.Add(-time.Duration(i+1)*time.Minute), userRecord("/w", "prompt"))
+	}
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	out := readClaudeStore(ended, configDir, now.Add(-time.Hour), 500)
+	if out.skip != cliSessionSkipTimeout || !out.trunc || !out.checked || out.pathsComplete || len(out.store) != 0 {
+		t.Fatalf("ended before the scan: %+v, want an empty, truncated, timed-out outcome", out)
+	}
+	partial := false
+	for n := int64(0); n <= 12; n++ {
+		ctx := &errAfterCtx{Context: context.Background()}
+		ctx.left.Store(n)
+		out := readClaudeStore(ctx, configDir, now.Add(-time.Hour), 500)
+		if len(out.store) < len(ids) {
+			if !out.trunc || out.skip != cliSessionSkipTimeout {
+				t.Fatalf("n=%d: %d of %d parsed with trunc=%v skip=%q, want trunc + timeout", n, len(out.store), len(ids), out.trunc, out.skip)
+			}
+			partial = partial || len(out.store) > 0
+		} else if out.trunc || out.skip != "" {
+			t.Fatalf("n=%d: a complete scan reported trunc=%v skip=%q", n, out.trunc, out.skip)
+		}
+	}
+	if !partial {
+		t.Fatal("no run ended between two transcripts: the parse loop's own stop was never exercised")
+	}
+}
+
+// writeLargeTranscript writes head records, then filler without an entrypoint
+// past two chunks, then tail records: only the head and tail are ever read.
+func writeLargeTranscript(t *testing.T, configDir, id string, head, tail []map[string]any) string {
+	t.Helper()
+	records := append([]map[string]any{}, head...)
+	pad := strings.Repeat("x", 1000)
+	for i := 0; i < 3*claudeTranscriptChunkBytes/1000; i++ {
+		records = append(records, map[string]any{"type": "queue-operation", "pad": pad})
+	}
+	records = append(records, tail...)
+	return writeTranscript(t, configDir, "-w", id, time.Now(), records...)
+}
+
+func viaRecord(kind, entrypoint, text string) map[string]any {
+	return map[string]any{"type": kind, "entrypoint": entrypoint, "cwd": "/w",
+		"message": map[string]any{"role": kind, "content": text}}
+}
+
+// The session started in VS Code and was later driven by an SDK app: where it
+// started comes from the head, where it was last driven from the tail.
+func TestTranscriptEntrypointFirstFromHeadLastFromTail(t *testing.T) {
+	configDir := t.TempDir()
+	path := writeLargeTranscript(t, configDir, sidA,
+		[]map[string]any{
+			viaRecord("user", "claude-vscode", "start here"),
+			viaRecord("assistant", "claude-vscode", "ok"),
+		},
+		[]map[string]any{
+			viaRecord("user", "sdk-cli", "continue"),
+			{"type": "attachment", "entrypoint": "sdk-cli"},
+			viaRecord("assistant", "sdk-cli", "done"),
+		})
+	info, err := parseClaudeTranscript(sidA, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.FirstEntrypoint != "claude-vscode" || info.LastEntrypoint != "sdk-cli" {
+		t.Fatalf("first/last = %q/%q, want claude-vscode/sdk-cli", info.FirstEntrypoint, info.LastEntrypoint)
+	}
+
+	res := discoverClaudeSessions(context.Background(), testDiscoveryEnv(configDir, nil))
+	a := rowByID(res.Rows, sidA)
+	if a == nil || a.StartedVia != "claude-vscode" || a.LastVia != "sdk-cli" {
+		t.Fatalf("row = %+v, want startedVia claude-vscode, lastVia sdk-cli", a)
+	}
+	b, _ := json.Marshal(a)
+	if !strings.Contains(string(b), `"startedVia":"claude-vscode","lastVia":"sdk-cli"`) {
+		t.Fatalf("wire shape: %s", b)
+	}
+	probe := probeClaudeSession(context.Background(), testDiscoveryEnv(configDir, nil), sidA, false)
+	if probe.StartedVia != "claude-vscode" || probe.LastVia != "sdk-cli" {
+		t.Fatalf("probe = %q/%q, want the same entrypoints as the row", probe.StartedVia, probe.LastVia)
+	}
+}
+
+// A first prompt too large for the head chunk leaves no complete record there:
+// where the session started then falls back to the earliest record the tail
+// holds.
+func TestTranscriptEntrypointFallsBackToTheTailWhenTheHeadHasNoRecord(t *testing.T) {
+	configDir := t.TempDir()
+	huge := viaRecord("user", "claude-vscode", strings.Repeat("pasted file ", 7000)) // > one chunk
+	path := writeLargeTranscript(t, configDir, sidB,
+		[]map[string]any{huge},
+		[]map[string]any{viaRecord("user", "cli", "next"), viaRecord("assistant", "sdk-cli", "done")})
+	info, err := parseClaudeTranscript(sidB, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.FirstEntrypoint != "cli" || info.LastEntrypoint != "sdk-cli" {
+		t.Fatalf("first/last = %q/%q, want the tail's first (cli) and last (sdk-cli)", info.FirstEntrypoint, info.LastEntrypoint)
+	}
+}
+
+// Unknown entrypoints pass through raw (capped); a value that is not a string
+// never costs the record it sits on; a transcript naming none reports none.
+func TestTranscriptEntrypointPassesUnknownValuesThrough(t *testing.T) {
+	configDir := t.TempDir()
+	long := "claude-jetbrains-" + strings.Repeat("z", 60)
+	writeTranscript(t, configDir, "-w", sidA, time.Now(),
+		map[string]any{"type": "custom-title", "customTitle": "Kept", "entrypoint": 7},
+		viaRecord("user", "claude-jetbrains", "a"),
+		viaRecord("assistant", long, "b"))
+	writeTranscript(t, configDir, "-w", sidB, time.Now(), userRecord("/w", "no entrypoint anywhere"))
+
+	res := discoverClaudeSessions(context.Background(), testDiscoveryEnv(configDir, nil))
+	a := rowByID(res.Rows, sidA)
+	if a == nil || a.Title != "Kept" {
+		t.Fatalf("row = %+v, want the record with a numeric entrypoint still read", a)
+	}
+	if a.StartedVia != "claude-jetbrains" || a.LastVia != long[:cliSessionViaMaxChars] {
+		t.Fatalf("startedVia/lastVia = %q/%q, want the raw unknown value and the long one capped", a.StartedVia, a.LastVia)
+	}
+	b := rowByID(res.Rows, sidB)
+	if b == nil || b.StartedVia != "" || b.LastVia != "" {
+		t.Fatalf("row = %+v, want no entrypoint reported", b)
+	}
+	if raw, _ := json.Marshal(b); strings.Contains(string(raw), "Via") {
+		t.Fatalf("a missing entrypoint must be absent from the wire, got %s", raw)
+	}
+}
+
+func TestCliSessionViaValue(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"sdk-cli", "sdk-cli"},
+		{"  claude-vscode\n", "claude-vscode"},
+		{"Claude Desktop", "Claude Desktop"},
+		{"", ""},
+		{"cli\u0000x", ""},
+		{"a\tb", ""},
+		{strings.Repeat("é", 50), strings.Repeat("é", cliSessionViaMaxChars)},
+	} {
+		if got := cliSessionViaValue(tc.in); got != tc.want {
+			t.Errorf("cliSessionViaValue(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The window folders are hashes, so name order is no order: the cap must keep
+// the windows written most recently.
+func TestEditorWindowsAreReadNewestFirstBeforeTheCap(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now()
+	for _, w := range []struct {
+		name, session string
+		age           time.Duration
+	}{
+		{"a-oldest", sidA, 20 * 24 * time.Hour},
+		{"b-middle", sidB, 2 * time.Hour},
+		{"c-newest", sidC, time.Minute},
+	} {
+		tabs, _ := json.Marshal(map[string]any{"panelTabSessions": []map[string]any{{"sessionId": w.session, "title": w.name}}})
+		writeEditorState(t, root, w.name, string(tabs))
+		db := filepath.Join(root, "User", "workspaceStorage", w.name, "state.vscdb")
+		if err := os.Chtimes(db, now.Add(-w.age), now.Add(-w.age)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := readEditorClaudeTabsUpTo(context.Background(), cliSessionSourceVSCode, root, now.Add(-30*24*time.Hour), 2)
+	got := map[string]bool{}
+	for _, tab := range out.tabs {
+		got[tab.SessionID] = true
+	}
+	if len(out.tabs) != 2 || !got[sidC] || !got[sidB] || got[sidA] {
+		t.Fatalf("tabs = %+v, want the two most recently written windows (c, b), not the first two by name", out.tabs)
+	}
+	if out.skip != "" || !out.checked {
+		t.Fatalf("outcome = %+v, want a clean read", out)
+	}
+	for _, tab := range out.tabs {
+		if tab.SessionID == sidC && now.Sub(time.UnixMilli(tab.SeenAt)) > 2*time.Minute {
+			t.Fatalf("seenAt = %v, want the window's own last write", time.UnixMilli(tab.SeenAt))
 		}
 	}
 }

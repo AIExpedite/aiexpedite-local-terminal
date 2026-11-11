@@ -211,7 +211,30 @@ func NewClaudeNativeManager(cfg *Config) *ClaudeNativeManager {
 // lets callers publish their `claude_native_started` ack ahead of any
 // `claude_native_message` frames the readers may forward, guaranteeing the
 // ordering consumers rely on when they initialize state on the started frame.
+//
+// Start is StartForAgent without the start command's agent id: frames that
+// must name this agent take it from the manager's Config alone.
 func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialPrompt, workspaceID, uid string, publishFn PublishFunc, onStarted func()) error {
+	return m.StartForAgent("", id, cwd, extraArgs, initialPrompt, workspaceID, uid, publishFn, onStarted)
+}
+
+// frameAgentID is the agent id a session's frames name where the reader
+// matches it (the outside-writer frame): this agent's registered id, else the
+// id the start command was addressed to.
+func (m *ClaudeNativeManager) frameAgentID(commandAgentID string) string {
+	if m.Config != nil {
+		id := ""
+		m.Config.WithPersistenceLock(func() { id = m.Config.AgentID })
+		if id != "" {
+			return id
+		}
+	}
+	return commandAgentID
+}
+
+// StartForAgent is Start for a start command addressed to commandAgentID (the
+// fallback for frameAgentID).
+func (m *ClaudeNativeManager) StartForAgent(commandAgentID, id, cwd string, extraArgs []string, initialPrompt, workspaceID, uid string, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -243,6 +266,10 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 	// filesystem can never hold up the spawn, and this runs before m.mu is taken
 	// so it cannot hold up the manager either.
 	reconcileClaudeStatusLineHookBounded("claude-native")
+
+	// Resolved before m.mu is taken, so the config's persistence lock is never
+	// waited on while the manager lock is held.
+	agentID := m.frameAgentID(commandAgentID)
 
 	// Hold the manager mutex across the spawn so two concurrent Start calls for
 	// the same id can't double-spawn (TOCTOU).
@@ -336,14 +363,17 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 	go m.waitForExit(session, publishFn)
 
 	// Discovery flags sessions this agent drives, and never counts its own
-	// child as another writer; a resumed session is watched for one
-	// (claude_session_probe.go).
+	// child as another writer; a session resumed in place is watched for one
+	// (claude_session_probe.go). A --fork-session start is a copy under a NEW
+	// id (recorded from its init frame in readStream): the original stays the
+	// other program's, so it is neither claimed nor watched, and a send into
+	// the copy is never held for what the original's editor does.
 	if proc.Process != nil {
 		recordClaudeOwnPID(proc.Process.Pid, true)
 	}
-	if resumeID := claudeResumeIDFromArgs(extraArgs); resumeID != "" {
+	if resumeID := claudeResumedInPlaceID(extraArgs); resumeID != "" {
 		recordClaudeOwnSessionID(resumeID)
-		startClaudeOutsideWriterWatcher(session, resumeID, publishFn)
+		startClaudeOutsideWriterWatcher(session, resumeID, agentID, publishFn)
 	}
 
 	// Deliver the first user turn (if any) after the readers are wired so we

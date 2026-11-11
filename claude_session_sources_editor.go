@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -175,12 +176,27 @@ func editorWindowFolder(dir string) string {
 	return filepath.FromSlash(p)
 }
 
-// readEditorClaudeTabs reads every window of one editor whose state database
+// claudeEditorWindow is one editor window whose state database was written
+// inside the look-back window.
+type claudeEditorWindow struct {
+	dir     string
+	dbPath  string
+	written time.Time
+}
+
+// readEditorClaudeTabs reads the windows of one editor whose state database
 // was written since `since` (a window untouched for longer holds no tab inside
 // the look-back window, and skipping it keeps a machine with thousands of old
-// workspaces inside the budget). It stops when ctx ends; a partial read is
+// workspaces inside the budget), newest first, at most
+// claudeEditorMaxWorkspace of them. It stops when ctx ends; a partial read is
 // still reported, with the source marked as timed out.
 func readEditorClaudeTabs(ctx context.Context, source, root string, since time.Time) claudeSourceOutcome {
+	return readEditorClaudeTabsUpTo(ctx, source, root, since, claudeEditorMaxWorkspace)
+}
+
+// readEditorClaudeTabsUpTo is readEditorClaudeTabs reading at most maxWindows
+// windows.
+func readEditorClaudeTabsUpTo(ctx context.Context, source, root string, since time.Time, maxWindows int) claudeSourceOutcome {
 	out := claudeSourceOutcome{source: source}
 	storage := filepath.Join(root, "User", "workspaceStorage")
 	if root == "" {
@@ -198,8 +214,13 @@ func readEditorClaudeTabs(ctx context.Context, source, root string, since time.T
 	}
 	read, unreadable, unrecognised := 0, 0, 0
 	timedOut := false
-	for i, e := range entries {
-		if i >= claudeEditorMaxWorkspace || !e.IsDir() {
+	// The folder names are hashes, so their order says nothing: rank the
+	// windows by when their state was last written before applying the cap,
+	// or a machine with many windows keeps an arbitrary maxWindows of them and
+	// can drop the one the owner used today.
+	windows := []claudeEditorWindow{}
+	for _, e := range entries {
+		if !e.IsDir() {
 			continue
 		}
 		if ctx.Err() != nil {
@@ -215,6 +236,18 @@ func readEditorClaudeTabs(ctx context.Context, source, root string, since time.T
 		if info.ModTime().Before(since) {
 			continue
 		}
+		windows = append(windows, claudeEditorWindow{dir: dir, dbPath: dbPath, written: info.ModTime()})
+	}
+	sort.SliceStable(windows, func(i, j int) bool { return windows[i].written.After(windows[j].written) })
+	if len(windows) > maxWindows {
+		windows = windows[:maxWindows]
+	}
+	for _, w := range windows {
+		if ctx.Err() != nil {
+			timedOut = true
+			break
+		}
+		dir, dbPath := w.dir, w.dbPath
 		raw, err := readEditorStateValue(dbPath)
 		if err != nil {
 			unreadable++
@@ -247,7 +280,7 @@ func readEditorClaudeTabs(ctx context.Context, source, root string, since time.T
 				Cwd:          cwd,
 				WindowFolder: folder,
 				Editor:       source,
-				SeenAt:       info.ModTime().UnixMilli(),
+				SeenAt:       w.written.UnixMilli(),
 			})
 		}
 	}

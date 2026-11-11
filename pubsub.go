@@ -7742,7 +7742,8 @@ func handleClaudeNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd
 			})
 		}
 
-		err := globalClaudeNativeManager.Start(
+		err := globalClaudeNativeManager.StartForAgent(
+			cmd.AgentID, // names this agent on the outside-writer frame when the config has no id
 			cmd.SessionID,
 			cmd.Cwd,
 			cmd.Args,
