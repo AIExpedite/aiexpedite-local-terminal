@@ -144,7 +144,8 @@ func TestCancelUpdate_ScheduledAttemptHoldsOffTheNextCheck(t *testing.T) {
 	r.mu.Lock()
 	checks := r.checkCalls
 	r.mu.Unlock()
-	r.au.tick() // the next scheduled check
+	r.au.sleep = func(time.Duration) bool { return false } // never park if this goes wrong
+	r.au.tick()                                            // the next scheduled check
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.checkCalls != checks {
@@ -289,6 +290,25 @@ func TestCancelUpdate_RefusedOnceTheInstallHasBegun(t *testing.T) {
 	}
 }
 
+// However an attempt ends, the way out goes with it.
+func TestCancelUpdate_WithdrawnWhenTheAttemptEnds(t *testing.T) {
+	r, _ := newManualRig(t, registeredCfg())
+	r.activeWork = 0
+	r.verifyErr = errors.New("the download failed")
+	r.au.sleep = func(time.Duration) bool { return true }
+
+	if err := installUpdateManually(r.info); err != nil {
+		t.Fatalf("installUpdateManually: %v", err)
+	}
+	r.au.tick()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.showCancel == 0 || r.hideCancel == 0 {
+		t.Fatalf("Cancel Update must go when the attempt ends (show=%d hide=%d)", r.showCancel, r.hideCancel)
+	}
+}
+
 // A request that joins an attempt already under way makes that attempt the
 // user's, so it must be offered the way out at that moment.
 func TestCancelUpdate_OfferedToARequestThatJoinsARunningAttempt(t *testing.T) {
@@ -408,6 +428,7 @@ func TestCancelUpdate_AClickWhileTheCancelledAttemptLeavesStartsAnother(t *testi
 		t.Fatalf("cancelUpdateManually: %v", err)
 	}
 	receiveWithin(t, exiting, "the cancelled attempt to start leaving its drain")
+	<-r.au.triggerCh // the first click's nudge, already answered by the attempt above
 
 	if err := installUpdateManually(r.info); err != nil {
 		t.Fatalf("installUpdateManually: %v", err)
