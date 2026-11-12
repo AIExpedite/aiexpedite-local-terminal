@@ -68,8 +68,26 @@ type memoryInfo struct {
 	AvailableGB float64 `json:"availableGB,omitempty"`
 }
 
+// diskEntry is one mounted volume as reported to the server.
+//
+// Drive is gopsutil's PartitionStat.Device: a drive letter on Windows ("C:"),
+// but a device node on macOS / Linux ("/dev/disk3s1s1", "/dev/nvme0n1p2") or a
+// filesystem name ("devfs"). It is NOT where the volume is mounted, so a
+// server cannot tell which volume holds a path from Drive alone. Mount is
+// PartitionStat.Mountpoint ("/", "/System/Volumes/Data", "C:"): the field a
+// path -> volume match must use. It is omitempty only so an empty Mountpoint
+// is not sent; gopsutil fills it on every platform.
+//
+// FreeGB (and SizeGB) MUST stay omitempty. A volume whose free space rounds to
+// 0.0 GB sends no freeGB at all, and servers already depend on that shape: the
+// terminal-service clone gate falls back to the smallest volume WITH a numeric
+// freeGB, so emitting freeGB: 0 for the 0.1 GB disk images every Mac mounts
+// would make that fallback read 0 MB free on every Mac. The shared resolver
+// (shared-constants diskVolume.js) reads "sizeGB but no freeGB" as a full
+// volume instead.
 type diskEntry struct {
 	Drive  string  `json:"drive,omitempty"`
+	Mount  string  `json:"mount,omitempty"`
 	SizeGB float64 `json:"sizeGB,omitempty"`
 	FreeGB float64 `json:"freeGB,omitempty"`
 }
@@ -834,19 +852,22 @@ func gatherMachineInfoBounded(usageBudget time.Duration) *MachineInfo {
 		}
 	}
 
-	// Disk — only physical partitions; gopsutil's `all=false` filters out
-	// pseudo / virtual filesystems (proc, sysfs, overlayfs, tmpfs) on Linux
-	// so we don't pollute the response with container-layer mounts.
+	// Disk — gopsutil's `all=false` filters only on Linux, where it drops
+	// pseudo / virtual filesystems (proc, sysfs, overlayfs, tmpfs: the
+	// "nodev" types of /proc/filesystems) so container-layer mounts do not
+	// pollute the response. darwin and the BSDs IGNORE `all` and list every
+	// getfsstat mount (devfs, the sealed system snapshot, Preboot / VM /
+	// Update / Data, every attached disk image), and Windows ignores it too.
+	// diskEntriesFromPartitions skips only volumes whose usage cannot be read
+	// or that report a zero total.
+	//
+	// The whole list is dropped on an error: in gopsutil v4.26.10 Partitions
+	// never returns partial results together with a non-nil error (Linux
+	// returns nil, darwin an empty slice, and on Windows the per-volume
+	// warnings are collected into a by-value copy and never reach the
+	// returned error), so there is nothing partial to keep.
 	if parts, err := disk.Partitions(false); err == nil {
-		for _, p := range parts {
-			if usage, err := disk.Usage(p.Mountpoint); err == nil && usage.Total > 0 {
-				info.Disk = append(info.Disk, diskEntry{
-					Drive:  p.Device,
-					SizeGB: roundGB(usage.Total),
-					FreeGB: roundGB(usage.Free),
-				})
-			}
-		}
+		info.Disk = append(info.Disk, diskEntriesFromPartitions(parts, disk.Usage)...)
 	}
 
 	// Runtimes — same set the legacy LLM probe used. Probe with the
@@ -1628,6 +1649,28 @@ func resetVersionProbeCache() {
 	versionProbeCache = map[versionProbeKey]string{}
 	versionProbeTransients = map[versionProbeKey]int{}
 	versionProbeMu.Unlock()
+}
+
+// diskEntriesFromPartitions turns gopsutil partitions into wire entries. Pure
+// apart from the usage func, which gatherMachineInfo passes as disk.Usage and
+// tests replace. A partition whose usage cannot be read, or whose total is 0,
+// is skipped; sizes and free space are rounded to one decimal GB, so a value
+// under 0.05 GB is omitted from the JSON (see diskEntry).
+func diskEntriesFromPartitions(parts []disk.PartitionStat, usage func(path string) (*disk.UsageStat, error)) []diskEntry {
+	var out []diskEntry
+	for _, p := range parts {
+		u, err := usage(p.Mountpoint)
+		if err != nil || u == nil || u.Total == 0 {
+			continue
+		}
+		out = append(out, diskEntry{
+			Drive:  p.Device,
+			Mount:  p.Mountpoint,
+			SizeGB: roundGB(u.Total),
+			FreeGB: roundGB(u.Free),
+		})
+	}
+	return out
 }
 
 func roundGB(bytes uint64) float64 {
