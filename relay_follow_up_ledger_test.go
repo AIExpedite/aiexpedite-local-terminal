@@ -80,8 +80,16 @@ func TestFollowUpWireValuesArePinned(t *testing.T) {
 	if followUpAckedMax != 32 || followUpAttemptWindow != 120*time.Second {
 		t.Errorf("limits drifted from shared-constants")
 	}
-	if len(liveFollowUpCertified) != 0 {
-		t.Errorf("no CLI is certified for live follow-ups until its certification run passes")
+	// Claude Code is certified (2.1.322) so a message spoken mid-turn is
+	// written into the running CLI instead of waiting for the turn to end.
+	// Every OTHER CLI stays uncertified until its own run passes: the device
+	// only writes live into a Claude native session, so listing another here
+	// would advertise a delivery path that does not exist for it.
+	if liveFollowUpCertified[claudeCodeCliAgentID] != "2.1.322" {
+		t.Errorf("Claude Code should be certified at the version its run passed at")
+	}
+	if len(liveFollowUpCertified) != 1 {
+		t.Errorf("no other CLI is certified until its own certification run passes")
 	}
 }
 
@@ -335,12 +343,19 @@ func TestAQueuedFollowUpTurnPastItsExpiryIsRefused(t *testing.T) {
 	}
 }
 
-func TestTheCapabilityListsNoLiveAgentButReportsTheLedger(t *testing.T) {
+func TestTheCapabilityListsTheCertifiedLiveAgentAndReportsTheLedger(t *testing.T) {
+	// Pinned, never read from this machine: the list is derived from the
+	// INSTALLED version, so asserting it unpinned would pass only where a
+	// qualifying Claude happens to be on PATH and fail in CI.
+	pinLiveFollowUpCertified(t, "2.1.322", "2.1.322")
 	cap := newRelayFollowUpsCapability()
 	if cap == nil {
 		t.Skipf("this process cannot own both the real follow-up ledger and the turn inbox")
 	}
-	if cap.LiveAgents == nil || len(cap.LiveAgents) != 0 || !cap.AttemptExpiry || cap.LedgerID == "" {
+	if len(cap.LiveAgents) != 1 || cap.LiveAgents[0] != claudeCodeCliAgentID {
+		t.Fatalf("a certified CLI should be advertised live: %+v", cap)
+	}
+	if !cap.AttemptExpiry || cap.LedgerID == "" {
 		t.Fatalf("capability: %+v", cap)
 	}
 	data, _ := json.Marshal(cap)

@@ -31,8 +31,15 @@ func TestClaudeLiveFollowUpCertification(t *testing.T) {
 		t.Fatalf("certification attempt was fenced: %+v", row)
 	}
 	l.Finish(row.AttemptID, nil, followUpProcessedInCurrent)
-	l.release()
-	reloaded := newRelayFollowUpLedger(func() string { return path })
+	// `reopenFollowUpLedger` rather than a bare `newRelayFollowUpLedger`: it
+	// releases the old handle AND registers the new one for release. Holding
+	// the reloaded ledger open makes `t.TempDir()`'s cleanup fail on Windows
+	// ("The process cannot access the file because it is being used by another
+	// process", on `relay-follow-up-ledger.json.lock"), which FAILS the test
+	// after its own contract has already held — so this certification could
+	// never pass on the platform the device ships on, and no CLI could be
+	// certified from a Windows machine.
+	reloaded := reopenFollowUpLedger(t, l, path)
 	if got := reloaded.Query("cert-1", reloaded.LedgerID(), time.Now().UnixMilli()); got.State != followUpRowWritten {
 		t.Fatalf("written attempt not durable: %+v", got)
 	}
