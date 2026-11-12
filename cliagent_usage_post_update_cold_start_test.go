@@ -109,9 +109,24 @@ func TestPostUpdateColdStart_ClaudeCode(t *testing.T) {
 			}
 
 			payAfterUpdate(t, cache, healthy)
-			// The new process's first gather meets the cold binary.
-			if got := cachedProbeVersion(binary); got != "" {
-				t.Fatalf("cold probe = %q, want the timeout's \"\"", got)
+			// WHICH caller meets the cold binary depends on whether this CLI
+			// is certified for live follow-ups. A certified Claude Code
+			// probes `--version` at session START (claudeLaunchVersion, to
+			// record what the child was launched from), so on the direct path
+			// the start spends the one timing-out probe before any gather
+			// runs; on the terminal-managed path the gather below is still
+			// the first. The contract is that the cold probe is spent exactly
+			// once and the next probe of the unchanged binary answers — not
+			// who spent it.
+			//
+			// The product consequence, and it is deliberate: a session
+			// started while the binary is still cold reads no version, so
+			// `liveFollowUpVersionCertified` fails closed and THAT session's
+			// follow-ups are queued rather than written live.
+			if cold.Load() == 0 {
+				if got := cachedProbeVersion(binary); got != "" {
+					t.Fatalf("cold probe = %q, want the timeout's \"\"", got)
+				}
 			}
 			requireNumericClaudeRows(t)
 			helperRequireVersionRecovers(t, cold, func() string { return cachedProbeVersion(binary) }, claudeColdStartVersion)

@@ -113,9 +113,24 @@ const (
 
 // liveFollowUpCertified lists the CLIs whose installed version passed the
 // live follow-up certification (relay_follow_up_claude_certification_test.go)
-// with the minimum version it passed at. EMPTY until a run passes: every live
+// with the minimum version it passed at. Empty until a run passes: every live
 // attempt is then answered notWritten/notLiveKind and the broker queues.
-var liveFollowUpCertified = map[string]string{}
+//
+// Claude Code 2.1.322: a message spoken or typed while the agent is working is
+// written into the running CLI's stdin instead of waiting for the turn to end.
+// Queued delivery was the behaviour the owner asked to remove — a message sat
+// as "one message waiting" until the session finished, which is not how the
+// CLI itself behaves when you type at it mid-turn.
+//
+// What the fences still do, and must keep doing: an attempt is refused at the
+// stdin boundary under stdinMu when the session is not running, is fenced,
+// does not match the conversation, has expired, or has an APPROVAL OPEN
+// (ApprovalPending). The last one is not a formality — text written beside an
+// open permission prompt can be read by the CLI as the ANSWER to it, which
+// would let an unrelated message approve an action nobody approved.
+var liveFollowUpCertified = map[string]string{
+	claudeCodeCliAgentID: "2.1.322",
+}
 
 type relayFollowUpRow struct {
 	AttemptID   string `json:"attemptId"`
