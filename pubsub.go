@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 
@@ -276,6 +277,32 @@ func isCommandStaleAfter(cmdTs int64, maxAgeSec, maxFutureSkewSec int) bool {
 	return ageMs > int64(maxAgeSec)*1000 || ageMs < -int64(maxFutureSkewSec)*1000
 }
 
+// pubsubReceiveBusy counts the sub.Receive callbacks running right now, and
+// pubsubReceiveSlots is the configured MaxOutstandingMessages they share. A
+// stale rejection reports both, so "every slot was busy" (delivery queued
+// behind long handlers) can be told apart from "offline or idle" without
+// device logs. A snapshot at the moment of refusal, not at the moment delivery
+// lagged, and it includes the rejecting callback itself.
+var (
+	pubsubReceiveBusy  atomic.Int32
+	pubsubReceiveSlots atomic.Int32
+)
+
+func pubsubReceiveOccupancy() (busy, slots int) {
+	return int(pubsubReceiveBusy.Load()), int(pubsubReceiveSlots.Load())
+}
+
+// staleCommandRejectionMessage is the text a stale refusal carries back to the
+// server. It names the window actually applied (commandMaxAgeSec), not the
+// generic constant, and keeps the literal "too old" prefix the server-side
+// error queries match on.
+func staleCommandRejectionMessage(ageSec int64, maxAgeSec, busySlots, receiveSlots int) string {
+	return fmt.Sprintf(
+		"Command rejected: too old (%d seconds, max %d seconds; %d of %d receive slots busy). Terminal may have been offline.",
+		ageSec, maxAgeSec, busySlots, receiveSlots,
+	)
+}
+
 // commandMaxAgeSec is the staleness window for one command. A follow-up
 // attempt (a live `relay_follow_up`, a reconciliation query, or a queued
 // `relayturn_fu_…` SEND) must still reach its handler inside its own attempt
@@ -283,17 +310,47 @@ func isCommandStaleAfter(cmdTs int64, maxAgeSec, maxFutureSkewSec int) bool {
 // expiry (fenceReason / followUpTurnExpired), so nothing is replayable beyond
 // what that fence already allows. Past this window the broker has expired the
 // attempt itself, so the generic rejection is harmless again.
+//
+// A worktree built-in (isWorktreeDeviceCommand) carrying a signed
+// `deliveryExpiresAt` later than its ts gets that window instead:
+// terminal-service sets it to the time it will wait for the answer, so a frame
+// that reached this device late — receive slots busy, a short connectivity gap
+// — still runs while the server is waiting. It is capped at
+// maxSignedCommandWindow and honoured on NO other command, so a future server
+// sending the field elsewhere widens nothing.
+//
+// The gate runs before verifySignature, so a tampered `deliveryExpiresAt`
+// passes it — and then fails the signature as `unauthorized`. That holds
+// because worktree commands never run unsigned (worktree_dispatch.go refuses
+// them when CommandSecret is empty).
 func commandMaxAgeSec(cmd commandMsg) int {
 	if isFollowUpProtocolCommand(cmd) {
 		return int((followUpAttemptWindow + followUpSkewMargin).Seconds())
 	}
+	if isWorktreeDeviceCommand(cmd.Command) && cmd.DeliveryExpiresAt > cmd.Ts {
+		window := time.Duration(cmd.DeliveryExpiresAt-cmd.Ts) * time.Millisecond
+		if window > maxSignedCommandWindow {
+			window = maxSignedCommandWindow
+		}
+		return int(window / time.Second)
+	}
 	return maxCommandAgeSec
 }
+
+// maxSignedCommandWindow bounds a signed `deliveryExpiresAt` window, whatever
+// the frame says. terminal-service's longest worktree wait
+// (WORKTREE_COMMAND_TIMEOUT_MS) is 10 minutes, below its 15-minute
+// stale-in-flight reaper, so nothing legitimate asks for more.
+const maxSignedCommandWindow = 10 * time.Minute
 
 // commandMaxFutureSkewSec is how far into this device's future one command's
 // timestamp may sit. A follow-up's own fences are decided against that signed
 // ts, so it tolerates only the clock skew those fences already allow
 // (followUpSkewMargin) — independently of the longer age window above.
+//
+// A worktree built-in's signed `deliveryExpiresAt` is the second case where the
+// two are independent: it lengthens how OLD the frame may be, never how far in
+// the future its ts may sit, which stays at the generic 60 seconds.
 func commandMaxFutureSkewSec(cmd commandMsg) int {
 	if isFollowUpProtocolCommand(cmd) {
 		return int(followUpSkewMargin.Seconds())
@@ -798,7 +855,7 @@ func isSigFailRateLimited() bool {
 // signaturePayload matches the exact JSON structure used by Node.js signCommand()
 // Field order must match: id, command, args, ts, type, sessionID, input, signal,
 // refreshId, riskLevel, executionId, cwd, conversationId, ackedTurnIds,
-// cliAgentCatalog, readOnly
+// cliAgentCatalog, deliveryExpiresAt, cwdFence, readOnly
 //
 // That list is a contract, not a description. Go marshals struct fields in
 // DECLARATION order, so moving any line below changes the canonical bytes and
@@ -842,7 +899,8 @@ type signaturePayload struct {
 	// executionId is signed for the same reason riskLevel is, and it MUST sit
 	// here — between riskLevel and cwd. Go marshals in declaration order and
 	// the Node signer appends in the order
-	//   refreshId, riskLevel, executionId, cwd, conversationId, ackedTurnIds, readOnly
+	//   refreshId, riskLevel, executionId, cwd, conversationId, ackedTurnIds,
+	//   deliveryExpiresAt, cwdFence, readOnly
 	// (hmac.util.js), so moving this line silently invalidates every signature
 	// that carries the field.
 	//
@@ -897,6 +955,16 @@ type signaturePayload struct {
 	// older agent would compute a canonical without it and reject the command.
 	AckedTurnIds    []string        `json:"ackedTurnIds,omitempty"`
 	CliAgentCatalog json.RawMessage `json:"cliAgentCatalog,omitempty"`
+	// DeliveryExpiresAt is a worktree frame's signed delivery window
+	// (commandMsg DeliveryExpiresAt). Node's signCommand appends
+	// `canonical.deliveryExpiresAt` after ackedTurnIds and before cwdFence,
+	// only for a positive integer; omitempty drops zero here, so every frame without it keeps its byte-identical
+	// canonical. CliAgentCatalog sits between the two on this side only, and
+	// only on __cli_usage_refresh__, which never carries an expiry.
+	// terminal-service sends the field only to a device reporting
+	// capabilities.signedCommandExpiry — an older agent would compute a
+	// canonical without it and reject the command.
+	DeliveryExpiresAt int64 `json:"deliveryExpiresAt,omitempty"`
 	// CwdFence is the signed folder boundary for a start admitted through an
 	// ancestor grant (relay_cwd_fence.go). If the command's real directory
 	// escapes that boundary (e.g. symlink escape), the agent refuses the command
@@ -956,12 +1024,13 @@ func signatureCanonical(cmd commandMsg) ([]byte, error) {
 		// command carries one, so this must too or the two canonicals diverge.
 		ExecutionID: cmd.ExecutionID,
 		// Gated to match the Node signer — see the field comment.
-		Cwd:             signatureCwd(cmd),
-		ConversationID:  cmd.ConversationID,
-		AckedTurnIds:    cmd.AckedTurnIds,
-		CliAgentCatalog: cliAgentCatalogSignatureJSON(cmd),
-		CwdFence:        cmd.CwdFence,
-		ReadOnly:        cmd.ReadOnly,
+		Cwd:               signatureCwd(cmd),
+		ConversationID:    cmd.ConversationID,
+		AckedTurnIds:      cmd.AckedTurnIds,
+		CliAgentCatalog:   cliAgentCatalogSignatureJSON(cmd),
+		DeliveryExpiresAt: cmd.DeliveryExpiresAt,
+		CwdFence:          cmd.CwdFence,
+		ReadOnly:          cmd.ReadOnly,
 	}
 
 	// Use json.NewEncoder with SetEscapeHTML(false) to match Node.js JSON.stringify behavior.
@@ -1073,6 +1142,13 @@ type commandMsg struct {
 	AgentID     string   `json:"agentId,omitempty"`   // Target agent for signature verification
 	Signature   string   `json:"signature,omitempty"` // HMAC-SHA256 signature of command
 	TimeoutMs   int64    `json:"timeoutMs,omitempty"` // Execution timeout in milliseconds (default: 120000)
+	// DeliveryExpiresAt (epoch ms) is the end of the window in which a worktree
+	// built-in may still start, set by terminal-service to the time it waits
+	// for the answer. SIGNED (see signaturePayload.DeliveryExpiresAt) and
+	// honoured only on worktree built-ins, capped at maxSignedCommandWindow
+	// (commandMaxAgeSec). Not `expiresAt`: that tag is the follow-up
+	// protocol's unsigned attempt expiry (FollowUpAttemptExpiresAt).
+	DeliveryExpiresAt int64 `json:"deliveryExpiresAt,omitempty"`
 	// CLI usage refresh: carries the backend's refreshId so __cli_usage_refresh_result__
 	// can echo it back. Stored as `cliUsageInFlightRefreshId` on the agent doc;
 	// stale results (mismatched refreshId) are dropped by the results subscriber.
@@ -1982,6 +2058,7 @@ func runPubSubConnection(cfg *Config) error {
 		sub.ReceiveSettings.MaxOutstandingMessages = 10 // Default to 10 for faster stale-command drain
 	}
 	fmt.Printf("[pubsub] MaxOutstandingMessages set to %d\n", sub.ReceiveSettings.MaxOutstandingMessages)
+	pubsubReceiveSlots.Store(int32(sub.ReceiveSettings.MaxOutstandingMessages))
 
 	topic := client.Publisher(topicName)
 
@@ -1992,6 +2069,10 @@ func runPubSubConnection(cfg *Config) error {
 
 	fmt.Printf("[pubsub] listening for commands on: %s\n", cfg.CommandsSubscription)
 	err = sub.Receive(ctx, func(ctx context.Context, m *pubsub.Message) {
+		// Counted first, so a stale rejection can say how many receive slots
+		// were occupied when it refused (staleCommandRejectionMessage).
+		pubsubReceiveBusy.Add(1)
+		defer pubsubReceiveBusy.Add(-1)
 		// Panic recovery to prevent app crash on unhandled errors
 		defer func() {
 			if r := recover(); r != nil {
@@ -2174,8 +2255,9 @@ func runPubSubConnection(cfg *Config) error {
 		maxAgeSec := commandMaxAgeSec(cmd)
 		if !isInternalDemandCommand(cmd.Command) && isCommandStaleAfter(cmd.Ts, maxAgeSec, commandMaxFutureSkewSec(cmd)) {
 			ageSec := (time.Now().UnixMilli() - cmd.Ts) / 1000
-			fmt.Printf("%s[aiexpedite] Stale command rejected (age: %ds, max: %ds)%s\n",
-				colorYellow, ageSec, maxAgeSec, colorReset)
+			busy, slots := pubsubReceiveOccupancy()
+			fmt.Printf("%s[aiexpedite] Stale command rejected (age: %ds, max: %ds, receive slots busy: %d of %d)%s\n",
+				colorYellow, ageSec, maxAgeSec, busy, slots, colorReset)
 
 			// Send stale response back to user
 			res := makeRejectionResult(
@@ -2183,7 +2265,7 @@ func runPubSubConnection(cfg *Config) error {
 				cfg.AgentID,
 				"stale",
 				"STALE",
-				fmt.Sprintf("Command rejected: too old (%d seconds, max %d seconds). Terminal may have been offline.", ageSec, maxCommandAgeSec),
+				staleCommandRejectionMessage(ageSec, maxAgeSec, busy, slots),
 			)
 			releasePublish, allowed := beginTrackedRejectionPublish()
 			if !allowed {

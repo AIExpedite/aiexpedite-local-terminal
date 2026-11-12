@@ -72,7 +72,8 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// The literal IS the assertion: this pins the exact wire shape, so
 			// adding a capability has to be a deliberate edit here rather than
 			// something that rides along silently. `signedExecutionId` joined it
-			// with the signed-executionId device half, `whatsapp` with the
+			// with the signed-executionId device half, `signedCommandExpiry` with
+			// the signed worktree delivery window, `whatsapp` with the
 			// WhatsApp bridge, and its `protocol` (2) with sticky identities and
 			// the re-link carry-over; `cliSessionDiscovery` with finding and
 			// adopting coding-agent sessions AI Expedite did not start, and its
@@ -82,7 +83,7 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// model and effort to every turn; `openCodeAuthRefusalFrame` with an
 			// OpenCode turn that fails on a missing provider key naming the
 			// provider in its error frame.
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"whatsapp":`+string(waRaw)+`}` {
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})

@@ -218,6 +218,21 @@ type capabilitiesInfo struct {
 	// Never omitempty: a future build reporting `false` must not read as
 	// "field absent".
 	SignedExecutionID bool `json:"signedExecutionId"`
+	// SignedCommandExpiry (shared-constants DEVICE_COMMAND_CAPABILITIES.
+	// SIGNED_COMMAND_EXPIRY): this build includes `deliveryExpiresAt` in the signature
+	// canonical (signaturePayload in pubsub.go) and honours it on the worktree
+	// built-ins as the frame's age window in place of the fixed 60 seconds
+	// (commandMaxAgeSec).
+	//
+	// terminal-service attaches a signed `deliveryExpiresAt` ONLY when this is true
+	// (`deviceVerifiesSignedCommandExpiry`), because an older agent omits the
+	// field from its canonical and would reject every worktree command as a bad
+	// signature. Signed because it is the only thing that lets an older frame
+	// past the staleness gate.
+	//
+	// Never omitempty: a future build reporting `false` must not read as
+	// "field absent".
+	SignedCommandExpiry bool `json:"signedCommandExpiry"`
 	// WhatsApp (`capabilities.whatsapp`, local/documents/features/whatsapp/WHATSAPP_INTEGRATION.md
 	// "Authorization and isolation"): this build embeds the whatsmeow bridge
 	// (whatsapp_supervisor.go). `secureStorage` is whether the OS credential
@@ -382,9 +397,10 @@ func newMachineCapabilities() *capabilitiesInfo {
 			Engines:  []string{cliSessionEngineClaudeCode},
 			Protocol: cliSessionDiscoveryProtocol,
 		},
-		WorktreeBuiltIns:  true,
-		SignedExecutionID: true,
-		WhatsApp:          currentWhatsAppCapability(),
+		WorktreeBuiltIns:    true,
+		SignedExecutionID:   true,
+		SignedCommandExpiry: true,
+		WhatsApp:            currentWhatsAppCapability(),
 	}
 }
 
