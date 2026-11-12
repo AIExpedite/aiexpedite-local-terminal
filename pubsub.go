@@ -312,17 +312,17 @@ func staleCommandRejectionMessage(ageSec int64, maxAgeSec, busySlots, receiveSlo
 // attempt itself, so the generic rejection is harmless again.
 //
 // A worktree built-in (isWorktreeDeviceCommand) carrying a signed
-// `deliveryExpiresAt`
-// later than its ts gets that window instead: terminal-service sets it to the
-// time it will wait for the answer, so a frame that reached this device late
-// — receive slots busy, a short connectivity gap — still runs while the server
-// is waiting. It is capped at maxSignedCommandWindow and honoured on NO other
-// command, so a future server sending the field elsewhere widens nothing.
+// `deliveryExpiresAt` later than its ts gets that window instead:
+// terminal-service sets it to the time it will wait for the answer, so a frame
+// that reached this device late — receive slots busy, a short connectivity gap
+// — still runs while the server is waiting. It is capped at
+// maxSignedCommandWindow and honoured on NO other command, so a future server
+// sending the field elsewhere widens nothing.
 //
-// The gate runs before verifySignature, so a tampered `deliveryExpiresAt` passes it —
-// and then fails the signature as `unauthorized`. That holds because worktree
-// commands never run unsigned (worktree_dispatch.go refuses them when
-// CommandSecret is empty).
+// The gate runs before verifySignature, so a tampered `deliveryExpiresAt`
+// passes it — and then fails the signature as `unauthorized`. That holds
+// because worktree commands never run unsigned (worktree_dispatch.go refuses
+// them when CommandSecret is empty).
 func commandMaxAgeSec(cmd commandMsg) int {
 	if isFollowUpProtocolCommand(cmd) {
 		return int((followUpAttemptWindow + followUpSkewMargin).Seconds())
@@ -337,8 +337,8 @@ func commandMaxAgeSec(cmd commandMsg) int {
 	return maxCommandAgeSec
 }
 
-// maxSignedCommandWindow bounds a signed `deliveryExpiresAt` window, whatever the
-// frame says. terminal-service's longest worktree wait
+// maxSignedCommandWindow bounds a signed `deliveryExpiresAt` window, whatever
+// the frame says. terminal-service's longest worktree wait
 // (WORKTREE_COMMAND_TIMEOUT_MS) is 10 minutes, below its 15-minute
 // stale-in-flight reaper, so nothing legitimate asks for more.
 const maxSignedCommandWindow = 10 * time.Minute
@@ -348,9 +348,9 @@ const maxSignedCommandWindow = 10 * time.Minute
 // ts, so it tolerates only the clock skew those fences already allow
 // (followUpSkewMargin) — independently of the longer age window above.
 //
-// A worktree built-in's signed `deliveryExpiresAt` is the second case where the two
-// are independent: it lengthens how OLD the frame may be, never how far in the
-// future its ts may sit, which stays at the generic 60 seconds.
+// A worktree built-in's signed `deliveryExpiresAt` is the second case where the
+// two are independent: it lengthens how OLD the frame may be, never how far in
+// the future its ts may sit, which stays at the generic 60 seconds.
 func commandMaxFutureSkewSec(cmd commandMsg) int {
 	if isFollowUpProtocolCommand(cmd) {
 		return int(followUpSkewMargin.Seconds())
@@ -855,7 +855,7 @@ func isSigFailRateLimited() bool {
 // signaturePayload matches the exact JSON structure used by Node.js signCommand()
 // Field order must match: id, command, args, ts, type, sessionID, input, signal,
 // refreshId, riskLevel, executionId, cwd, conversationId, ackedTurnIds,
-// cliAgentCatalog, readOnly
+// cliAgentCatalog, deliveryExpiresAt, cwdFence, readOnly
 //
 // That list is a contract, not a description. Go marshals struct fields in
 // DECLARATION order, so moving any line below changes the canonical bytes and
@@ -899,7 +899,8 @@ type signaturePayload struct {
 	// executionId is signed for the same reason riskLevel is, and it MUST sit
 	// here — between riskLevel and cwd. Go marshals in declaration order and
 	// the Node signer appends in the order
-	//   refreshId, riskLevel, executionId, cwd, conversationId, ackedTurnIds, readOnly
+	//   refreshId, riskLevel, executionId, cwd, conversationId, ackedTurnIds,
+	//   deliveryExpiresAt, cwdFence, readOnly
 	// (hmac.util.js), so moving this line silently invalidates every signature
 	// that carries the field.
 	//
@@ -956,9 +957,8 @@ type signaturePayload struct {
 	CliAgentCatalog json.RawMessage `json:"cliAgentCatalog,omitempty"`
 	// DeliveryExpiresAt is a worktree frame's signed delivery window
 	// (commandMsg DeliveryExpiresAt). Node's signCommand appends
-	// `canonical.deliveryExpiresAt` after
-	// ackedTurnIds and before cwdFence, only for a positive integer; omitempty
-	// drops zero here, so every frame without it keeps its byte-identical
+	// `canonical.deliveryExpiresAt` after ackedTurnIds and before cwdFence,
+	// only for a positive integer; omitempty drops zero here, so every frame without it keeps its byte-identical
 	// canonical. CliAgentCatalog sits between the two on this side only, and
 	// only on __cli_usage_refresh__, which never carries an expiry.
 	// terminal-service sends the field only to a device reporting
