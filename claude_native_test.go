@@ -343,6 +343,146 @@ func TestClaudeNativeLifecycle_StartSendEnd(t *testing.T) {
 	}
 }
 
+// How many partial-message deltas the claude-native-delta-burst mock prints
+// ahead of its assistant recap and result.
+const mockClaudeDeltaBurstCount = 40
+
+// The end of a Claude turn arrives as a burst: its deltas, its assistant recap
+// and its result within a few milliseconds. Each publish waits for its Pub/Sub
+// ack, so a FIFO publisher held the result behind every delta (1-2.3 s on dev,
+// 2026-11-13). The recap and the result go out first; every delta is still
+// published, in its own order, before the session's ended frame.
+func TestClaudeNativeLifecycle_ResultOvertakesQueuedDeltas(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	tmpDir := installMockClaude(t, "claude-native-delta-burst")
+
+	m := NewClaudeNativeManager(nil)
+	id := fmt.Sprintf("claude-burst-%d", time.Now().UnixNano())
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	release := make(chan struct{})
+	var holdOnce sync.Once
+	publishFn := func(res resultMsg) {
+		// Hold the first Claude frame's publish, as a slow Pub/Sub ack does,
+		// while the rest of the burst queues behind it.
+		if res.Type == "claude_native_message" {
+			holdOnce.Do(func() { <-release })
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+	if err := m.Start(id, tmpDir, nil, "", "ws", "uid", publishFn, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// The mock prints the whole burst in one write; the scanner queues it in
+	// microseconds.
+	time.Sleep(750 * time.Millisecond)
+	close(release)
+
+	order := func() (deltas []int, recap, result int) {
+		mu.Lock()
+		defer mu.Unlock()
+		recap, result = -1, -1
+		for i, msg := range captured {
+			if msg.Type != "claude_native_message" {
+				continue
+			}
+			switch {
+			case isClaudeStreamDeltaLine(msg.Output):
+				deltas = append(deltas, i)
+			case strings.Contains(msg.Output, `"type":"assistant"`):
+				recap = i
+			case strings.Contains(msg.Output, `"type":"result"`):
+				result = i
+			}
+		}
+		return deltas, recap, result
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		deltas, _, result := order()
+		if len(deltas) == mockClaudeDeltaBurstCount && result >= 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out: %d deltas, result at %d", len(deltas), result)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := m.End(id); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	for {
+		mu.Lock()
+		ended := len(captured) > 0 && captured[len(captured)-1].Type == "claude_native_ended"
+		mu.Unlock()
+		if ended {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for claude_native_ended")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	deltas, recap, result := order()
+	if recap < 0 || result < 0 || recap > result {
+		t.Fatalf("recap at %d, result at %d: want the recap, then the result", recap, result)
+	}
+	// At most the one delta already in flight when the burst queued (the held
+	// publish) goes before the result; every queued delta waits.
+	before := 0
+	for _, i := range deltas {
+		if i < result {
+			before++
+		}
+	}
+	if before > 1 {
+		t.Fatalf("%d deltas published before the result (recap at %d, result at %d): the recap and result must skip the queued deltas", before, recap, result)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	prevSeq := 0
+	for _, i := range deltas {
+		if captured[i].Seq <= prevSeq {
+			t.Fatalf("delta seq %d published after seq %d: deltas must keep their order", captured[i].Seq, prevSeq)
+		}
+		prevSeq = captured[i].Seq
+	}
+	if captured[result].Seq <= captured[deltas[len(deltas)-1]].Seq {
+		t.Fatalf("result seq %d is not after the deltas' (%d): only the publish order may change, never the seq", captured[result].Seq, captured[deltas[len(deltas)-1]].Seq)
+	}
+}
+
+func TestIsClaudeStreamDeltaLine(t *testing.T) {
+	cases := []struct {
+		line string
+		want bool
+	}{
+		{`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}},"session_id":"s","parent_tool_use_id":null,"uuid":"u"}`, true},
+		{`{"type":"stream_event","event":{"type":"message_stop"},"session_id":"s"}`, true},
+		// Every frame a reader acts on stays in order.
+		{`{"duration_api_ms":20893,"type":"result","subtype":"success","is_error":false,"result":"done"}`, false},
+		{`{"type":"result","subtype":"success","result":"done"}`, false},
+		{`{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}`, false},
+		{`{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool"}}`, false},
+		{`{"type":"system","subtype":"init","session_id":"s"}`, false},
+		{`{"type":"user","message":{"content":[{"type":"tool_result"}]}}`, false},
+		// A shape it does not recognise stays in order: slower, never wrong.
+		{`{"event":{"type":"content_block_delta"},"type":"stream_event"}`, false},
+		{`{ "type": "stream_event" }`, false},
+		{`mock-claude: not json`, false},
+		{``, false},
+	}
+	for _, c := range cases {
+		if got := isClaudeStreamDeltaLine(c.line); got != c.want {
+			t.Errorf("isClaudeStreamDeltaLine(%q) = %v, want %v", c.line, got, c.want)
+		}
+	}
+}
+
 func TestClaudeNativeLifecycle_OversizeFrameTerminatesSession(t *testing.T) {
 	skipIfUnsupportedOS(t)
 	tmpDir := installMockClaude(t, "claude-native-oversize")

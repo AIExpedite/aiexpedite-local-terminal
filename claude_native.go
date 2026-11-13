@@ -792,6 +792,21 @@ func (m *ClaudeNativeManager) removeSessionIfSame(id string, s *ClaudeNativeSess
    Stream + exit handling
    -------------------------------------------------------------------------- */
 
+// claudeStreamDeltaPrefix starts every partial-message event Claude Code writes
+// with --include-partial-messages (`{"type":"stream_event","event":{…}}`).
+const claudeStreamDeltaPrefix = `{"type":"stream_event",`
+
+// isClaudeStreamDeltaLine reports whether a stdout line is a partial-message
+// delta, the one frame that may be published after frames printed later
+// (startOrderedFirstTerminalPublisher). It matches the exact prefix Claude
+// writes and nothing else: a line it does not recognise stays in order, which
+// is never wrong, only slower. The result, the assistant recap, a permission
+// request and every system frame start differently, so they always stay in
+// order.
+func isClaudeStreamDeltaLine(line string) bool {
+	return strings.HasPrefix(line, claudeStreamDeltaPrefix)
+}
+
 // readStream forwards every stdout stream-json line as claude_native_message
 // (VERBATIM — the frontend parseClaudeEvents does all semantic interpretation)
 // and every stderr line as claude_native_stderr. Unlike codex we do NOT reject
@@ -803,16 +818,22 @@ func (m *ClaudeNativeManager) removeSessionIfSame(id string, s *ClaudeNativeSess
 func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn PublishFunc) {
 	defer close(session.streamDone)
 
+	// Two queues, one serial publisher: every frame but a stream_event delta is
+	// published in order and never waits behind the deltas queued before it
+	// (startOrderedFirstTerminalPublisher). Each queue has its own bound, so a
+	// stalled publish still fails the session fast.
 	queue := make(chan resultMsg, claudeNativePublishQueueSize)
-	publisherDone := startTrackedTerminalPublisher(queue, publishFn)
+	deltaQueue := make(chan resultMsg, claudeNativePublishQueueSize)
+	publisherDone := startOrderedFirstTerminalPublisher(queue, deltaQueue, publishFn)
 	defer func() {
 		close(queue)
+		close(deltaQueue)
 		<-publisherDone
 	}()
 
-	enqueue := func(msg resultMsg) bool {
+	enqueueTo := func(q chan<- resultMsg, msg resultMsg) bool {
 		select {
-		case queue <- msg:
+		case q <- msg:
 			return true
 		case <-time.After(claudeNativeEnqueueTimeout):
 			return false
@@ -841,7 +862,7 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 		}
 	}
 
-	publishOrFail := func(msg resultMsg, droppedType string) bool {
+	publishOrFailTo := func(q chan<- resultMsg, msg resultMsg, droppedType string) bool {
 		encoded, err := json.Marshal(msg)
 		if err != nil {
 			failSessionFatally(
@@ -860,11 +881,14 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 			)
 			return false
 		}
-		if !enqueue(msg) {
+		if !enqueueTo(q, msg) {
 			failSessionFatally("claude native publish queue stalled — terminating session to avoid dropping frames", droppedType)
 			return false
 		}
 		return true
+	}
+	publishOrFail := func(msg resultMsg, droppedType string) bool {
+		return publishOrFailTo(queue, msg, droppedType)
 	}
 
 	var wg sync.WaitGroup
@@ -934,7 +958,14 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 					colorYellow, session.ID,
 					time.UnixMilli(rejected.ResetsAtMs).UTC().Format(time.RFC3339), colorReset)
 			}
-			if !publishOrFail(resultMsg{
+			// A partial-message delta waits behind every other frame
+			// (startOrderedFirstTerminalPublisher), so the recap, the result and
+			// a permission request reach the cloud without queueing behind it.
+			lane := queue
+			if isClaudeStreamDeltaLine(trimmed) {
+				lane = deltaQueue
+			}
+			if !publishOrFailTo(lane, resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,
 				UID:         session.UID,

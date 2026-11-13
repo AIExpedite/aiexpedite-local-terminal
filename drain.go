@@ -414,6 +414,79 @@ func startTrackedTerminalPublisher(queue <-chan resultMsg, publishFn PublishFunc
 	return done
 }
 
+// startOrderedFirstTerminalPublisher drains two queues with ONE serial
+// publisher, counted as active work exactly like startTrackedTerminalPublisher
+// (the count ends only after every frame of both queues returned from
+// publishFn).
+//
+// `ordered` frames are published in their own order and never wait behind a
+// `deferred` frame queued before them: an ordered frame that is waiting is
+// always published next. A deferred frame is published only while no ordered
+// frame is waiting, so it can lag behind the ordered frames queued after it
+// but never overtake one queued before it.
+//
+// Why: each publish waits for its Pub/Sub ack (~20 ms), so frames drain one
+// round trip at a time. Claude Code prints a finished message as ~100
+// stream_event deltas, its `assistant` recap and the turn's `result` within a
+// few milliseconds, and the `result` (the turn's whole reply) then reached the
+// cloud 1-2.3 s after Claude printed it, behind its own deltas (measured on dev
+// 2026-11-13). Deltas repeat what the recap and the result already say, and
+// their only reader orders chunks by seq whenever they land, so they are the
+// frames that can wait. The relay readers drop a chunk that lands after a
+// higher seq: a deferred frame may only ever be the one that lands late.
+func startOrderedFirstTerminalPublisher(ordered, deferred <-chan resultMsg, publishFn PublishFunc) <-chan struct{} {
+	done := make(chan struct{})
+	trackTerminalPublishStart()
+	go func() {
+		defer close(done)
+		defer trackTerminalPublishEnd()
+		// Publish every ordered frame already waiting; ordered becomes nil
+		// once its queue is closed and empty.
+		drainOrdered := func() {
+			for ordered != nil {
+				select {
+				case msg, ok := <-ordered:
+					if !ok {
+						ordered = nil
+						return
+					}
+					publishFn(msg)
+				default:
+					return
+				}
+			}
+		}
+		// A nil channel never fires, so a closed queue drops out of the select.
+		for ordered != nil || deferred != nil {
+			select {
+			case msg, ok := <-ordered:
+				if !ok {
+					ordered = nil
+					continue
+				}
+				publishFn(msg)
+			case msg, ok := <-deferred:
+				if !ok {
+					deferred = nil
+					continue
+				}
+				orderedFirstPickedDeferred()
+				// With a frame in both queues the select picks either, so the
+				// ordered frames waiting still go first: this deferred frame
+				// may land after them, never before.
+				drainOrdered()
+				publishFn(msg)
+			}
+		}
+	}()
+	return done
+}
+
+// orderedFirstPickedDeferred runs when the publisher has taken a deferred frame
+// and not yet published it. A test seam: it lets a test queue an ordered frame
+// at exactly that moment.
+var orderedFirstPickedDeferred = func() {}
+
 // ActiveWork returns the total number of accepted units of work that have not
 // yet reached a terminal state. A drain may install only when this is zero.
 func ActiveWork() int {
