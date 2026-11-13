@@ -577,6 +577,46 @@ func TestOrderedFirstPublisher_DeferredFrameNeverOvertakesAnOrderedOne(t *testin
 	}
 }
 
+// The race the select cannot rule out: the publisher has taken a deferred
+// frame when an ordered one is queued. The ordered frame still goes first.
+func TestOrderedFirstPublisher_OrderedFrameQueuedAsADeferredOneIsTakenGoesFirst(t *testing.T) {
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+	picked := make(chan struct{})
+	resume := make(chan struct{})
+	var once sync.Once
+	orderedFirstPickedDeferred = func() {
+		once.Do(func() {
+			close(picked)
+			<-resume
+		})
+	}
+	t.Cleanup(func() { orderedFirstPickedDeferred = func() {} })
+
+	ordered := make(chan resultMsg, 4)
+	deferred := make(chan resultMsg, 4)
+	var mu sync.Mutex
+	var published []string
+	done := startOrderedFirstTerminalPublisher(ordered, deferred, func(msg resultMsg) {
+		mu.Lock()
+		published = append(published, msg.Output)
+		mu.Unlock()
+	})
+	deferred <- resultMsg{Output: "delta"}
+	<-picked
+	ordered <- resultMsg{Output: "result"}
+	close(resume)
+	close(ordered)
+	close(deferred)
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(published, ",") != "result,delta" {
+		t.Fatalf("published %v, want [result delta]: an ordered frame waiting goes before the deferred frame already taken", published)
+	}
+}
+
 func TestOrderedFirstPublisher_HoldsDrainUntilBothQueuesFlush(t *testing.T) {
 	resetDrainState(t)
 	t.Cleanup(func() { resetDrainState(t) })

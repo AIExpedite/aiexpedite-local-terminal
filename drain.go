@@ -440,28 +440,24 @@ func startOrderedFirstTerminalPublisher(ordered, deferred <-chan resultMsg, publ
 	go func() {
 		defer close(done)
 		defer trackTerminalPublishEnd()
-		// Publish every ordered frame already waiting. Returns false once the
-		// ordered queue is closed and empty.
-		drainOrdered := func() bool {
-			for {
+		// Publish every ordered frame already waiting; ordered becomes nil
+		// once its queue is closed and empty.
+		drainOrdered := func() {
+			for ordered != nil {
 				select {
 				case msg, ok := <-ordered:
 					if !ok {
-						return false
+						ordered = nil
+						return
 					}
 					publishFn(msg)
 				default:
-					return true
+					return
 				}
 			}
 		}
+		// A nil channel never fires, so a closed queue drops out of the select.
 		for ordered != nil || deferred != nil {
-			if ordered != nil && !drainOrdered() {
-				ordered = nil
-				continue
-			}
-			// Nothing ordered is waiting: block on either queue. A nil channel
-			// never fires, so a closed queue drops out of the select.
 			select {
 			case msg, ok := <-ordered:
 				if !ok {
@@ -474,17 +470,22 @@ func startOrderedFirstTerminalPublisher(ordered, deferred <-chan resultMsg, publ
 					deferred = nil
 					continue
 				}
-				// An ordered frame queued while this select was choosing (both
-				// ready: Go picks either) still goes first.
-				if ordered != nil && !drainOrdered() {
-					ordered = nil
-				}
+				orderedFirstPickedDeferred()
+				// With a frame in both queues the select picks either, so the
+				// ordered frames waiting still go first: this deferred frame
+				// may land after them, never before.
+				drainOrdered()
 				publishFn(msg)
 			}
 		}
 	}()
 	return done
 }
+
+// orderedFirstPickedDeferred runs when the publisher has taken a deferred frame
+// and not yet published it. A test seam: it lets a test queue an ordered frame
+// at exactly that moment.
+var orderedFirstPickedDeferred = func() {}
 
 // ActiveWork returns the total number of accepted units of work that have not
 // yet reached a terminal state. A drain may install only when this is zero.
