@@ -2,6 +2,7 @@
 package main
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -488,6 +489,121 @@ func TestTrackedTerminalPublisherHoldsDrainUntilQueueFlushes(t *testing.T) {
 	<-done
 	if got := ActiveWork(); got != 0 {
 		t.Fatalf("ActiveWork() = %d, want 0 after queued stream publish flushes", got)
+	}
+}
+
+// orderedFirstHarness runs startOrderedFirstTerminalPublisher with a publish
+// that blocks on the first frame until released, so the test can queue frames
+// behind it, then records the order every frame was published in.
+type orderedFirstHarness struct {
+	ordered, deferred chan resultMsg
+	done              <-chan struct{}
+	firstStarted      chan struct{}
+	release           chan struct{}
+	mu                sync.Mutex
+	published         []string
+}
+
+func newOrderedFirstHarness() *orderedFirstHarness {
+	h := &orderedFirstHarness{
+		ordered:      make(chan resultMsg, 16),
+		deferred:     make(chan resultMsg, 16),
+		firstStarted: make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+	var once sync.Once
+	h.done = startOrderedFirstTerminalPublisher(h.ordered, h.deferred, func(msg resultMsg) {
+		once.Do(func() {
+			close(h.firstStarted)
+			<-h.release
+		})
+		h.mu.Lock()
+		h.published = append(h.published, msg.Output)
+		h.mu.Unlock()
+	})
+	return h
+}
+
+func (h *orderedFirstHarness) finish(t *testing.T) []string {
+	t.Helper()
+	close(h.ordered)
+	close(h.deferred)
+	select {
+	case <-h.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("publisher did not finish after both queues closed")
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.published...)
+}
+
+func TestOrderedFirstPublisher_OrderedFrameSkipsQueuedDeferredFrames(t *testing.T) {
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+	h := newOrderedFirstHarness()
+
+	h.deferred <- resultMsg{Output: "d1"}
+	<-h.firstStarted // d1 is in flight
+	h.deferred <- resultMsg{Output: "d2"}
+	h.deferred <- resultMsg{Output: "d3"}
+	h.ordered <- resultMsg{Output: "result"}
+	close(h.release)
+
+	got := h.finish(t)
+	want := []string{"d1", "result", "d2", "d3"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("published %v, want %v: an ordered frame must not wait behind queued deferred frames", got, want)
+	}
+}
+
+func TestOrderedFirstPublisher_DeferredFrameNeverOvertakesAnOrderedOne(t *testing.T) {
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+	h := newOrderedFirstHarness()
+
+	h.ordered <- resultMsg{Output: "o1"}
+	<-h.firstStarted // o1 is in flight
+	h.ordered <- resultMsg{Output: "o2"}
+	h.deferred <- resultMsg{Output: "d1"}
+	h.ordered <- resultMsg{Output: "o3"}
+	h.deferred <- resultMsg{Output: "d2"}
+	close(h.release)
+
+	got := h.finish(t)
+	want := []string{"o1", "o2", "o3", "d1", "d2"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("published %v, want %v: ordered frames keep their order and go before every deferred frame waiting", got, want)
+	}
+}
+
+func TestOrderedFirstPublisher_HoldsDrainUntilBothQueuesFlush(t *testing.T) {
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+	h := newOrderedFirstHarness()
+
+	h.deferred <- resultMsg{Output: "d1"}
+	<-h.firstStarted
+	h.deferred <- resultMsg{Output: "d2"}
+	h.ordered <- resultMsg{Output: "o1"}
+	close(h.ordered)
+	close(h.deferred)
+	if got := ActiveWork(); got != 1 {
+		t.Fatalf("ActiveWork() = %d, want 1 while queued frames are unpublished", got)
+	}
+	close(h.release)
+	select {
+	case <-h.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("publisher did not finish")
+	}
+	if got := ActiveWork(); got != 0 {
+		t.Fatalf("ActiveWork() = %d, want 0 after both queues flushed", got)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if strings.Join(h.published, ",") != "d1,o1,d2" {
+		t.Fatalf("published %v, want every frame of both queues before done", h.published)
 	}
 }
 

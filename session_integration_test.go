@@ -617,6 +617,22 @@ func runMockCLI(mode string) {
 	case "claude-native-echo":
 		runMockClaudeNative()
 
+	case "claude-native-delta-burst":
+		// The end of a turn as Claude Code prints it (seen on dev 2026-11-13):
+		// the message's partial-message deltas, its assistant recap and the
+		// turn's result, all in one write. Then stay alive so End() drives the
+		// teardown. Used by TestClaudeNativeLifecycle_ResultOvertakesQueuedDeltas.
+		var burst strings.Builder
+		for i := 1; i <= mockClaudeDeltaBurstCount; i++ {
+			fmt.Fprintf(&burst, `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"d%d "}},"session_id":"s","parent_tool_use_id":null,"uuid":"u%d"}`+"\n", i, i)
+		}
+		burst.WriteString(`{"type":"assistant","message":{"content":[{"type":"text","text":"the whole reply"}]},"session_id":"s","parent_tool_use_id":null}` + "\n")
+		burst.WriteString(`{"duration_api_ms":1,"type":"result","subtype":"success","is_error":false,"result":"the whole reply","session_id":"s"}` + "\n")
+		_, _ = os.Stdout.WriteString(burst.String())
+		_ = os.Stdout.Sync()
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		os.Exit(0)
+
 	case "claude-native-ratelimit":
 		// Emit a single stream-json frame that captureClaudeRateLimitLine
 		// classifies as a hard-quota rejection, then keep stdin open so the
