@@ -110,7 +110,7 @@ func TestAntigravityFreshness_NativeTurnAdvancesObservedAt(t *testing.T) {
 	}
 
 	session := &AntigravityNativeSession{ID: "freshness-native", status: "idle"}
-	out, _, exitCode, timedOut, _, runErr := NewAntigravityNativeManager(nil).runOneShot(
+	out, _, exitCode, timedOut, _, _, runErr := NewAntigravityNativeManager(nil).runOneShot(
 		session, t.TempDir(), executable, "hello", "", 30*time.Second, "test:antigravity-freshness")
 	if runErr != nil || exitCode != 0 || timedOut {
 		t.Fatalf("stub turn failed: out=%q exit=%d timedOut=%v err=%v", out, exitCode, timedOut, runErr)
@@ -296,7 +296,7 @@ func TestAntigravityFreshness_GatedNativeTurnAdvancesObservedAt(t *testing.T) {
 	home, cache, stale, executable := helperGatedRunFreshnessFixture(t)
 
 	session := &AntigravityNativeSession{ID: "freshness-native-gated", status: "idle"}
-	out, _, exitCode, timedOut, _, runErr := NewAntigravityNativeManager(nil).runOneShot(
+	out, _, exitCode, timedOut, _, _, runErr := NewAntigravityNativeManager(nil).runOneShot(
 		session, t.TempDir(), executable, "hello", "", 30*time.Second, "test:antigravity-freshness-gated")
 	if runErr != nil || exitCode != 0 || timedOut {
 		t.Fatalf("stub turn failed: out=%q exit=%d timedOut=%v err=%v", out, exitCode, timedOut, runErr)

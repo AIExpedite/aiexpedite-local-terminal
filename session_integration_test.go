@@ -337,6 +337,9 @@ func runMockCLI(mode string) {
 		fmt.Printf(`{"event":"result","result":{"status":"SUCCESS","response":%s}}`+"\n", encodedMarker)
 		os.Exit(0)
 
+	case mockAgyConversationIDMode:
+		runMockAgyConversationID()
+
 	case mockAgyArgvMode:
 		runMockAgyArgv()
 
