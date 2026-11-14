@@ -14,11 +14,21 @@
 //     `session/new`, `session/prompt`, `session/update` streaming, approval
 //     responses — live in the orchestrator. Keeping this driver protocol-
 //     agnostic means Grok's ACP can evolve without dragging the agent along.
+//     One narrow exception: a live follow-up (relay_follow_up_jsonrpc.go).
+//     The device writes that `_x.ai/interject` itself, under its follow-up
+//     ledger, so a small tracker reads the frames going both ways for the
+//     request/response pairing of ids the device chose (`relay-followup-…`),
+//     the client prompts and permission requests that are open, and the ACP
+//     session the child is on. It exists only on a session launched from a
+//     Grok version certified for live follow-ups.
 //
 //   - Frames are forwarded VERBATIM as `grok_acp_message` results. Non-JSON
 //     lines become `grok_acp_error` so the orchestrator's state machine sees
 //     a clear failure instead of misinterpreting a malformed line as a real
-//     JSON-RPC response.
+//     JSON-RPC response. The one frame ever delayed is a prompt's answer
+//     while a live follow-up's stranded interjection runs as a turn of its
+//     own: it is published unchanged once that turn completes (L1/L2 spec
+//     §2.8).
 //
 //   - Stderr is surfaced as `grok_acp_stderr` for diagnostics but is not
 //     protocol-critical.
@@ -208,6 +218,14 @@ type GrokACPSession struct {
 	// whichever exit path gets there first.
 	grokUsageFloorMs atomic.Int64
 	grokUsageSettled atomic.Bool
+	// launchedVersion is the major.minor.patch of the grok binary this child
+	// was spawned from, read only while Grok is certified for live follow-ups
+	// ("" otherwise or when it could not be established). Live follow-ups are
+	// gated on it, never on the version installed now. Set once at Start.
+	launchedVersion string
+	// liveFollowUps is the live follow-up tracker (relay_follow_up_jsonrpc.go),
+	// nil unless launchedVersion is certified. Set once at Start.
+	liveFollowUps *liveFollowUpTracker
 
 	mu            sync.Mutex
 	status        string // "running" | "ended"
@@ -421,6 +439,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 			executable = p
 		}
 	}
+	launchedVersion, launchedKey := cliLaunchVersion(grokCliAgentID, executable)
 	// System-level requirements.toml (`/etc/grok/requirements.toml`) is NOT
 	// redirected by GROK_HOME — that's the whole point of a system layer. The
 	// per-session GROK_HOME isolation below neutralises the user-level layer
@@ -560,6 +579,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return fmt.Errorf("failed to start grok agent stdio (is `grok` on PATH or in ~/.grok/bin? run `grok login` to authenticate): %w", err)
 	}
 	trackSessionProcess(id, proc)
+	launchedVersion = confirmCliLaunchVersion(executable, launchedVersion, launchedKey)
 
 	// Clamp the requested timeout at our stale-GC ceiling. A misbehaving
 	// orchestrator that requests TimeoutMs > grokACPMaxLifetime would
@@ -588,6 +608,8 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		PersistentHome:    persistentHome,
 		limitNoticeScope:  limitNoticeScope,
 		producerContested: producerContested,
+		launchedVersion:   launchedVersion,
+		liveFollowUps:     newLiveFollowUpTracker(grokCliAgentID, launchedVersion),
 		status:            "running",
 		done:              make(chan struct{}),
 		processExited:     make(chan struct{}),
@@ -757,6 +779,11 @@ func (m *GrokACPManager) SendAccepting(id string, payload string, accept func() 
 	if err := acceptRelayDelivery(accept); err != nil {
 		return err
 	}
+	// The live follow-up tracker (relay_follow_up_jsonrpc.go) reads the frame
+	// before it reaches the child and learns, on return, whether it did.
+	sent := session.liveFollowUps.outbound(trimmed)
+	wrote := false
+	defer func() { sent.done(wrote) }()
 
 	writeDone := make(chan error, 1)
 	go func() {
@@ -784,6 +811,7 @@ func (m *GrokACPManager) SendAccepting(id string, payload string, accept func() 
 		}
 		return fmt.Errorf("timeout writing to grok acp session %s stdin — session terminated to prevent frame interleave", id)
 	}
+	wrote = true
 
 	fmt.Printf("%s[grok-acp] → %s (%d bytes)%s\n",
 		colorBlue, id, len(trimmed), colorReset)
@@ -1080,11 +1108,37 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 		return true
 	}
 
+	// publishMessage publishes one stdout frame verbatim. Its seq is taken here,
+	// so a prompt answer the live follow-up tracker held back takes one later
+	// than every frame read before its release.
+	publishMessage := func(line string) bool {
+		seq := atomic.AddInt64(&session.seq, 1)
+		return publishOrFail(resultMsg{
+			ID:          session.ID,
+			WorkspaceID: session.WorkspaceID,
+			UID:         session.UID,
+			Output:      line,
+			Status:      "success",
+			Ts:          time.Now().UnixMilli(),
+			Version:     Version,
+			Type:        "grok_acp_message",
+			SessionID:   session.ID,
+			Seq:         int(seq),
+		}, "grok_acp_message")
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
+		// Live follow-ups (relay_follow_up_jsonrpc.go): the tracker reads every
+		// frame and may hold one prompt answer back while a stranded
+		// interjection runs (L1/L2 spec §2.8), releasing it through
+		// publishMessage. At EOF it publishes what it still holds, so before
+		// grok_acp_ended; after a fatal stop it publishes nothing more.
+		session.liveFollowUps.attachPublisher(publishMessage)
+		defer session.liveFollowUps.readerDone(false)
 		scanner := bufio.NewScanner(session.Stdout)
 		scanner.Buffer(make([]byte, 0, 256*1024), grokACPMaxLineSize)
 		fmt.Printf("%s[grok-acp] stdout scanner started for %s%s\n",
@@ -1109,12 +1163,11 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 				return
 			}
 
-			seq := atomic.AddInt64(&session.seq, 1)
-
 			var probe json.RawMessage
 			if err := json.Unmarshal([]byte(trimmed), &probe); err != nil {
 				fmt.Printf("%s[grok-acp] Non-JSON stdout frame on %s: %v (line=%s)%s\n",
 					colorRed, session.ID, err, truncateString(trimmed, 200), colorReset)
+				seq := atomic.AddInt64(&session.seq, 1)
 				if !publishOrFail(resultMsg{
 					ID:          session.ID,
 					WorkspaceID: session.WorkspaceID,
@@ -1161,21 +1214,17 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 			// Agents card stays Unknown for the primary Grok flow.
 			captureGrokUsageLimitLine(trimmed, time.Now(), session.limitNoticeScope)
 
-			if !publishOrFail(resultMsg{
-				ID:          session.ID,
-				WorkspaceID: session.WorkspaceID,
-				UID:         session.UID,
-				Output:      trimmed,
-				Status:      "success",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Type:        "grok_acp_message",
-				SessionID:   session.ID,
-				Seq:         int(seq),
-			}, "grok_acp_message") {
+			if session.liveFollowUps.inbound(trimmed) {
+				continue
+			}
+			if !publishMessage(trimmed) {
+				return
+			}
+			if !session.liveFollowUps.publishReleased() {
 				return
 			}
 		}
+		session.liveFollowUps.readerDone(true)
 		if err := scanner.Err(); err != nil {
 			fmt.Printf("%s[grok-acp] stdout scanner error for %s: %v%s\n",
 				colorRed, session.ID, err, colorReset)

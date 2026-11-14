@@ -111,7 +111,7 @@ func TestPostUpdateColdStart_ClaudeCode(t *testing.T) {
 			payAfterUpdate(t, cache, healthy)
 			// WHICH caller meets the cold binary depends on whether this CLI
 			// is certified for live follow-ups. A certified Claude Code
-			// probes `--version` at session START (claudeLaunchVersion, to
+			// probes `--version` at session START (cliLaunchVersion, to
 			// record what the child was launched from), so on the direct path
 			// the start spends the one timing-out probe before any gather
 			// runs; on the terminal-managed path the gather below is still

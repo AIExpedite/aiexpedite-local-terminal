@@ -13,20 +13,31 @@
 //     answered `relay_turn_ack { outcome: "notWritten", reason: "expired" }`.
 //   - LIVE: a signed `relay_follow_up` (envelope `relayfollowup_<attemptId>`)
 //     written into the RUNNING CLI as a conversational user message — never on
-//     the approval channel. Only a kind certified for live follow-ups at the
-//     installed version takes it (liveFollowUpCertified, empty until a
-//     certification run passes); every other one answers notWritten.
+//     the approval channel. Claude Code takes it as a stream-json user
+//     message; Codex as a `turn/steer` and Grok Build as an `_x.ai/interject`
+//     the device builds itself and settles from the CLI's own answer
+//     (relay_follow_up_jsonrpc.go). Only a kind certified for live follow-ups
+//     at the version its session was launched from takes it
+//     (liveFollowUpCertified); every other one answers notWritten.
 //
 // Every live attempt has exactly one durable row, keyed by attempt id:
 //
 //   accepted  persisted BEFORE any byte is written to the CLI;
-//   written   the stdin write returned successfully;
+//   written   Claude Code: the stdin write returned successfully. Codex and
+//             Grok: the CLI answered the request with success;
 //   refused   fenced: answered notWritten, and refused forever (also across
 //             restarts) — the broker may then deliver the message by a new
-//             attempt;
-//   unknown   a write error, or a restart that found the row still accepted:
-//             bytes may have reached the CLI, so the broker treats it as
-//             uncertain, never as delivered or not written.
+//             attempt. Codex and Grok also refuse when the CLI rejected the
+//             request at the JSON-RPC request level (nothing reached the
+//             conversation);
+//   unknown   a write error, no answer in time, or a restart that found the
+//             row still accepted: bytes may have reached the CLI, so the
+//             broker treats it as uncertain, never as delivered or not
+//             written. Only a late success can still make it written.
+//
+// An attempt still being written or answered in this process is never
+// answered from the ledger: a redelivery or a query naming it publishes
+// nothing, and the in-flight path answers it.
 //
 // A repeated attempt id returns its recorded outcome and writes nothing. Rows
 // are deleted only when the broker confirms them through `ackedAttemptIds`
@@ -87,7 +98,7 @@ const (
 	followUpReasonUnseen               = "unseen"
 	followUpReasonLedgerFull           = "ledgerFull"
 
-	// CLI_AGENT_IDS.CLAUDE_CODE — the only kind whose stdin stays open between turns.
+	// CLI_AGENT_IDS.CLAUDE_CODE. Codex and Grok's ids are in relay_follow_up_jsonrpc.go.
 	claudeCodeCliAgentID = "claudeCode"
 
 	followUpProcessedInCurrent = "current"
@@ -112,9 +123,13 @@ const (
 )
 
 // liveFollowUpCertified lists the CLIs whose installed version passed the
-// live follow-up certification (relay_follow_up_claude_certification_test.go)
-// with the minimum version it passed at. Empty until a run passes: every live
-// attempt is then answered notWritten/notLiveKind and the broker queues.
+// live follow-up certification (relay_follow_up_claude_certification_test.go,
+// relay_follow_up_codex_certification_test.go,
+// relay_follow_up_grok_certification_test.go) with the minimum version it
+// passed at. A kind not listed answers every live attempt
+// notWritten/notLiveKind, so the broker queues. Codex and Grok Build are added
+// only in the release that follows their own certification run; until then
+// the device can write to them but never does.
 //
 // Claude Code 2.1.322: a message spoken or typed while the agent is working is
 // written into the running CLI's stdin instead of waiting for the turn to end.
@@ -140,6 +155,10 @@ type relayFollowUpRow struct {
 	Reason      string `json:"reason,omitempty"`
 	ProcessedIn string `json:"processedIn,omitempty"`
 	UpdatedAt   int64  `json:"updatedAt"`
+	// inFlight marks an answer for an attempt this process is still writing or
+	// waiting on the CLI's answer for. Never stored: set only on the copy
+	// Begin and Query return, so the caller publishes nothing for it.
+	inFlight bool
 }
 
 type relayFollowUpLedgerFile struct {
@@ -174,10 +193,15 @@ type relayFollowUpLedger struct {
 	// of the process once taken.
 	acquireOwnership func() *os.File
 	lockFile         *os.File
+	// inFlight holds the attempts this process accepted and has not settled
+	// yet: being written, or waiting for the CLI's answer (Codex and Grok wait
+	// up to liveFollowUpAnswerTimeout). In memory only: a restart finds such a
+	// row still accepted and makes it unknown (loadLocked).
+	inFlight map[string]bool
 }
 
 func newRelayFollowUpLedger(path func() string) *relayFollowUpLedger {
-	l := &relayFollowUpLedger{path: path, now: time.Now, rows: map[string]*relayFollowUpRow{}}
+	l := &relayFollowUpLedger{path: path, now: time.Now, rows: map[string]*relayFollowUpRow{}, inFlight: map[string]bool{}}
 	l.acquireOwnership = func() *os.File {
 		return tryAcquireRelayTurnInboxLock(l.path() + ".lock")
 	}
@@ -342,12 +366,19 @@ type followUpAttemptCheck struct {
 	SessionRunning  bool
 	ConversationOK  bool
 	ApprovalPending bool
+	// EmptyText: the text is empty or whitespace only (Codex, Grok). Grok
+	// would run even an empty interjection (G11), so one is never sent.
+	EmptyText bool
+	// NoActiveTurn: no client prompt's turn is running on the child (Grok,
+	// whose interjection into an idle session starts a turn of its own, G8).
+	// Codex enforces the same itself through the signed expectedTurnId.
+	NoActiveTurn bool
 }
 
-// fenceReason is why a new attempt must be refused, or "" to write it. The
-// expiry is the EARLIER of the broker's `expiresAt` and the signed `ts` plus
-// the attempt window, so an edited (unsigned) expiresAt cannot extend it.
-func (c followUpAttemptCheck) fenceReason() string {
+// expiresAtMs is the attempt's expiry: the EARLIER of the broker's
+// `expiresAt` and the signed `ts` plus the attempt window, so an edited
+// (unsigned) expiresAt cannot extend it. 0 when neither is known.
+func (c followUpAttemptCheck) expiresAtMs() int64 {
 	expires := c.ExpiresAtMs
 	if c.SignedTsMs > 0 {
 		bound := c.SignedTsMs + followUpAttemptWindow.Milliseconds()
@@ -355,11 +386,20 @@ func (c followUpAttemptCheck) fenceReason() string {
 			expires = bound
 		}
 	}
+	return expires
+}
+
+// fenceReason is why a new attempt must be refused, or "" to write it.
+func (c followUpAttemptCheck) fenceReason() string {
+	expires := c.expiresAtMs()
 	if expires <= 0 || c.Now.UnixMilli() > expires-followUpSkewMargin.Milliseconds() {
 		return followUpReasonExpired
 	}
 	if !c.LiveKind {
 		return followUpReasonNotLiveKind
+	}
+	if c.EmptyText {
+		return followUpReasonCliRefused
 	}
 	if !c.SessionRunning {
 		return followUpReasonSessionNotRunning
@@ -369,6 +409,9 @@ func (c followUpAttemptCheck) fenceReason() string {
 	}
 	if c.ApprovalPending {
 		return followUpReasonApprovalPending
+	}
+	if c.NoActiveTurn {
+		return followUpReasonNoActiveTurn
 	}
 	return ""
 }
@@ -440,7 +483,9 @@ func (l *relayFollowUpLedger) beginLocked(attemptID, followUpID, sessionID strin
 		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}, false
 	}
 	if r := l.rows[attemptID]; r != nil {
-		return *r, false
+		out := *r
+		out.inFlight = l.inFlight[attemptID]
+		return out, false
 	}
 	now := l.now().UnixMilli()
 	r := &relayFollowUpRow{AttemptID: attemptID, FollowUpID: followUpID, SessionID: sessionID, UpdatedAt: now}
@@ -468,6 +513,7 @@ func (l *relayFollowUpLedger) beginLocked(attemptID, followUpID, sessionID strin
 		// process is answered uncertain rather than notWritten.
 		return l.markNotDurableLocked(r), false
 	}
+	l.inFlight[attemptID] = true
 	return *r, true
 }
 
@@ -479,6 +525,7 @@ func (l *relayFollowUpLedger) beginLocked(attemptID, followUpID, sessionID strin
 func (l *relayFollowUpLedger) RefuseAccepted(attemptID, reason string) relayFollowUpRow {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	delete(l.inFlight, attemptID)
 	if !l.ownLocked() {
 		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
 	}
@@ -504,6 +551,7 @@ func (l *relayFollowUpLedger) RefuseAccepted(attemptID, reason string) relayFoll
 func (l *relayFollowUpLedger) Finish(attemptID string, writeErr error, processedIn string) relayFollowUpRow {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	delete(l.inFlight, attemptID)
 	if !l.ownLocked() {
 		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
 	}
@@ -522,6 +570,82 @@ func (l *relayFollowUpLedger) Finish(attemptID string, writeErr error, processed
 	return *r
 }
 
+// Settle records how the CLI answered a live attempt written as a JSON-RPC
+// request (Codex, Grok; relay_follow_up_jsonrpc.go): the `accepted` row
+// becomes written (with processedIn), refused (a request-level refusal:
+// nothing reached the conversation, so it is fenced for good like any other
+// fence) or unknown. A row in any other state is returned unchanged. A refusal
+// that does not reach disk is downgraded to unknown (markNotDurableLocked); a
+// written or unknown row that does not reach disk stays accepted on disk,
+// which a restart reads as unknown, the conservative direction (as Finish).
+func (l *relayFollowUpLedger) Settle(attemptID, state, reason, processedIn string) relayFollowUpRow {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.inFlight, attemptID)
+	if !l.ownLocked() {
+		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
+	}
+	r := l.rows[attemptID]
+	if r == nil {
+		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
+	}
+	if r.State != followUpRowAccepted {
+		return *r
+	}
+	r.State = state
+	r.Reason = reason
+	if state == followUpRowWritten {
+		r.Reason = ""
+		r.ProcessedIn = processedIn
+	}
+	r.UpdatedAt = l.now().UnixMilli()
+	if err := l.persistLocked(); err != nil && state == followUpRowRefused {
+		fmt.Printf("%s[follow-up] ledger write failed for a refusal: %v%s\n", colorYellow, err, colorReset)
+		return l.markNotDurableLocked(r)
+	}
+	return *r
+}
+
+// LateWritten records a success the CLI answered after the attempt had
+// already been answered unknown for want of an answer: late evidence of
+// receipt can only lift unknown to written (SR accepts unknown → written). A
+// row the broker has since confirmed away is answered written without being
+// stored again. ok is false when there is nothing to publish: the row is in
+// another state, or the upgrade did not reach disk (it then stays unknown).
+func (l *relayFollowUpLedger) LateWritten(attemptID, followUpID, sessionID, processedIn string) (relayFollowUpRow, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.ownLocked() {
+		return relayFollowUpRow{}, false
+	}
+	r := l.rows[attemptID]
+	if r == nil {
+		return relayFollowUpRow{AttemptID: attemptID, FollowUpID: followUpID, SessionID: sessionID,
+			State: followUpRowWritten, ProcessedIn: processedIn, UpdatedAt: l.now().UnixMilli()}, true
+	}
+	if r.State != followUpRowUnknown {
+		return relayFollowUpRow{}, false
+	}
+	prev := *r
+	r.State = followUpRowWritten
+	r.Reason = ""
+	r.ProcessedIn = processedIn
+	r.UpdatedAt = l.now().UnixMilli()
+	if err := l.persistLocked(); err != nil {
+		*r = prev
+		return relayFollowUpRow{}, false
+	}
+	return *r, true
+}
+
+// EndInFlight marks an attempt as no longer in flight in this process. Every
+// settling path clears it already; this is the backstop the handler defers.
+func (l *relayFollowUpLedger) EndInFlight(attemptID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.inFlight, attemptID)
+}
+
 // Query answers one attempt id: its recorded outcome; an id never seen is
 // fenced now when this ledger can vouch for its absence (vouchesForLocked),
 // else it is unknown.
@@ -532,7 +656,9 @@ func (l *relayFollowUpLedger) Query(attemptID, brokerLedgerID string, signedTsMs
 		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
 	}
 	if r := l.rows[attemptID]; r != nil {
-		return *r
+		out := *r
+		out.inFlight = l.inFlight[attemptID]
+		return out
 	}
 	if !l.vouchesForLocked(brokerLedgerID, signedTsMs) {
 		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
@@ -633,9 +759,11 @@ func relayFollowUpAckFrame(cmd commandMsg, agentID string, r relayFollowUpRow, l
 	}
 }
 
-// liveFollowUpKind reports whether this session's kind is certified for live
-// follow-ups at its installed version. Only Claude Code can ever be: its
-// stdin stays open between turns.
+// liveFollowUpKind reports whether a kind is certified for live follow-ups at
+// its installed version: Claude Code (a stream-json user message), Codex
+// (`turn/steer`) and Grok Build (`_x.ai/interject`) can be, each once it is in
+// liveFollowUpCertified. The other kinds run one process per turn, so there is
+// no running CLI to write into.
 //
 // Membership in liveFollowUpCertified is not on its own certification: the
 // run passes against ONE version, and an older build of the same CLI was
@@ -658,13 +786,13 @@ func liveFollowUpVersionCertified(cliAgentID, version string) bool {
 	return version != "" && compareSemver(version, minVersion) >= 0
 }
 
-// claudeLaunchVersion reads the version of the Claude binary a session is
+// cliLaunchVersion reads the version of the binary a session of cliAgentID is
 // about to spawn, plus the (path, mtime, size) identity it was read from, so
-// confirmClaudeLaunchVersion can check that exact binary is what started. It
-// probes only while Claude Code is certified for live follow-ups at all, so an
-// uncertified build never pays a `--version` spawn per session start.
-func claudeLaunchVersion(executable string) (string, versionProbeKey) {
-	if _, ok := liveFollowUpCertified[claudeCodeCliAgentID]; !ok || executable == "" {
+// confirmCliLaunchVersion can check that exact binary is what started. It
+// probes only while that kind is certified for live follow-ups at all, so an
+// uncertified kind never pays a `--version` spawn per session start.
+func cliLaunchVersion(cliAgentID, executable string) (string, versionProbeKey) {
+	if _, ok := liveFollowUpCertified[cliAgentID]; !ok || executable == "" {
 		return "", versionProbeKey{}
 	}
 	cachedProbeVersion(executable)
@@ -676,11 +804,11 @@ func claudeLaunchVersion(executable string) (string, versionProbeKey) {
 	return m[0], key
 }
 
-// confirmClaudeLaunchVersion keeps the version claudeLaunchVersion read only
-// when the binary on disk still has the identity it was read from once the
-// child has started. An upgrade landing between the probe and the spawn makes
-// the launched build unknown, which fails closed to queued delivery.
-func confirmClaudeLaunchVersion(executable, version string, key versionProbeKey) string {
+// confirmCliLaunchVersion keeps the version cliLaunchVersion read only when
+// the binary on disk still has the identity it was read from once the child
+// has started. An upgrade landing between the probe and the spawn makes the
+// launched build unknown, which fails closed to queued delivery.
+func confirmCliLaunchVersion(executable, version string, key versionProbeKey) string {
 	if version == "" {
 		return ""
 	}
@@ -697,10 +825,18 @@ func confirmClaudeLaunchVersion(executable, version string, key versionProbeKey)
 // The probe is the shared (path, mtime, size) cache, so an accepted attempt
 // spawns `--version` only after the binary actually changed.
 var liveFollowUpInstalledVersion = func(cliAgentID string) string {
-	if cliAgentID != claudeCodeCliAgentID {
+	var path string
+	switch cliAgentID {
+	case claudeCodeCliAgentID:
+		path = resolveClaudePath()
+	case codexCliAgentID:
+		path = resolveExecutable("codex")
+	case grokCliAgentID:
+		// resolveExecutable falls back to Grok's installer directory.
+		path = resolveExecutable("grok")
+	default:
 		return ""
 	}
-	path := resolveClaudePath()
 	if path == "" {
 		return ""
 	}
@@ -743,7 +879,12 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 			fmt.Printf("%s[follow-up] %v%s\n", colorYellow, err, colorReset)
 		}
 		for _, id := range q.AttemptIDs {
-			publish(ledger.Query(id, q.LedgerID, cmd.Ts))
+			// An attempt still being written or answered here is answered by
+			// that path, never from the ledger: its `accepted` row reads as
+			// unknown and would make a delivered message uncertain.
+			if r := ledger.Query(id, q.LedgerID, cmd.Ts); !r.inFlight {
+				publish(r)
+			}
 		}
 		return true
 	}
@@ -763,32 +904,98 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 	// refused: a later, genuine delivery of it is never written after the
 	// broker was told it was not.
 	metadataMatches := p.AttemptID == "" || p.AttemptID == attemptID
-	session := (*ClaudeNativeSession)(nil)
-	if globalClaudeNativeManager != nil {
-		session = globalClaudeNativeManager.Get(cmd.SessionID)
-	}
-	check := followUpAttemptCheck{
-		Now:         time.Now(),
-		ExpiresAtMs: p.ExpiresAt,
-		SignedTsMs:  cmd.Ts,
-		// Gated on the version the running child was LAUNCHED from, not the
-		// one installed now: an in-place upgrade must not make a session
-		// started from an older, uncertified build live-eligible (Codex P2
-		// on #219).
-		LiveKind: session != nil && liveFollowUpVersionCertified(claudeCodeCliAgentID, session.launchedVersion),
-		// A fenced session (moved or max-parked off this computer) takes
-		// nothing but its END, so it is not running for a follow-up.
-		SessionRunning: session != nil && session.Status() == "running" && !isSessionFenced(cmd.SessionID),
-		// A relay session id is bound to one CLI conversation (a resume is a
-		// new session id), so the session being this one is the match.
-		ConversationOK:  session != nil && metadataMatches,
-		ApprovalPending: session != nil && session.pendingApprovals.Load() > 0,
-	}
+	target := liveFollowUpTargetFor(cmd.SessionID)
+	check := target.attemptCheck(cmd, p, metadataMatches)
 	row, write := ledger.BeginForLedger(p.LedgerID, cmd.Ts, attemptID, p.FollowUpID, cmd.SessionID, check)
 	if !write {
-		publish(row)
+		// A redelivery while the first delivery is still being written or
+		// answered here publishes nothing: that delivery answers it.
+		if !row.inFlight {
+			publish(row)
+		}
 		return true
 	}
+	defer ledger.EndInFlight(attemptID)
+	if target.claude != nil {
+		writeClaudeLiveFollowUp(publish, ledger, cmd, attemptID, check, target.claude)
+		return true
+	}
+	writeJSONRPCLiveFollowUp(publish, ledger, cmd, attemptID, p, check, target)
+	return true
+}
+
+// liveFollowUpTarget is the session a live attempt names, in whichever of the
+// three managers that can take one holds it. All nil: no such session here.
+type liveFollowUpTarget struct {
+	claude *ClaudeNativeSession
+	codex  *CodexAppServerSession
+	grok   *GrokACPSession
+}
+
+func liveFollowUpTargetFor(sessionID string) liveFollowUpTarget {
+	if globalClaudeNativeManager != nil {
+		if s := globalClaudeNativeManager.Get(sessionID); s != nil {
+			return liveFollowUpTarget{claude: s}
+		}
+	}
+	if globalCodexAppServerManager != nil {
+		if s := globalCodexAppServerManager.Get(sessionID); s != nil {
+			return liveFollowUpTarget{codex: s}
+		}
+	}
+	if globalGrokACPManager != nil {
+		if s := globalGrokACPManager.Get(sessionID); s != nil {
+			return liveFollowUpTarget{grok: s}
+		}
+	}
+	return liveFollowUpTarget{}
+}
+
+// attemptCheck is everything a new live attempt on this target is fenced on
+// (spec §2.3), read before the ledger row is created.
+func (t liveFollowUpTarget) attemptCheck(cmd commandMsg, p relayFollowUpPayload, metadataMatches bool) followUpAttemptCheck {
+	check := followUpAttemptCheck{Now: time.Now(), ExpiresAtMs: p.ExpiresAt, SignedTsMs: cmd.Ts}
+	// A fenced session (moved or max-parked off this computer) takes nothing
+	// but its END, so it is not running for a follow-up.
+	fenced := isSessionFenced(cmd.SessionID)
+	// Every kind is gated on the version the running child was LAUNCHED from,
+	// not the one installed now: an in-place upgrade must not make a session
+	// started from an older, uncertified build live-eligible (Codex P2 on
+	// #219).
+	switch {
+	case t.claude != nil:
+		s := t.claude
+		check.LiveKind = liveFollowUpVersionCertified(claudeCodeCliAgentID, s.launchedVersion)
+		check.SessionRunning = s.Status() == "running" && !fenced
+		// A relay session id is bound to one CLI conversation (a resume is a
+		// new session id), so the session being this one is the match.
+		check.ConversationOK = metadataMatches
+		check.ApprovalPending = s.pendingApprovals.Load() > 0
+	case t.codex != nil:
+		s := t.codex
+		check.LiveKind = s.liveFollowUps != nil && liveFollowUpVersionCertified(codexCliAgentID, s.launchedVersion)
+		check.EmptyText = strings.TrimSpace(cmd.Input) == ""
+		check.SessionRunning = s.Status() == "running" && !fenced
+		// The thread and the turn the steer names ride in the signature; Codex
+		// itself refuses a steer whose turn is not the one running.
+		check.ConversationOK = metadataMatches && cmd.ConversationID != "" && cmd.ExpectedTurnID != ""
+		check.ApprovalPending = s.liveFollowUps.approvalPending()
+	case t.grok != nil:
+		s := t.grok
+		check.LiveKind = s.liveFollowUps != nil && liveFollowUpVersionCertified(grokCliAgentID, s.launchedVersion)
+		check.EmptyText = strings.TrimSpace(cmd.Input) == ""
+		check.SessionRunning = s.Status() == "running" && !fenced
+		// The signed conversation must be the ACP session this child is on.
+		check.ConversationOK = metadataMatches && cmd.ConversationID != "" && cmd.ConversationID == s.liveFollowUps.acpSession()
+		check.ApprovalPending = s.liveFollowUps.approvalPending()
+		check.NoActiveTurn = !s.liveFollowUps.grokTurnRunning()
+	}
+	return check
+}
+
+// writeClaudeLiveFollowUp writes an accepted Claude Code attempt as a
+// stream-json user message; the stdin write returning is its evidence.
+func writeClaudeLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollowUpLedger, cmd commandMsg, attemptID string, check followUpAttemptCheck, session *ClaudeNativeSession) {
 	// The fence is decided again at the stdin boundary, under stdinMu right
 	// before the write: SendAccepting can wait there behind another stdin
 	// write (up to its write timeout), and the check above may pass up to the
@@ -824,10 +1031,139 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 	})
 	if refusedAtStdin != nil {
 		publish(*refusedAtStdin)
-		return true
+		return
 	}
 	publish(ledger.Finish(attemptID, err, processedIn))
-	return true
+}
+
+// writeJSONRPCLiveFollowUp writes an accepted Codex or Grok attempt as the
+// request the device builds itself (relay_follow_up_jsonrpc.go) and settles it
+// from the CLI's own answer. Neither CLI de-duplicates the request, so the
+// ledger row is what keeps it at most once.
+func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollowUpLedger, cmd commandMsg, attemptID string, p relayFollowUpPayload, check followUpAttemptCheck, target liveFollowUpTarget) {
+	rpcID := relayLiveFollowUpRPCID(attemptID)
+	var (
+		kind    string
+		tracker *liveFollowUpTracker
+		status  func() string
+		send    func(id, payload string, accept func() error) error
+		frame   string
+		err     error
+	)
+	switch {
+	case target.codex != nil && globalCodexAppServerManager != nil:
+		kind, tracker, status, send = codexCliAgentID, target.codex.liveFollowUps, target.codex.Status, globalCodexAppServerManager.SendAccepting
+		frame, err = codexSteerFrame(rpcID, cmd.ConversationID, cmd.ExpectedTurnID, p.FollowUpID, cmd.Input)
+	case target.grok != nil && globalGrokACPManager != nil:
+		kind, tracker, status, send = grokCliAgentID, target.grok.liveFollowUps, target.grok.Status, globalGrokACPManager.SendAccepting
+		frame, err = grokInterjectFrame(rpcID, cmd.ConversationID, cmd.Input, attemptID)
+	default:
+		publish(ledger.RefuseAccepted(attemptID, followUpReasonSessionNotRunning))
+		return
+	}
+	if err != nil {
+		publish(ledger.RefuseAccepted(attemptID, followUpReasonCliRefused))
+		return
+	}
+	// The fence is decided again at the stdin boundary, under stdinMu right
+	// before the write, for the same reasons as Claude Code's. The tracker's
+	// part (an open client-bound request; for Grok, the running turn) is read
+	// in the same step that registers the answer waiter and, for Grok, records
+	// the interjection on the running prompt.
+	var answer <-chan liveFollowUpAnswer
+	var refusedAtStdin *relayFollowUpRow
+	err = send(cmd.SessionID, frame, func() error {
+		recheck := check
+		recheck.Now = time.Now()
+		recheck.SessionRunning = status() == "running" && !isSessionFenced(cmd.SessionID)
+		ch, reason := tracker.admitLiveWrite(rpcID, attemptID, cmd.Input, func(s liveWriteState) string {
+			c := recheck
+			c.SessionRunning = c.SessionRunning && !s.Closed
+			c.ApprovalPending = s.ApprovalPending
+			c.NoActiveTurn = s.NoActiveTurn
+			return c.fenceReason()
+		})
+		if reason != "" {
+			row := ledger.RefuseAccepted(attemptID, reason)
+			refusedAtStdin = &row
+			return errFollowUpRefusedAtStdin
+		}
+		answer = ch
+		return nil
+	})
+	if refusedAtStdin != nil {
+		publish(*refusedAtStdin)
+		return
+	}
+	if err != nil {
+		if answer == nil {
+			// Refused before the stdin boundary (the session ended, or its
+			// Send rejected the frame): nothing was written.
+			reason := followUpReasonCliRefused
+			if status() != "running" {
+				reason = followUpReasonSessionNotRunning
+			}
+			publish(ledger.RefuseAccepted(attemptID, reason))
+			return
+		}
+		// The write itself failed: some bytes may have reached the CLI.
+		tracker.forget(rpcID)
+		publish(ledger.Settle(attemptID, followUpRowUnknown, followUpReasonWriteFailed, ""))
+		return
+	}
+	timer := time.NewTimer(liveFollowUpAnswerTimeout)
+	defer timer.Stop()
+	select {
+	case a := <-answer:
+		publish(settleLiveFollowUpAnswer(ledger, kind, attemptID, a))
+	case <-timer.C:
+		// No answer yet: unknown now, and a success that still arrives within
+		// the attempt window (plus the skew margin) lifts it to written.
+		publish(ledger.Settle(attemptID, followUpRowUnknown, followUpReasonNoAnswer, ""))
+		deadline := time.UnixMilli(check.expiresAtMs()).Add(followUpSkewMargin)
+		go awaitLateLiveFollowUpAnswer(publish, ledger, tracker, kind, rpcID, attemptID, p.FollowUpID, cmd.SessionID, answer, deadline)
+	}
+}
+
+// settleLiveFollowUpAnswer records the CLI's answer (or the child's exit) on
+// the attempt's row. A written Codex or Grok attempt always joined the turn
+// that was running: Codex enforces that through expectedTurnId, and the Grok
+// answer hold keeps a stranded interjection's reply inside that turn.
+func settleLiveFollowUpAnswer(ledger *relayFollowUpLedger, kind, attemptID string, a liveFollowUpAnswer) relayFollowUpRow {
+	if a.Exited {
+		return ledger.Settle(attemptID, followUpRowUnknown, followUpReasonNoAnswer, "")
+	}
+	v := classifyLiveFollowUpAnswer(kind, a.Frame)
+	processedIn := ""
+	if v.State == followUpRowWritten {
+		processedIn = followUpProcessedInCurrent
+	}
+	return ledger.Settle(attemptID, v.State, v.Reason, processedIn)
+}
+
+// awaitLateLiveFollowUpAnswer keeps listening, after the answer timeout, for
+// an answer that can only add evidence of receipt: a late success turns the
+// unknown row into written and is answered again; a late error, or the child
+// exiting, leaves it unknown.
+func awaitLateLiveFollowUpAnswer(publish func(relayFollowUpRow), ledger *relayFollowUpLedger, tracker *liveFollowUpTracker, kind, rpcID, attemptID, followUpID, sessionID string, answer <-chan liveFollowUpAnswer, deadline time.Time) {
+	defer tracker.forget(rpcID)
+	wait := time.Until(deadline)
+	if wait <= 0 {
+		return
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case a := <-answer:
+		if a.Exited || classifyLiveFollowUpAnswer(kind, a.Frame).State != followUpRowWritten {
+			return
+		}
+		if row, ok := ledger.LateWritten(attemptID, followUpID, sessionID, followUpProcessedInCurrent); ok {
+			fmt.Printf("%s[follow-up] attempt %s answered after the timeout: written%s\n", colorCyan, attemptID, colorReset)
+			publish(row)
+		}
+	case <-timer.C:
+	}
 }
 
 // errFollowUpRefusedAtStdin aborts a live write whose fence failed at the

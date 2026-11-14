@@ -1535,7 +1535,7 @@ func TestALiveFollowUpIsGatedOnTheSessionsLaunchedVersion(t *testing.T) {
 
 // The launch version is kept only while the binary on disk is the one it was
 // read from; a replacement between the probe and the spawn fails closed.
-func TestConfirmClaudeLaunchVersionRequiresTheProbedBinary(t *testing.T) {
+func TestConfirmCliLaunchVersionRequiresTheProbedBinary(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "claude")
 	if err := os.WriteFile(path, []byte("v1"), 0o755); err != nil {
 		t.Fatal(err)
@@ -1545,16 +1545,16 @@ func TestConfirmClaudeLaunchVersionRequiresTheProbedBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := versionProbeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}
-	if got := confirmClaudeLaunchVersion(path, "1.2.3", key); got != "1.2.3" {
+	if got := confirmCliLaunchVersion(path, "1.2.3", key); got != "1.2.3" {
 		t.Fatalf("unchanged binary: got %q", got)
 	}
-	if got := confirmClaudeLaunchVersion(path, "", key); got != "" {
+	if got := confirmCliLaunchVersion(path, "", key); got != "" {
 		t.Fatalf("an unknown version must stay unknown, got %q", got)
 	}
 	if err := os.WriteFile(path, []byte("v2-upgraded"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if got := confirmClaudeLaunchVersion(path, "1.2.3", key); got != "" {
+	if got := confirmCliLaunchVersion(path, "1.2.3", key); got != "" {
 		t.Fatalf("a binary replaced before the spawn must fail closed, got %q", got)
 	}
 }
