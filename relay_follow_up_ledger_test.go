@@ -80,16 +80,22 @@ func TestFollowUpWireValuesArePinned(t *testing.T) {
 	if followUpAckedMax != 32 || followUpAttemptWindow != 120*time.Second {
 		t.Errorf("limits drifted from shared-constants")
 	}
-	// Claude Code is certified (2.1.322) so a message spoken mid-turn is
-	// written into the running CLI instead of waiting for the turn to end.
-	// Every OTHER CLI stays uncertified until its own run passes: the device
-	// only writes live into a Claude native session, so listing another here
-	// would advertise a delivery path that does not exist for it.
-	if liveFollowUpCertified[claudeCodeCliAgentID] != "2.1.322" {
-		t.Errorf("Claude Code should be certified at the version its run passed at")
+	// Each certified CLI is listed at exactly the version its own run passed
+	// at, never lower. Every other CLI stays uncertified until its own run
+	// passes: listing it would advertise a delivery path that does not exist
+	// for it (Antigravity, OpenCode and Muse Code run one process per turn).
+	want := map[string]string{
+		claudeCodeCliAgentID: "2.1.322",
+		codexCliAgentID:      "0.168.0",
+		grokCliAgentID:       "1.0.77",
 	}
-	if len(liveFollowUpCertified) != 1 {
-		t.Errorf("no other CLI is certified until its own certification run passes")
+	for id, version := range want {
+		if liveFollowUpCertified[id] != version {
+			t.Errorf("%s should be certified at %s, the version its run passed at; got %q", id, version, liveFollowUpCertified[id])
+		}
+	}
+	if len(liveFollowUpCertified) != len(want) {
+		t.Errorf("no other CLI is certified until its own certification run passes: %+v", liveFollowUpCertified)
 	}
 }
 
@@ -1535,7 +1541,7 @@ func TestALiveFollowUpIsGatedOnTheSessionsLaunchedVersion(t *testing.T) {
 
 // The launch version is kept only while the binary on disk is the one it was
 // read from; a replacement between the probe and the spawn fails closed.
-func TestConfirmClaudeLaunchVersionRequiresTheProbedBinary(t *testing.T) {
+func TestConfirmCliLaunchVersionRequiresTheProbedBinary(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "claude")
 	if err := os.WriteFile(path, []byte("v1"), 0o755); err != nil {
 		t.Fatal(err)
@@ -1545,16 +1551,16 @@ func TestConfirmClaudeLaunchVersionRequiresTheProbedBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := versionProbeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}
-	if got := confirmClaudeLaunchVersion(path, "1.2.3", key); got != "1.2.3" {
+	if got := confirmCliLaunchVersion(path, "1.2.3", key); got != "1.2.3" {
 		t.Fatalf("unchanged binary: got %q", got)
 	}
-	if got := confirmClaudeLaunchVersion(path, "", key); got != "" {
+	if got := confirmCliLaunchVersion(path, "", key); got != "" {
 		t.Fatalf("an unknown version must stay unknown, got %q", got)
 	}
 	if err := os.WriteFile(path, []byte("v2-upgraded"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if got := confirmClaudeLaunchVersion(path, "1.2.3", key); got != "" {
+	if got := confirmCliLaunchVersion(path, "1.2.3", key); got != "" {
 		t.Fatalf("a binary replaced before the spawn must fail closed, got %q", got)
 	}
 }

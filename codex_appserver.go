@@ -13,6 +13,14 @@
 // so this agent doesn't need to know about codex method names or evolve in
 // lockstep with the upstream protocol.
 //
+// One narrow exception: a live follow-up (relay_follow_up_jsonrpc.go). The
+// device writes that `turn/steer` itself, under its follow-up ledger, so a
+// small tracker reads the frames going both ways for the request/response
+// pairing of ids the device chose (`relay-followup-…`) and for the open
+// server requests a steer must never be written beside. It never edits,
+// holds or drops a frame, and exists only on a session launched from a Codex
+// version certified for live follow-ups.
+//
 // Per the OpenAI Codex IDE documentation
 // (https://developers.openai.com/codex/app-server) the stdio transport is the
 // default. We pass `--listen stdio://` explicitly anyway so the chosen
@@ -148,6 +156,14 @@ type CodexAppServerSession struct {
 	// codexCaptureVersion is the Codex build published when this app-server
 	// was spawned; its telemetry is stamped with it (see CLISession).
 	codexCaptureVersion string
+	// launchedVersion is the major.minor.patch of the codex binary this child
+	// was spawned from, read only while Codex is certified for live follow-ups
+	// ("" otherwise or when it could not be established). Live follow-ups are
+	// gated on it, never on the version installed now. Set once at Start.
+	launchedVersion string
+	// liveFollowUps is the live follow-up tracker (relay_follow_up_jsonrpc.go),
+	// nil unless launchedVersion is certified. Set once at Start.
+	liveFollowUps *liveFollowUpTracker
 
 	mu            sync.Mutex
 	status        string // "running" | "ended"
@@ -565,6 +581,7 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 	}
 
 	executable := resolveExecutable("codex")
+	launchedVersion, launchedKey := cliLaunchVersion(codexCliAgentID, executable)
 	args := buildCodexAppServerArgs(extraArgs)
 
 	fmt.Printf("%s[codex-appserver] Starting session %s: %s %s%s\n",
@@ -608,6 +625,7 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 		return fmt.Errorf("failed to start codex app-server (is `codex` on PATH?): %w", err)
 	}
 	trackSessionProcess(id, proc)
+	launchedVersion = confirmCliLaunchVersion(executable, launchedVersion, launchedKey)
 
 	session := &CodexAppServerSession{
 		ID:                  id,
@@ -621,6 +639,8 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 		status:              "running",
 		done:                make(chan struct{}),
 		codexCaptureVersion: codexCaptureVersionPin.confirmed(),
+		launchedVersion:     launchedVersion,
+		liveFollowUps:       newLiveFollowUpTracker(codexCliAgentID, launchedVersion),
 		processExited:       make(chan struct{}),
 		streamDone:          make(chan struct{}),
 	}
@@ -703,6 +723,11 @@ func (m *CodexAppServerManager) SendAccepting(id string, payload string, accept 
 	if err := acceptRelayDelivery(accept); err != nil {
 		return err
 	}
+	// The live follow-up tracker (relay_follow_up_jsonrpc.go) reads the frame
+	// before it reaches the child and learns, on return, whether it did.
+	sent := session.liveFollowUps.outbound(trimmed)
+	wrote := false
+	defer func() { sent.done(wrote) }()
 
 	// Anchor the turn's utilization floor BEFORE the request reaches the child:
 	// the reading this turn owes must be taken from here on, not from the
@@ -763,6 +788,7 @@ func (m *CodexAppServerManager) SendAccepting(id string, payload string, accept 
 		}
 		return fmt.Errorf("timeout writing to codex app-server session %s stdin — session terminated to prevent frame interleave", id)
 	}
+	wrote = true
 
 	fmt.Printf("%s[codex-appserver] → %s (%d bytes)%s\n",
 		colorBlue, id, len(trimmed), colorReset)
@@ -1120,6 +1146,9 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 
 	go func() {
 		defer wg.Done()
+		// Whatever the reader stops on, a live follow-up still waiting for
+		// Codex's answer learns the child is gone (relay_follow_up_jsonrpc.go).
+		defer session.liveFollowUps.readerDone(false)
 		scanner := bufio.NewScanner(session.Stdout)
 		scanner.Buffer(make([]byte, 0, 256*1024), codexAppServerMaxLineSize)
 		fmt.Printf("%s[codex-appserver] stdout scanner started for %s%s\n",
@@ -1198,6 +1227,9 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			} else if codexRunProgressFrame(trimmed) {
 				session.openUsageRun(time.Now())
 			}
+			// Live follow-ups: answers to the device's own `turn/steer` and the
+			// open server requests. Read only; the frame is forwarded as is.
+			session.liveFollowUps.inbound(trimmed)
 			if !publishOrFail(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,

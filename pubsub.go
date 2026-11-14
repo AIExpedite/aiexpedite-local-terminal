@@ -900,7 +900,7 @@ type signaturePayload struct {
 	// here — between riskLevel and cwd. Go marshals in declaration order and
 	// the Node signer appends in the order
 	//   refreshId, riskLevel, executionId, cwd, conversationId, ackedTurnIds,
-	//   deliveryExpiresAt, cwdFence, readOnly
+	//   deliveryExpiresAt, expectedTurnId, cwdFence, readOnly
 	// (hmac.util.js), so moving this line silently invalidates every signature
 	// that carries the field.
 	//
@@ -965,6 +965,17 @@ type signaturePayload struct {
 	// capabilities.signedCommandExpiry — an older agent would compute a
 	// canonical without it and reject the command.
 	DeliveryExpiresAt int64 `json:"deliveryExpiresAt,omitempty"`
+	// ExpectedTurnID is a live Codex follow-up's running turn (commandMsg
+	// ExpectedTurnID), written into the `turn/steer` the device builds, so
+	// Codex itself refuses the message once that turn has ended. Unsigned, it
+	// could be swapped for a later turn's id and move the message there. Node's
+	// signCommand appends `canonical.expectedTurnId` after deliveryExpiresAt
+	// and before cwdFence, only for a non-empty string; omitempty drops "" here,
+	// so every other command keeps its byte-identical canonical.
+	// terminal-service sends it only on a `relay_follow_up` to a device that
+	// lists `codex` in its live follow-up agents — an older agent computes a
+	// canonical without it and rejects the command.
+	ExpectedTurnID string `json:"expectedTurnId,omitempty"`
 	// CwdFence is the signed folder boundary for a start admitted through an
 	// ancestor grant (relay_cwd_fence.go). If the command's real directory
 	// escapes that boundary (e.g. symlink escape), the agent refuses the command
@@ -1029,6 +1040,7 @@ func signatureCanonical(cmd commandMsg) ([]byte, error) {
 		AckedTurnIds:      cmd.AckedTurnIds,
 		CliAgentCatalog:   cliAgentCatalogSignatureJSON(cmd),
 		DeliveryExpiresAt: cmd.DeliveryExpiresAt,
+		ExpectedTurnID:    cmd.ExpectedTurnID,
 		CwdFence:          cmd.CwdFence,
 		ReadOnly:          cmd.ReadOnly,
 	}
@@ -1221,7 +1233,11 @@ type commandMsg struct {
 	// currently advertised id therefore cannot promote an attempt minted
 	// under a replaced ledger from `unknown` to a write or to a `notWritten`
 	// fence.
-	FollowUpExpiresAt        int64  `json:"followUpExpiresAt,omitempty"`
+	FollowUpExpiresAt int64 `json:"followUpExpiresAt,omitempty"`
+	// ExpectedTurnID is the Codex turn a live follow-up steers into
+	// (`turn/steer` expectedTurnId). SIGNED (see signaturePayload
+	// .ExpectedTurnID), unlike the metadata around it.
+	ExpectedTurnID           string `json:"expectedTurnId,omitempty"`
 	FollowUpAttemptID        string `json:"attemptId,omitempty"`
 	FollowUpID               string `json:"followUpId,omitempty"`
 	FollowUpAttemptExpiresAt int64  `json:"expiresAt,omitempty"`

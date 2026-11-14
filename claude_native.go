@@ -281,7 +281,7 @@ func (m *ClaudeNativeManager) StartForAgent(commandAgentID, id, cwd string, extr
 	}
 
 	executable := resolveExecutable("claude")
-	launchedVersion, launchedKey := claudeLaunchVersion(executable)
+	launchedVersion, launchedKey := cliLaunchVersion(claudeCodeCliAgentID, executable)
 	args, extractedPrompt := buildClaudeInteractiveArgs(extraArgs)
 	prompt := initialPrompt
 	if prompt == "" {
@@ -325,7 +325,7 @@ func (m *ClaudeNativeManager) StartForAgent(commandAgentID, id, cwd string, extr
 		return fmt.Errorf("failed to start claude (is `claude` on PATH?): %w", err)
 	}
 	trackSessionProcess(id, proc)
-	launchedVersion = confirmClaudeLaunchVersion(executable, launchedVersion, launchedKey)
+	launchedVersion = confirmCliLaunchVersion(executable, launchedVersion, launchedKey)
 
 	session := &ClaudeNativeSession{
 		ID:              id,
