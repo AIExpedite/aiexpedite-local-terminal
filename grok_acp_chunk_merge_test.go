@@ -281,7 +281,9 @@ func TestGrokChunkMerge_ThoughtTextIsNeverMergedIntoMessageText(t *testing.T) {
 
 func TestGrokChunkMerge_MergedFrameIsTheFirstChunksNotification(t *testing.T) {
 	h := startGrokStreamHarness(t, 10*time.Second)
-	first := grokMessageChunkFrame(1, "a<b>&c ")
+	// 2^53 + 1: a float64 cannot hold it, so it survives only if the merge
+	// keeps numbers exactly as Grok wrote them.
+	first := strings.Replace(grokMessageChunkFrame(1, "a<b>&c "), `"chunkId":1,`, `"chunkId":9007199254740993,`, 1)
 	h.writeStdout(first, grokMessageChunkFrame(2, "d"), grokPromptAnswerFrame)
 	msgs := h.waitFor(2)
 	h.finish()
@@ -305,7 +307,8 @@ func TestGrokChunkMerge_MergedFrameIsTheFirstChunksNotification(t *testing.T) {
 	if strings.Contains(msgs[0].Output, htmlEscaped) || !strings.Contains(msgs[0].Output, "a<b>&c d") {
 		t.Fatalf("text must not be HTML-escaped: %s", msgs[0].Output)
 	}
-	if !strings.Contains(msgs[0].Output, `"agentTimestampMs":1784000000001`) {
+	if !strings.Contains(msgs[0].Output, `"agentTimestampMs":1784000000001`) ||
+		!strings.Contains(msgs[0].Output, `"chunkId":9007199254740993`) {
 		t.Fatalf("numbers must keep their exact digits: %s", msgs[0].Output)
 	}
 }
@@ -408,7 +411,10 @@ func TestGrokChunkMerge_EndOfStreamPublishesHeldText(t *testing.T) {
 
 func TestParseGrokMessageChunk_OnlyPlainTextMessageChunks(t *testing.T) {
 	for name, line := range map[string]string{
-		"thought":         grokChunkFrame("agent_thought_chunk", "p", 1, "x"),
+		"thought": grokChunkFrame("agent_thought_chunk", "p", 1, "x"),
+		// Passes the cheap text pre-filter, so only the kind check refuses it.
+		"thought naming the kind": strings.Replace(grokChunkFrame("agent_thought_chunk", "p", 1, "x"),
+			`"updateType":"agentMessageChunk"`, `"updateType":"agent_message_chunk"`, 1),
 		"request":         `{"jsonrpc":"2.0","id":3,"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}}}`,
 		"image content":   `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"image","data":"x"}}}}`,
 		"non-object meta": `{"jsonrpc":"2.0","method":"session/update","params":{"_meta":"x","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}}}`,
