@@ -90,6 +90,7 @@ var museCodeNativeSpec = &oneShotNativeSpec{
 		return looksLikeMissingMuseCodeSession(stdout, stderr)
 	},
 	RunCreatedSession: museCodeRunCreatedSession,
+	OpeningRecord:     museCodeOpeningRecord,
 	ObserveTurn: func(stdout, stderr string) {
 		observeMuseCodeAuthOutput(stdout+"\n"+stderr, time.Now())
 	},
@@ -387,6 +388,31 @@ func museCodeRunCreatedSession(firstLine, sessionID string) bool {
 		rec.Stream.Kind == "session" &&
 		strings.EqualFold(rec.Stream.ID, sessionID) &&
 		rec.Sequence != nil && *rec.Sequence == 1
+}
+
+// museCodeOpeningRecords are the records a `muse exec --json` run writes, in
+// one burst, when its command is accepted and before the run starts
+// executing: on 1.4.18 they arrive together, `run.lifecycle.started` follows
+// ~180 ms later, and the provider's first answer ~1.1 s after the burst
+// (timed through a pipe, 2026-11-13). Anything else means the run had begun.
+var museCodeOpeningRecords = map[string]bool{
+	"runtime.command.accepted": true,
+	"session.run.linked":       true,
+	"run.model.configured":     true,
+	"turn.input.user":          true,
+}
+
+// museCodeOpeningRecord reports whether line is one of those opening records
+// (oneShotNativeSpec.OpeningRecord). An unknown or unreadable record is not:
+// that fails closed, to no replay.
+func museCodeOpeningRecord(line string) bool {
+	var rec struct {
+		PayloadType string `json:"payload_type"`
+	}
+	if err := json.Unmarshal([]byte(line), &rec); err != nil {
+		return false
+	}
+	return museCodeOpeningRecords[rec.PayloadType]
 }
 
 // looksLikeMissingMuseCodeSession recognizes a stale-resume failure. Muse Code

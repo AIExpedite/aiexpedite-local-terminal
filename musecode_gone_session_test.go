@@ -68,9 +68,12 @@ func (h *museGoneHarness) runs() int {
 func TestMuseCode_GoneSessionIsRecoveredByReplayNotAnsweredBlank(t *testing.T) {
 	h := newMuseGoneHarness(t, museGoneSeed)
 	// Run 1: Muse has no session under the seed, creates one (sequence 1)
-	// and would answer the follow-up with no context, exiting 0.
+	// and would go on to answer the follow-up with no context, exiting 0.
+	// It writes its first record, then takes 30 s over the rest: the device
+	// must stop it there.
 	t.Setenv("OPENCODE_STUB_FAIL_FIRST", "1")
 	t.Setenv("OPENCODE_STUB_FIRST_EXIT", "0")
+	t.Setenv("OPENCODE_STUB_FIRST_SPLIT_MS", "30000")
 	t.Setenv("OPENCODE_STUB_FIRST_STDOUT", museStubStdout(
 		museAcceptedRecord(museGoneSeed, 1),
 		museDeltaRecord("ANSWER WITHOUT CONTEXT"),
@@ -79,8 +82,12 @@ func TestMuseCode_GoneSessionIsRecoveredByReplayNotAnsweredBlank(t *testing.T) {
 	// Run 2: the replay, which creates its own fresh session (sequence 1 is
 	// expected there and must not stop it).
 	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museAcceptedRecord("{{SESSION_ID}}", 1), museFrameCompleted))
+	began := time.Now()
 	sink := h.send()
 
+	if took := time.Since(began); took > 20*time.Second {
+		t.Fatalf("the run in the recreated session must be stopped at its first record, the turn took %s", took)
+	}
 	if h.runs() != 2 {
 		t.Fatalf("a gone session must be recovered by exactly one replay, runs=%d", h.runs())
 	}
@@ -104,6 +111,97 @@ func TestMuseCode_GoneSessionIsRecoveredByReplayNotAnsweredBlank(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(string(argv)), "\n")
 	if len(lines) != 2 || !strings.Contains(lines[0], museGoneSeed) || !strings.Contains(lines[1], done.ConversationID) {
 		t.Fatalf("run 1 resumes the seed, run 2 the fresh id:\n%s", argv)
+	}
+}
+
+// Muse writes its opening records in one burst; a stopped run that got no
+// further than them had not started, and is replayed.
+func TestMuseCode_GoneSessionWithOnlyOpeningRecordsIsReplayed(t *testing.T) {
+	h := newMuseGoneHarness(t, museGoneSeed)
+	t.Setenv("OPENCODE_STUB_FAIL_FIRST", "1")
+	t.Setenv("OPENCODE_STUB_FIRST_EXIT", "0")
+	t.Setenv("OPENCODE_STUB_FIRST_STDOUT", museStubStdout(
+		museAcceptedRecord(museGoneSeed, 1),
+		museRecord("session.run.linked", `{"kind":"session_run_linked"}`),
+		museRecord("run.model.configured", `{"kind":"run_model_configured"}`),
+		museRecord("turn.input.user", `{"kind":"turn_input_user","prompt":"follow up"}`),
+	))
+	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museAcceptedRecord("{{SESSION_ID}}", 1), museFrameCompleted))
+	sink := h.send()
+
+	if h.runs() != 2 {
+		t.Fatalf("a run stopped before it started is replayed once, runs=%d", h.runs())
+	}
+	if done, ok := sink.completion(); !ok || !strings.Contains(done.Output, `"replayRecovery":true`) {
+		t.Fatalf("the completion must carry the replay marker, got %#v", done)
+	}
+}
+
+// The kill did not land before the stopped run started (its output goes on
+// past the opening records): replaying could do part of the instruction
+// twice, so the turn fails instead, and the NEXT turn replays the history.
+func TestMuseCode_GoneSessionThatHadStartedIsNotRepeated(t *testing.T) {
+	h := newMuseGoneHarness(t, museGoneSeed)
+	t.Setenv("OPENCODE_STUB_FAIL_FIRST", "1")
+	t.Setenv("OPENCODE_STUB_FIRST_EXIT", "0")
+	t.Setenv("OPENCODE_STUB_FIRST_STDOUT", museStubStdout(
+		museAcceptedRecord(museGoneSeed, 1),
+		museRecord("run.lifecycle.started", `{"kind":"run_lifecycle"}`),
+		museFrameToolResult,
+		museCompletedRecord("ACTED WITHOUT CONTEXT"),
+	))
+	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museAcceptedRecord("{{SESSION_ID}}", 1), museFrameCompleted))
+
+	sink := &frameSink{}
+	err := h.m.Send("s", "follow up", sink.publish, time.Minute)
+	if err == nil {
+		t.Fatal("the turn must fail rather than send the message again")
+	}
+	if h.runs() != 1 {
+		t.Fatalf("the message must not be sent a second time, runs=%d", h.runs())
+	}
+	for _, f := range sink.all() {
+		if strings.Contains(f.Output, "ACTED WITHOUT CONTEXT") || strings.Contains(f.Output, "tool_result") {
+			t.Fatalf("nothing of the stopped run may be published:\n%s", museFramesDump(sink.all()))
+		}
+	}
+	if errs := sink.ofType("musecode_native_error"); len(errs) != 1 || !strings.Contains(errs[0].Output, "not sent again") {
+		t.Fatalf("the turn must say why it stopped:\n%s", museFramesDump(sink.all()))
+	}
+
+	// The next turn runs with the earlier context, under a fresh id.
+	next := &frameSink{}
+	if err := h.m.Send("s", "follow up again", next.publish, time.Minute); err != nil {
+		t.Fatalf("next send: %v", err)
+	}
+	stdin, _ := os.ReadFile(h.stdinLog)
+	if !strings.Contains(string(stdin), "earlier answer") {
+		t.Fatal("the next turn must replay the bounded transcript")
+	}
+	done, ok := next.completion()
+	if !ok || !strings.Contains(done.Output, `"replayRecovery":true`) ||
+		done.ConversationID == museGoneSeed || !isValidMuseCodeSessionID(done.ConversationID) {
+		t.Fatalf("the next turn replays under a fresh id, got %#v", done)
+	}
+}
+
+func TestMuseCodeOpeningRecord(t *testing.T) {
+	for _, pt := range []string{"runtime.command.accepted", "session.run.linked", "run.model.configured", "turn.input.user"} {
+		if !museCodeOpeningRecord(museRecord(pt, `{}`)) {
+			t.Errorf("%s is an opening record", pt)
+		}
+	}
+	for _, line := range []string{
+		museRecord("run.lifecycle.started", `{}`),
+		museRecord("task.lifecycle.started", `{}`),
+		museFrameToolResult,
+		museDeltaRecord("text"),
+		museRecord("some.future.record", `{}`),
+		"not json",
+	} {
+		if museCodeOpeningRecord(line) {
+			t.Errorf("not an opening record: %s", line)
+		}
 	}
 }
 

@@ -44,7 +44,9 @@ import (
 //	OPENCODE_STUB_SLEEP_MS   sleep this long before exiting (cancel/timeout)
 //	OPENCODE_STUB_RUN_LOG    append one line per invocation (replay counting)
 //	OPENCODE_STUB_FAIL_FIRST when set, invocation #1 uses
-//	                         …_FIRST_STDOUT/_FIRST_STDERR/_FIRST_EXIT
+//	                         …_FIRST_STDOUT/_FIRST_STDERR/_FIRST_EXIT; with
+//	                         _FIRST_SPLIT_MS it writes the first stdout line,
+//	                         sleeps that long, then writes the rest
 //	OPENCODE_STUB_MODELS     stdout for `models` (a diagnostic, not a run)
 //	OPENCODE_STUB_AUTH       stdout for `auth …` (a diagnostic, not a run)
 //	OPENCODE_STUB_DONE_LOG   written AFTER the sleep, just before exit — absent
@@ -196,6 +198,16 @@ func main() {
 				stdout = strings.ReplaceAll(stdout, "{{SESSION_ID}}", os.Args[i+1])
 				break
 			}
+		}
+	}
+	// The first run writes its first line, then waits before the rest: a run
+	// the parent stops at its first record never writes the rest.
+	if ms, err := strconv.Atoi(os.Getenv("OPENCODE_STUB_FIRST_SPLIT_MS")); err == nil && ms > 0 &&
+		os.Getenv("OPENCODE_STUB_FAIL_FIRST") != "" && runs == 1 {
+		if i := strings.Index(stdout, "\n"); i >= 0 {
+			os.Stdout.WriteString(stdout[:i+1])
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			stdout = stdout[i+1:]
 		}
 	}
 	if stdout != "" {
