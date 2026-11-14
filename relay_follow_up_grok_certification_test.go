@@ -52,7 +52,15 @@ func TestGrokLiveFollowUpCertification(t *testing.T) {
 		t.Fatalf("cannot read the grok version from %s", executable)
 	}
 	t.Logf("certifying grok %s (%s)", version, executable)
-	auth, err := os.ReadFile(filepath.Join(grokPersistentHome(), "auth.json"))
+	// The test binary moves HOME into a sandbox at startup (test_environment_test.go),
+	// so grokPersistentHome() would look for the login there. Read it from the
+	// person's real Grok home instead: GROK_HOME when they set one, else the home
+	// directory as it was before the sandbox. It is only read, never written.
+	loginHome := os.Getenv("GROK_HOME")
+	if loginHome == "" {
+		loginHome = filepath.Join(realHomeAtStartup, ".grok")
+	}
+	auth, err := os.ReadFile(filepath.Join(loginHome, "auth.json"))
 	if err != nil {
 		t.Skipf("grok is not signed in here: %v", err)
 	}
