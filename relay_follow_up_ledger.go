@@ -14,9 +14,11 @@
 //   - LIVE: a signed `relay_follow_up` (envelope `relayfollowup_<attemptId>`)
 //     written into the RUNNING CLI as a conversational user message — never on
 //     the approval channel. Claude Code takes it as a stream-json user
-//     message; Codex as a `turn/steer` and Grok Build as an `_x.ai/interject`
-//     the device builds itself and settles from the CLI's own answer
-//     (relay_follow_up_jsonrpc.go). Only a kind certified for live follow-ups
+//     message; Codex as a `turn/steer`, Grok Build as an `_x.ai/interject`
+//     and OpenCode (on its ACP driver) as a `_session/steering` the device
+//     builds itself and settles from the CLI's own answer, and Antigravity (on
+//     its ACP driver) as a second `session/prompt` whose write returning is
+//     the evidence (relay_follow_up_jsonrpc.go). Only a kind certified for live follow-ups
 //     at the version its session was launched from takes it
 //     (liveFollowUpCertified); every other one answers notWritten.
 //
@@ -106,6 +108,10 @@ const (
 
 	followUpProcessedInCurrent = "current"
 	followUpProcessedInNext    = "next"
+	// RELAY_FOLLOW_UP_PROCESSED_IN.NEXT_PROMPT (3.23.579): OpenCode took the
+	// message but holds it until its next prompt (W-O6); terminal-service
+	// sends the flush prompt that carries it in.
+	followUpProcessedInNextPrompt = "nextPrompt"
 
 	// RELAY_FOLLOW_UP_LIMITS.attemptWindowMs / clockSkewMarginMs.
 	followUpAttemptWindow = 120 * time.Second
@@ -844,6 +850,10 @@ var liveFollowUpInstalledVersion = func(cliAgentID string) string {
 	case grokCliAgentID:
 		// resolveExecutable falls back to Grok's installer directory.
 		path = resolveExecutable("grok")
+	case opencodeCliAgentID, antigravityCliAgentID:
+		// Live only on the ACP driver: a version the driver does not run (or
+		// a build without the driver) is no version at all here.
+		return acpDriverInstalledVersion(cliAgentID)
 	default:
 		return ""
 	}
@@ -935,11 +945,15 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 }
 
 // liveFollowUpTarget is the session a live attempt names, in whichever of the
-// three managers that can take one holds it. All nil: no such session here.
+// managers that can take one holds it. All nil: no such session here.
 type liveFollowUpTarget struct {
 	claude *ClaudeNativeSession
 	codex  *CodexAppServerSession
 	grok   *GrokACPSession
+	// acp is an OpenCode or Antigravity session on its ACP driver, and
+	// acpManager the manager (its profile) that holds it.
+	acp        *ACPSession
+	acpManager *ACPManager
 }
 
 func liveFollowUpTargetFor(sessionID string) liveFollowUpTarget {
@@ -956,6 +970,11 @@ func liveFollowUpTargetFor(sessionID string) liveFollowUpTarget {
 	if globalGrokACPManager != nil {
 		if s := globalGrokACPManager.Get(sessionID); s != nil {
 			return liveFollowUpTarget{grok: s}
+		}
+	}
+	for _, m := range acpDriverManagers() {
+		if s := m.Get(sessionID); s != nil {
+			return liveFollowUpTarget{acp: s, acpManager: m}
 		}
 	}
 	return liveFollowUpTarget{}
@@ -999,6 +1018,22 @@ func (t liveFollowUpTarget) attemptCheck(cmd commandMsg, p relayFollowUpPayload,
 		check.ConversationOK = metadataMatches && cmd.ConversationID != "" && cmd.ConversationID == s.liveFollowUps.acpSession()
 		check.ApprovalPending = s.liveFollowUps.approvalPending()
 		check.NoActiveTurn = !s.liveFollowUps.grokTurnRunning()
+	case t.acp != nil && t.acpManager != nil:
+		s := t.acp
+		kind := t.acpManager.profile.cliAgentID
+		// OpenCode steers only on a session whose `initialize` advertised it,
+		// whatever its version said (L3/L4 spec §2.2).
+		check.LiveKind = s.liveFollowUps != nil && liveFollowUpVersionCertified(kind, s.launchedVersion) &&
+			(kind != opencodeCliAgentID || s.liveFollowUps.steeringAdvertised())
+		check.EmptyText = strings.TrimSpace(cmd.Input) == ""
+		check.SessionRunning = s.Status() == "running" && !fenced
+		// The signed conversation must be the ACP session this child is on.
+		check.ConversationOK = metadataMatches && cmd.ConversationID != "" && cmd.ConversationID == s.liveFollowUps.acpSession()
+		check.ApprovalPending = s.liveFollowUps.approvalPending()
+		// Never into an idle session: a steer there adds nothing (OpenCode
+		// answers promptRequired) and a prompt there starts a turn of its own
+		// (Antigravity). The broker queues it as the next turn instead.
+		check.NoActiveTurn = !s.liveFollowUps.clientTurnRunning()
 	}
 	return check
 }
@@ -1067,6 +1102,19 @@ func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollo
 	case target.grok != nil && globalGrokACPManager != nil:
 		kind, tracker, status, send = grokCliAgentID, target.grok.liveFollowUps, target.grok.Status, globalGrokACPManager.SendAccepting
 		frame, err = grokInterjectFrame(rpcID, cmd.ConversationID, cmd.Input, attemptID)
+	case target.acp != nil && target.acpManager != nil:
+		kind, tracker, status, send = target.acpManager.profile.cliAgentID, target.acp.liveFollowUps, target.acp.Status, target.acpManager.SendAccepting
+		switch kind {
+		case opencodeCliAgentID:
+			frame, err = openCodeSteerFrame(rpcID, cmd.ConversationID, cmd.Input)
+		case antigravityCliAgentID:
+			// A prompt, not a follow-up request: its answer is a turn's end.
+			rpcID = relayFollowUpPromptRPCID(attemptID)
+			frame, err = antigravityFollowUpPromptFrame(rpcID, cmd.ConversationID, cmd.Input)
+		default:
+			publish(ledger.RefuseAccepted(attemptID, followUpReasonNotLiveKind))
+			return
+		}
 	default:
 		publish(ledger.RefuseAccepted(attemptID, followUpReasonSessionNotRunning))
 		return
@@ -1123,12 +1171,32 @@ func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollo
 	}
 	timer := time.NewTimer(liveFollowUpAnswerTimeout)
 	defer timer.Stop()
+	if kind == antigravityCliAgentID {
+		// agy processes every prompt written to it, as a steer or as the next
+		// turn, and answers it only when that turn ends: the write returning
+		// is the evidence (L3/L4 spec §2.6). The RUNNING prompt's answer says
+		// which: handed over (no `usage`) means this prompt carries the turn
+		// on, `current`; an ordinary end means agy runs it as the next turn,
+		// `next`, settled under this prompt's own id. No answer in time: the
+		// turn is still running with this prompt queued into it.
+		processedIn := followUpProcessedInCurrent
+		select {
+		case a := <-answer:
+			if !a.Exited && !acpHandoverAnswer(a.Frame) {
+				processedIn = followUpProcessedInNext
+			}
+		case <-timer.C:
+		}
+		publish(ledger.Settle(attemptID, followUpRowWritten, "", processedIn))
+		return
+	}
 	select {
 	case a := <-answer:
 		publish(settleLiveFollowUpAnswer(ledger, kind, attemptID, a))
 	case <-timer.C:
 		// No answer yet: unknown now, and a success that still arrives within
 		// the attempt window (plus the skew margin) lifts it to written.
+		tracker.markLate(rpcID)
 		publish(ledger.Settle(attemptID, followUpRowUnknown, followUpReasonNoAnswer, ""))
 		deadline := time.UnixMilli(check.expiresAtMs()).Add(followUpSkewMargin)
 		go awaitLateLiveFollowUpAnswer(publish, ledger, tracker, kind, rpcID, attemptID, p.FollowUpID, cmd.SessionID, answer, deadline)
@@ -1138,7 +1206,9 @@ func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollo
 // settleLiveFollowUpAnswer records the CLI's answer (or the child's exit) on
 // the attempt's row. A written Codex or Grok attempt always joined the turn
 // that was running: Codex enforces that through expectedTurnId, and the Grok
-// answer hold keeps a stranded interjection's reply inside that turn.
+// answer hold keeps a stranded interjection's reply inside that turn. A
+// written OpenCode steer joined it too, unless its answer was read after that
+// turn's own: OpenCode then holds it for the next prompt (W-O6, `nextPrompt`).
 func settleLiveFollowUpAnswer(ledger *relayFollowUpLedger, kind, attemptID string, a liveFollowUpAnswer) relayFollowUpRow {
 	if a.Exited {
 		return ledger.Settle(attemptID, followUpRowUnknown, followUpReasonNoAnswer, "")
@@ -1146,9 +1216,18 @@ func settleLiveFollowUpAnswer(ledger *relayFollowUpLedger, kind, attemptID strin
 	v := classifyLiveFollowUpAnswer(kind, a.Frame)
 	processedIn := ""
 	if v.State == followUpRowWritten {
-		processedIn = followUpProcessedInCurrent
+		processedIn = liveFollowUpProcessedIn(kind, a)
 	}
 	return ledger.Settle(attemptID, v.State, v.Reason, processedIn)
+}
+
+// liveFollowUpProcessedIn is where a written attempt went: the running turn,
+// or (OpenCode) held for the next prompt.
+func liveFollowUpProcessedIn(kind string, a liveFollowUpAnswer) string {
+	if kind == opencodeCliAgentID && a.AfterPrompt {
+		return followUpProcessedInNextPrompt
+	}
+	return followUpProcessedInCurrent
 }
 
 // awaitLateLiveFollowUpAnswer keeps listening, after the answer timeout, for
@@ -1168,7 +1247,7 @@ func awaitLateLiveFollowUpAnswer(publish func(relayFollowUpRow), ledger *relayFo
 		if a.Exited || classifyLiveFollowUpAnswer(kind, a.Frame).State != followUpRowWritten {
 			return
 		}
-		if row, ok := ledger.LateWritten(attemptID, followUpID, sessionID, followUpProcessedInCurrent); ok {
+		if row, ok := ledger.LateWritten(attemptID, followUpID, sessionID, liveFollowUpProcessedIn(kind, a)); ok {
 			fmt.Printf("%s[follow-up] attempt %s answered after the timeout: written%s\n", colorCyan, attemptID, colorReset)
 			publish(row)
 		}
@@ -1278,6 +1357,8 @@ func followUpTurnTargetGone(cmd commandMsg) bool {
 		return globalCodexAppServerManager != nil && managedSessionGone(globalCodexAppServerManager.Get(cmd.SessionID))
 	case isGrokACPCommand(cmd.Type):
 		return globalGrokACPManager != nil && managedSessionGone(globalGrokACPManager.Get(cmd.SessionID))
+	case acpDriverManagerForCommand(cmd.Type) != nil:
+		return managedSessionGone(acpDriverManagerForCommand(cmd.Type).Get(cmd.SessionID))
 	case isAntigravityNativeCommand(cmd.Type):
 		return globalAntigravityNativeManager != nil && managedSessionGone(globalAntigravityNativeManager.Get(cmd.SessionID))
 	case isOpenCodeNativeCommand(cmd.Type):

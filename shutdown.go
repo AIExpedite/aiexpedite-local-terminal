@@ -230,6 +230,10 @@ func tearDownSubprocesses(ctx context.Context) {
 	if globalGrokACPManager != nil {
 		globalGrokACPManager.ShutdownAll()
 	}
+	// The same for OpenCode and Antigravity on their ACP drivers.
+	for _, m := range acpDriverManagers() {
+		m.ShutdownAll()
+	}
 
 	// Same rationale for the Claude native manager — stream-json children keep
 	// drawing on the interactive Claude allowance until ended.

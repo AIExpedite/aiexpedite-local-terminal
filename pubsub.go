@@ -219,6 +219,9 @@ func rejectionResultType(cmdType string) string {
 	if isGrokACPCommand(cmdType) {
 		return "grok_acp_error"
 	}
+	if p := acpDriverProfileForCommand(cmdType); p != nil {
+		return p.resultTypes.Error
+	}
 	if isClaudeNativeCommand(cmdType) {
 		return "claude_native_error"
 	}
@@ -1415,6 +1418,19 @@ type resultMsg struct {
 	// (relay_turn_inbox.go). Set on that frame type only.
 	RelayTurnID string `json:"relayTurnId,omitempty"`
 
+	// The device's annotations on an ACP-family MESSAGE frame
+	// (shared-constants ACP_HANDOVER_FIELD / ACP_STEER_OUTCOME_FIELD; set by
+	// relay_follow_up_jsonrpc.go, only on a session taking live follow-ups).
+	// Output stays the CLI's line, verbatim.
+	//
+	//   AcpHandoverTo    Antigravity: on the answer to a running prompt that
+	//                    a follow-up prompt the device wrote took over, that
+	//                    prompt's id — the turn carries on under it.
+	//   AcpSteerOutcome  OpenCode: on the answer to a device-written
+	//                    `_session/steering`, the follow-up ledger's outcome.
+	AcpHandoverTo   string `json:"acpHandoverTo,omitempty"`
+	AcpSteerOutcome string `json:"acpSteerOutcome,omitempty"`
+
 	// Follow-up answers (relay_follow_up_ledger.go): one attempt's durable
 	// outcome on `relay_follow_up_ack`, and a refused queued follow-up turn's
 	// outcome on `relay_turn_ack`. Never the follow-up text.
@@ -1765,6 +1781,10 @@ func prepareCLIUsageRefreshResult(secret, refreshID string, challengeTs int64, s
 	receipt, normalizedUsage, normalizedErrors, err := signCLIUsageRefreshReceipt(secret, refreshID, challengeTs, success, usage, errs)
 	if err == nil && success {
 		SetCachedCLIAgents(normalizedUsage)
+		// The refresh re-read every CLI's version: a newly installed or
+		// updated OpenCode can change which ACP drivers this computer runs.
+		// Off this goroutine, and a no-op unless the list changed.
+		go refreshACPDriversCapability()
 	}
 	return receipt, normalizedUsage, normalizedErrors, err
 }
@@ -7244,6 +7264,22 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// short-circuit exists to close (a later raw execute would skip the ACP
 		// manager's API-key/env-sanitisation gates). Treat "Always" as one-time.
 		persistOnAlways = false
+	case openCodeACPProfile.commandTypes.Start, antigravityACPProfile.commandTypes.Start:
+		// The selected ACP drivers (acp_profiles.go): the profile owns the
+		// argv (exactly `<cli> acp`; START args are refused) and the
+		// environment, so a SIGNED start needs no allowlist entry, as
+		// grok_acp_start's does not. Unsigned (or a signed high-risk step),
+		// the person sees the dialog with the argv that will run. "Always"
+		// never persists: it would write a blanket `opencode *` / `agy *`.
+		if cfg.CommandSecret != "" && !forceNative {
+			return true
+		}
+		p := acpDriverProfileForCommand(cmd.Type)
+		allowCommand = p.cliName
+		allowArgs = []string{"acp"}
+		dialogArgs = allowArgs
+		denyOutput = p.noun + " session denied by user: not in allow list"
+		persistOnAlways = false
 	default:
 		// Mid-session interactive commands don't re-prompt — unless the step
 		// itself is signed high-risk, in which case fall through to the native
@@ -7438,8 +7474,8 @@ func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd co
 		handleOneShotNativeCommand(ctx, topic, cmd, target, museCodeNativeSpec.nativeFrameKind)
 		return
 	}
-	if isGrokACPCommand(cmd.Type) {
-		handleGrokACPCommand(ctx, topic, cmd, cfg)
+	if isACPFamilyCommand(cmd.Type) {
+		handleACPCommand(ctx, topic, cmd, cfg)
 		return
 	}
 
@@ -8154,7 +8190,7 @@ func publishAntigravityNativeError(ctx context.Context, topic *pubsub.Publisher,
 }
 
 /* --------------------------------------------------------------------------
-   Grok ACP (JSON-RPC over stdio) command routing
+   ACP family (JSON-RPC over stdio) command routing: Grok, OpenCode, Antigravity
    -------------------------------------------------------------------------- */
 
 // isGrokACPCommand returns true if cmdType is one of the Grok ACP command
@@ -8168,39 +8204,73 @@ func isGrokACPCommand(cmdType string) bool {
 	return false
 }
 
+// isACPFamilyCommand reports a command of any ACP-family driver: Grok's, or a
+// selected driver's (OpenCode, Antigravity; acp_profiles.go).
+func isACPFamilyCommand(cmdType string) bool {
+	return isGrokACPCommand(cmdType) || acpDriverProfileForCommand(cmdType) != nil
+}
+
+// acpFamilyRoute is the profile and manager an ACP-family command goes to. The
+// manager is nil before the agent has initialised it.
+func acpFamilyRoute(cmdType string) (*acpAgentProfile, *ACPManager) {
+	if isGrokACPCommand(cmdType) {
+		return grokACPProfile, globalGrokACPManager
+	}
+	if p := acpDriverProfileForCommand(cmdType); p != nil {
+		return p, acpDriverManagerFor(p)
+	}
+	return nil, nil
+}
+
 // handleGrokACPCommand dispatches grok_acp_* commands to the GrokACPManager.
+// cfg drives Grok's per-session policy: the API-key fallback gate
+// (Config.EnableGrokAPIKeyFallback) and the always-approve gate
+// (Config.EnableGrokAlwaysApprove). Session cwd containment is rooted at the
+// start cwd itself (see ACPManager.Start), not at Config.WorkingDirectory.
+func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
+	handleACPCommand(ctx, topic, cmd, cfg)
+}
+
+// handleACPCommand dispatches an ACP-family command to its agent's manager.
 // Mirrors handleCodexAppServerCommand's shape — a single publishFn is shared
 // with the manager so it can stream JSON-RPC frames (responses, session/update
 // notifications, server-initiated approval requests) back via Pub/Sub for the
-// duration of the session. cfg drives per-session policy: API-key fallback
-// gate (Config.EnableGrokAPIKeyFallback) and always-approve gate
-// (Config.EnableGrokAlwaysApprove). Session cwd containment is rooted at the
-// start cwd itself (see GrokACPManager.Start), not at Config.WorkingDirectory.
-func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
-	if globalGrokACPManager == nil {
-		publishGrokACPError(ctx, topic, cmd, "grok acp manager not initialized", "")
+// duration of the session.
+//
+// A signed START needs no allowlist entry (gateSessionEntryCommand): the
+// profile owns the argv and the environment, and the selected drivers refuse
+// any START args. Only terminal-service publishes their SENDs (the handshake,
+// the prompt it wraps a person's text in, and the answers to the CLI's own
+// requests); the client-frame fence (acp_fence.go) refuses anything else.
+func handleACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
+	p, m := acpFamilyRoute(cmd.Type)
+	if p == nil {
+		return
+	}
+	if m == nil {
+		publishACPError(ctx, topic, cmd, p, fmt.Sprintf("%s manager not initialized", p.noun), "")
 		return
 	}
 
-	publishFn := newSessionPublishFn(topic, "[grok-acp]")
+	publishFn := newSessionPublishFn(topic, p.logTag)
 
 	switch cmd.Type {
-	case "grok_acp_start":
+	case p.commandTypes.Start:
 		if cmd.SessionID == "" {
-			publishGrokACPError(ctx, topic, cmd, "sessionID is required for grok_acp_start", "")
+			publishACPError(ctx, topic, cmd, p, fmt.Sprintf("sessionID is required for %s", cmd.Type), "")
 			return
 		}
 
-		fmt.Printf("%s[grok-acp] Starting session %s (workspace=%s)%s\n",
-			colorCyan, cmd.SessionID, cmd.WorkspaceID, colorReset)
+		fmt.Printf("%s%s Starting session %s (workspace=%s)%s\n",
+			colorCyan, p.logTag, cmd.SessionID, cmd.WorkspaceID, colorReset)
 
-		opts := GrokStartOptions{
-			TimeoutMs:           cmd.TimeoutMs,
-			AllowAPIKeyFallback: cfg != nil && cfg.EnableGrokAPIKeyFallback,
-			AllowAlwaysApprove:  cfg != nil && cfg.EnableGrokAlwaysApprove,
+		opts := ACPStartOptions{TimeoutMs: cmd.TimeoutMs}
+		if p == grokACPProfile {
+			opts.AllowAPIKeyFallback = cfg != nil && cfg.EnableGrokAPIKeyFallback
+			opts.AllowAlwaysApprove = cfg != nil && cfg.EnableGrokAlwaysApprove
 		}
 
-		err := globalGrokACPManager.Start(
+		err := m.Start(
 			cmd.SessionID,
 			cmd.Cwd,
 			cmd.Args,
@@ -8210,73 +8280,67 @@ func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			publishFn,
 		)
 		if err != nil {
-			msg := fmt.Sprintf("failed to start grok acp: %v", err)
-			if typed := grokAuthErrorFrom(err); typed != nil {
-				// Keep the "failed to start grok acp:" prefix so
-				// terminal-service's start-refusal settler still
-				// releases the session/device claim. The typed
-				// errorCode is what downstream classifies on.
-				publishGrokACPError(ctx, topic, cmd, msg, typed.Code)
-				return
-			}
-			publishGrokACPError(ctx, topic, cmd, msg, "")
+			// Keep the "failed to start <noun>:" prefix so terminal-service's
+			// start-refusal settler releases the session/device claim. A typed
+			// errorCode (GROK_NOT_AUTHENTICATED, ACP_CLI_TOO_OLD,
+			// ACP_CONFIG_OVERLAY_INVALID) is what downstream classifies on.
+			publishACPError(ctx, topic, cmd, p, fmt.Sprintf("failed to start %s: %v", p.noun, err), acpTypedErrorCode(err))
 			return
 		}
 
-		// Synchronous ack so the orchestrator can proceed to send the ACP
-		// `initialize` request as soon as the pipe is up. The first
-		// grok_acp_message will follow once grok emits its initialize
-		// response on stdout.
+		// Synchronous ack so terminal-service can send the ACP `initialize`
+		// request as soon as the pipe is up. The first message frame follows
+		// once the CLI answers it on stdout.
 		publishFn(resultMsg{
 			ID:          cmd.ID,
 			WorkspaceID: cmd.WorkspaceID,
 			UID:         cmd.UID,
-			Output:      "Grok ACP started",
+			Output:      p.startedOutput,
 			Status:      "success",
 			Ts:          time.Now().UnixMilli(),
 			Version:     Version,
-			Type:        "grok_acp_started",
+			Type:        p.resultTypes.Started,
 			SessionID:   cmd.SessionID,
 		})
 
 		// Arm the first-frame watchdog AFTER the ack publish. publishFn
 		// (newSessionPublishFn) can block for up to 30s when Pub/Sub is slow;
 		// arming the watchdog from Start would include that publish latency
-		// in the 45s budget and risk killing a healthy grok that is just
-		// waiting on the orchestrator's `initialize` frame.
-		globalGrokACPManager.ArmFirstFrameWatchdog(cmd.SessionID, publishFn)
+		// in the 45s budget and risk killing a healthy child that is just
+		// waiting on terminal-service's `initialize` frame.
+		m.ArmFirstFrameWatchdog(cmd.SessionID, publishFn)
 
-	case "grok_acp_send":
+	case p.commandTypes.Send:
 		if cmd.SessionID == "" {
-			publishGrokACPError(ctx, topic, cmd, "sessionID is required for grok_acp_send", "")
+			publishACPError(ctx, topic, cmd, p, fmt.Sprintf("sessionID is required for %s", cmd.Type), "")
 			return
 		}
 		if cmd.Input == "" {
-			publishGrokACPError(ctx, topic, cmd, "input (JSON-RPC frame) is required for grok_acp_send", "")
+			publishACPError(ctx, topic, cmd, p, fmt.Sprintf("input (JSON-RPC frame) is required for %s", cmd.Type), "")
 			return
 		}
 
-		if err := globalGrokACPManager.SendAccepting(cmd.SessionID, cmd.Input, relayTurnAcceptor(ctx)); err != nil {
-			publishGrokACPError(ctx, topic, cmd, fmt.Sprintf("failed to send to grok acp: %v", err), "")
+		if err := m.SendAccepting(cmd.SessionID, cmd.Input, relayTurnAcceptor(ctx)); err != nil {
+			publishACPError(ctx, topic, cmd, p, fmt.Sprintf("failed to send to %s: %v", p.noun, err), acpTypedErrorCode(err))
 			return
 		}
 
-	case "grok_acp_end":
+	case p.commandTypes.End:
 		if cmd.SessionID == "" {
-			publishGrokACPError(ctx, topic, cmd, "sessionID is required for grok_acp_end", "")
+			publishACPError(ctx, topic, cmd, p, fmt.Sprintf("sessionID is required for %s", cmd.Type), "")
 			return
 		}
 
-		fmt.Printf("%s[grok-acp] Ending session %s%s\n",
-			colorYellow, cmd.SessionID, colorReset)
+		fmt.Printf("%s%s Ending session %s%s\n",
+			colorYellow, p.logTag, cmd.SessionID, colorReset)
 
-		if err := globalGrokACPManager.End(cmd.SessionID); err != nil {
-			publishGrokACPError(ctx, topic, cmd, fmt.Sprintf("failed to end grok acp session: %v", err), "")
+		if err := m.End(cmd.SessionID); err != nil {
+			publishACPError(ctx, topic, cmd, p, fmt.Sprintf("failed to end %s session: %v", p.noun, err), "")
 			return
 		}
 
 	default:
-		publishGrokACPError(ctx, topic, cmd, fmt.Sprintf("unknown grok acp command type: %s", cmd.Type), "")
+		publishACPError(ctx, topic, cmd, p, fmt.Sprintf("unknown %s command type: %s", p.noun, cmd.Type), "")
 	}
 }
 
@@ -8284,7 +8348,13 @@ func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 // not ready, send failure) back to the orchestrator as a `grok_acp_error`
 // frame so it can fail the in-flight call without waiting for a timeout.
 func publishGrokACPError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string, errorCode string) {
-	fmt.Printf("%s[grok-acp] Error: %s%s\n", colorRed, errMsg, colorReset)
+	publishACPError(ctx, topic, cmd, grokACPProfile, errMsg, errorCode)
+}
+
+// publishACPError surfaces a synchronous failure of an ACP-family command as
+// its agent's `<kind>_acp_error` frame.
+func publishACPError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, p *acpAgentProfile, errMsg string, errorCode string) {
+	fmt.Printf("%s%s Error: %s%s\n", colorRed, p.logTag, errMsg, colorReset)
 
 	res := resultMsg{
 		ID:          cmd.ID,
@@ -8295,14 +8365,14 @@ func publishGrokACPError(ctx context.Context, topic *pubsub.Publisher, cmd comma
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
 		BootID:      agentBootID,
-		Type:        "grok_acp_error",
+		Type:        p.resultTypes.Error,
 		SessionID:   cmd.SessionID,
 	}
 	if errorCode != "" {
 		res.ErrorCode = errorCode
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
-		fmt.Printf("%s[grok-acp] Failed to publish error: %v%s\n", colorRed, err, colorReset)
+		fmt.Printf("%s%s Failed to publish error: %v%s\n", colorRed, p.logTag, err, colorReset)
 	}
 }
 
