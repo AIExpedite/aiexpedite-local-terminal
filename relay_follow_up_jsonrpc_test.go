@@ -70,47 +70,64 @@ func TestLiveFollowUpJSONRPCWireValuesArePinned(t *testing.T) {
 	}
 }
 
-// Dark until certification: the shipped map certifies neither Codex nor
-// Grok, so no session of theirs probes its version or gets a tracker, and
-// the device never advertises them live.
-func TestCodexAndGrokStayUncertifiedAndDark(t *testing.T) {
-	for _, kind := range []string{codexCliAgentID, grokCliAgentID} {
-		if _, ok := liveFollowUpCertified[kind]; ok {
-			t.Fatalf("%s is certified before its certification run", kind)
+// Certified at their run versions: a Codex or Grok session launched at the
+// certified version gets a tracker, and one launched below it gets none, so
+// an older CLI that never passed the run is never written to live.
+func TestCodexAndGrokTrackOnlyFromTheirCertifiedVersion(t *testing.T) {
+	for kind, certified := range map[string]string{codexCliAgentID: "0.168.0", grokCliAgentID: "1.0.77"} {
+		if liveFollowUpCertified[kind] != certified {
+			t.Fatalf("%s is certified at %q, want %s", kind, liveFollowUpCertified[kind], certified)
 		}
-		if tr := newLiveFollowUpTracker(kind, "99.0.0"); tr != nil {
-			t.Fatalf("an uncertified %s session got a tracker", kind)
+		if tr := newLiveFollowUpTracker(kind, certified); tr == nil {
+			t.Fatalf("a %s session launched at its certified version %s got no tracker", kind, certified)
 		}
-		if v, _ := cliLaunchVersion(kind, filepath.Join(t.TempDir(), "no-such-cli")); v != "" {
-			t.Fatalf("an uncertified %s launch read a version: %q", kind, v)
+		if tr := newLiveFollowUpTracker(kind, "0.0.1"); tr != nil {
+			t.Fatalf("a %s session launched below its certified version got a tracker", kind)
+		}
+		if tr := newLiveFollowUpTracker(kind, ""); tr != nil {
+			t.Fatalf("a %s session with an unreadable version got a tracker", kind)
 		}
 	}
 }
 
-// liveAgents stays ["claudeCode"] with Codex and Grok installed at the
-// versions the spec's runs used: the map is unchanged by this release.
-func TestLiveAgentsStayClaudeOnlyWithCodexAndGrokInstalled(t *testing.T) {
+// liveAgents lists Codex and Grok exactly when their INSTALLED version meets
+// the certified minimum: at the run versions all three are advertised, one
+// patch below their run versions only Claude Code is.
+func TestLiveAgentsListCodexAndGrokOnlyAtTheirCertifiedVersions(t *testing.T) {
 	dir := t.TempDir()
 	ledger := newRelayFollowUpLedger(func() string { return filepath.Join(dir, relayFollowUpLedgerFileName) })
 	t.Cleanup(ledger.release)
 	inbox := newRelayTurnInbox(func() string { return filepath.Join(dir, relayTurnInboxFileName) })
 	t.Cleanup(inbox.release)
 	prev := liveFollowUpInstalledVersion
-	liveFollowUpInstalledVersion = func(id string) string {
-		switch id {
-		case claudeCodeCliAgentID:
-			return liveFollowUpCertified[claudeCodeCliAgentID]
-		case codexCliAgentID:
-			return "0.168.0"
-		case grokCliAgentID:
-			return "1.0.77"
-		}
-		return ""
-	}
 	t.Cleanup(func() { liveFollowUpInstalledVersion = prev })
-	caps := newRelayFollowUpsCapabilityFor(ledger, inbox)
-	if caps == nil || len(caps.LiveAgents) != 1 || caps.LiveAgents[0] != claudeCodeCliAgentID {
-		t.Fatalf("liveAgents = %+v, want [claudeCode]", caps)
+	advertised := func(codex, grok string) map[string]bool {
+		liveFollowUpInstalledVersion = func(id string) string {
+			switch id {
+			case claudeCodeCliAgentID:
+				return liveFollowUpCertified[claudeCodeCliAgentID]
+			case codexCliAgentID:
+				return codex
+			case grokCliAgentID:
+				return grok
+			}
+			return ""
+		}
+		caps := newRelayFollowUpsCapabilityFor(ledger, inbox)
+		if caps == nil {
+			t.Fatal("no follow-up capability")
+		}
+		got := map[string]bool{}
+		for _, id := range caps.LiveAgents {
+			got[id] = true
+		}
+		return got
+	}
+	if got := advertised("0.168.0", "1.0.77"); len(got) != 3 || !got[claudeCodeCliAgentID] || !got[codexCliAgentID] || !got[grokCliAgentID] {
+		t.Fatalf("at the certified versions liveAgents = %v, want claudeCode, codex and grok", got)
+	}
+	if got := advertised("0.167.9", "1.0.76"); len(got) != 1 || !got[claudeCodeCliAgentID] {
+		t.Fatalf("below the certified versions liveAgents = %v, want claudeCode only", got)
 	}
 }
 

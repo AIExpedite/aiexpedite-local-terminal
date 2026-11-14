@@ -130,9 +130,14 @@ const (
 // relay_follow_up_codex_certification_test.go,
 // relay_follow_up_grok_certification_test.go) with the minimum version it
 // passed at. A kind not listed answers every live attempt
-// notWritten/notLiveKind, so the broker queues. Codex and Grok Build are added
-// only in the release that follows their own certification run; until then
-// the device can write to them but never does.
+// notWritten/notLiveKind, so the broker queues.
+//
+// Codex 0.168.0 and Grok Build 1.0.77 passed their runs on 2026-11-14 (the
+// Codex run with its step 8, a steer beside an open approval; the Grok run's
+// stranded window held 6 of 10 answers, none answered out of order). Listing
+// them here makes a computer ADVERTISE them in liveAgents; nothing is written
+// live until the shared-constants broker row is certified too, because the
+// broker resolves the follow-up mode from that row before it publishes.
 //
 // Claude Code 2.1.322: a message spoken or typed while the agent is working is
 // written into the running CLI's stdin instead of waiting for the turn to end.
@@ -148,6 +153,8 @@ const (
 // would let an unrelated message approve an action nobody approved.
 var liveFollowUpCertified = map[string]string{
 	claudeCodeCliAgentID: "2.1.322",
+	codexCliAgentID:      "0.168.0",
+	grokCliAgentID:       "1.0.77",
 }
 
 type relayFollowUpRow struct {
