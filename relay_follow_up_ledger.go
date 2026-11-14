@@ -87,7 +87,12 @@ const (
 	followUpReasonUnseen               = "unseen"
 	followUpReasonLedgerFull           = "ledgerFull"
 
-	// CLI_AGENT_IDS.CLAUDE_CODE — the only kind whose stdin stays open between turns.
+	// CLI_AGENT_IDS.CLAUDE_CODE — the only kind the live follow-up path writes to.
+	// It is not the only kind whose stdin stays open between turns: Codex's
+	// app-server and Grok's ACP child hold theirs for the whole session too
+	// (codex_appserver.go, grok_acp.go Start). What is Claude-only is this
+	// follow-up path and its certification, so a live attempt for any other
+	// kind is refused (fenceReason: notLiveKind) and the broker queues it.
 	claudeCodeCliAgentID = "claudeCode"
 
 	followUpProcessedInCurrent = "current"

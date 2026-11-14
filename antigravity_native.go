@@ -12,8 +12,11 @@ package main
 //   - `--conversation <uuid>` resumes the exact prior conversation.
 //   - `--continue` resumes the most recent conversation globally and is
 //     NEVER used (cross-chat contamination risk).
-//   - After a first turn, the native conversation ID is read only from
-//     ~/.gemini/antigravity-cli/cache/last_conversations.json keyed by cwd
+//   - After a first turn, the native conversation ID is the one the run
+//     reports on its own stream-json events (`init`'s `conversation_id`, the
+//     `result`'s `conversation_id`; read on agy 1.5.8), which another agy in
+//     the same folder cannot change. Only when no event names one is it read
+//     from ~/.gemini/antigravity-cli/cache/last_conversations.json keyed by cwd
 //     (and only when that ID is new vs the pre-turn snapshot). We deliberately
 //     do not adopt the newest global conversations/*.db — it may belong to
 //     another cwd (local TUI or concurrent AIExpedite session). Missed capture
@@ -524,7 +527,7 @@ func (m *AntigravityNativeManager) SendTurn(id, text string, publishFn PublishFu
 		beforeIDs = listAntigravityConversationIDs()
 	}
 
-	outText, errText, exitCode, timedOut, truncated, runErr := m.runOneShot(
+	outText, errText, exitCode, timedOut, truncated, streamConvID, runErr := m.runOneShot(
 		session, runDir, executable, promptToSend, nativeID, turnTimeout, "antigravity-native:"+id,
 	)
 	m.publishStderrIfAny(session, publishFn, errText)
@@ -562,7 +565,7 @@ func (m *AntigravityNativeManager) SendTurn(id, text string, publishFn PublishFu
 		lockCapture()
 		beforeIDs = listAntigravityConversationIDs()
 
-		out2, err2, exit2, timed2, trunc2, run2 := m.runOneShot(
+		out2, err2, exit2, timed2, trunc2, conv2, run2 := m.runOneShot(
 			session, runDir, executable, replayPrompt, "", turnTimeout, "antigravity-native:"+id+":replay",
 		)
 		if run2 != nil {
@@ -580,6 +583,7 @@ func (m *AntigravityNativeManager) SendTurn(id, text string, publishFn PublishFu
 				"Antigravity replay output exceeded the maximum capture size")
 		}
 		outText, errText, exitCode = out2, err2, exit2
+		streamConvID = conv2
 		runErr = nil
 		usedReplay = true
 		needCapture = true
@@ -621,9 +625,17 @@ func (m *AntigravityNativeManager) SendTurn(id, text string, publishFn PublishFu
 	// appending to the transcript, so capturing its ID earlier would resume a
 	// conversation containing a failed/hidden turn the UI and replay never saw.
 	// Capture read runs under the per-cwd lock acquired before this turn's run.
+	//
+	// The id the run reported on its own stream wins (antigravityStreamConversationID):
+	// another agy in the same folder cannot change it. The last_conversations.json
+	// scrape stays as the fallback for an agy that reports none, and still
+	// fails closed when the folder saw more than one new conversation.
 	if needCapture || session.NativeConversationID == "" {
 		lockCapture()
-		captured := captureAntigravityNativeID(runDir, beforeIDs)
+		captured := streamConvID
+		if captured == "" {
+			captured = captureAntigravityNativeID(runDir, beforeIDs)
+		}
 		if captured != "" {
 			session.NativeConversationID = captured
 		} else if session.NativeConversationID == "" {
@@ -703,8 +715,6 @@ func killAntigravityProcessTree(cmd *exec.Cmd) {
 	_ = killProcessGroup(pid)
 }
 
-// runOneShot spawns one stream-json `agy` process, drains stdout/stderr concurrently
-// (required to avoid pipe deadlock), and waits for exit. Does not publish frames.
 // containedCwd resolves symlinks on cwd and, when workspaceRoot is set,
 // verifies the resolved cwd stays inside the resolved root, returning the real
 // (symlink-free) cwd to use as the process working directory. Called from a
@@ -736,12 +746,17 @@ func containedCwd(cwd, workspaceRoot string) (string, error) {
 	return resolvedCwd, nil
 }
 
+// runOneShot spawns one stream-json `agy` process, drains stdout/stderr
+// concurrently (required to avoid pipe deadlock), and waits for exit. Does not
+// publish frames. conversationID is the conversation the run reported on its
+// own stream (antigravityStreamConversationID), set only when that stream
+// parsed as a complete result; "" otherwise.
 func (m *AntigravityNativeManager) runOneShot(
 	session *AntigravityNativeSession,
 	runDir, executable, prompt, nativeID string,
 	turnTimeout time.Duration,
 	registryLabel string,
-) (stdoutText, stderrText string, exitCode int, timedOut, truncated bool, err error) {
+) (stdoutText, stderrText string, exitCode int, timedOut, truncated bool, conversationID string, err error) {
 	// Unattended remote chat cannot answer local permission prompts — see
 	// package threat-model comment. Same prefix the approval gate displays
 	// (buildAntigravityNativeGateArgs) so the two never drift. The START's
@@ -770,16 +785,16 @@ func (m *AntigravityNativeManager) runOneShot(
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", "", 0, false, false, fmt.Errorf("stdout pipe: %w", err)
+		return "", "", 0, false, false, "", fmt.Errorf("stdout pipe: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return "", "", 0, false, false, fmt.Errorf("stderr pipe: %w", err)
+		return "", "", 0, false, false, "", fmt.Errorf("stderr pipe: %w", err)
 	}
 
 	// Avoid spawning when End already won the race during turn setup.
 	if session.Status() == "ended" {
-		return "", "", 0, false, false, fmt.Errorf("session ended during turn")
+		return "", "", 0, false, false, "", fmt.Errorf("session ended during turn")
 	}
 
 	// agy already leads its own group (Setsid above). Recorded in the spawn
@@ -787,7 +802,7 @@ func (m *AntigravityNativeManager) runOneShot(
 	beginSessionSpawn(session.ID, cmd)
 	if err := cmd.Start(); err != nil {
 		abortSessionSpawn(session.ID)
-		return "", "", 0, false, false, fmt.Errorf("failed to start agy (is Antigravity CLI installed?): %w", err)
+		return "", "", 0, false, false, "", fmt.Errorf("failed to start agy (is Antigravity CLI installed?): %w", err)
 	}
 	trackSessionProcess(session.ID, cmd)
 	defer untrackSessionProcess(session.ID, cmd.Process.Pid)
@@ -866,25 +881,26 @@ func (m *AntigravityNativeManager) runOneShot(
 	if reason, _ := quotaReason.Load().(string); reason != "" {
 		// Not a timeout and not a missing conversation: Send publishes this
 		// reason as the turn error, in the wrapper the cloud's matcher reads.
-		return "", "", 1, false, false, fmt.Errorf("[Antigravity turn failed: %s]", reason)
+		return "", "", 1, false, false, "", fmt.Errorf("[Antigravity turn failed: %s]", reason)
 	}
 	exitCode = 0
 	if waitErr != nil {
 		if ee, ok := waitErr.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
 		} else {
-			return "", "", 0, timedOutFlag.Load(), false, fmt.Errorf("agy process error: %w", waitErr)
+			return "", "", 0, timedOutFlag.Load(), false, "", fmt.Errorf("agy process error: %w", waitErr)
 		}
 	}
 	// Fail closed only when assistant stdout was truncated. Stderr may hit its
 	// smaller cap without invalidating a complete assistant response; the
 	// partial stderr is still published (redacted) for diagnostics.
 	out := ""
+	convID := ""
 	if stdoutBuf != nil {
 		rawOut := strings.TrimSpace(stdoutBuf.b.String())
 		if !stdoutBuf.trunc && !timedOutFlag.Load() {
 			if rawOut == "" && exitCode == 0 {
-				return "", "", exitCode, false, false, fmt.Errorf("Antigravity stream ended without a result event")
+				return "", "", exitCode, false, false, "", fmt.Errorf("Antigravity stream ended without a result event")
 			}
 			if rawOut != "" {
 				parsed, parseErr := antigravityStreamResultText(rawOut)
@@ -893,11 +909,12 @@ func (m *AntigravityNativeManager) runOneShot(
 					// exiting non-zero. Preserve it for the normal exit-code error
 					// path; successful runs must honor the stream-json contract.
 					if exitCode == 0 {
-						return parsed, "", exitCode, false, false, parseErr
+						return parsed, "", exitCode, false, false, "", parseErr
 					}
 					out = rawOut
 				} else {
 					out = parsed
+					convID = antigravityStreamConversationID(rawOut)
 				}
 			}
 		} else {
@@ -909,7 +926,7 @@ func (m *AntigravityNativeManager) runOneShot(
 		errOut = strings.TrimSpace(stderrBuf.b.String())
 	}
 	trunc := stdoutBuf != nil && stdoutBuf.trunc
-	return out, errOut, exitCode, timedOutFlag.Load(), trunc, nil
+	return out, errOut, exitCode, timedOutFlag.Load(), trunc, convID, nil
 }
 
 func (m *AntigravityNativeManager) publishStderrIfAny(session *AntigravityNativeSession, publishFn PublishFunc, errText string) {
@@ -1346,6 +1363,56 @@ func antigravityStreamResultText(output string) (string, error) {
 		return resultText, resultErr
 	}
 	return strings.TrimSpace(resultText), nil
+}
+
+// antigravityStreamConversationID returns the conversation agy reports for
+// this run on its own stream-json events: the top-level `conversation_id` of
+// the `init` event and the `conversation_id` of the terminal `result`. Both
+// were read on agy 1.5.8 (2026-11-13), and both named the conversation the
+// last_conversations.json scrape then read for the run's folder.
+//
+// Unlike that scrape, it cannot be misled by another agy that ran in the same
+// folder at the same time: each run reports its own id. `step_update` events
+// are not read, because a delegated subagent's step can carry the
+// subagent's own conversation (agy changelog: `subagent_info`). Returns ""
+// when no event names one, when the events disagree, or when the id is not a
+// safe `--conversation` argument; the caller then falls back to the scrape.
+func antigravityStreamConversationID(output string) string {
+	id := ""
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, `"conversation_id"`) {
+			continue
+		}
+		var event struct {
+			Event          string `json:"event"`
+			ConversationID string `json:"conversation_id"`
+			Result         *struct {
+				ConversationID string `json:"conversation_id"`
+			} `json:"result"`
+		}
+		if json.Unmarshal([]byte(line), &event) != nil {
+			continue
+		}
+		reported := ""
+		switch {
+		case event.Event == "init":
+			reported = event.ConversationID
+		case event.Event == "result" && event.Result != nil:
+			reported = event.Result.ConversationID
+		}
+		if reported == "" {
+			continue
+		}
+		if id != "" && id != reported {
+			return ""
+		}
+		id = reported
+	}
+	if !isValidCliConversationID(id) {
+		return ""
+	}
+	return id
 }
 
 // antigravityDangerousFlags is the prefix runOneShot prepends before the

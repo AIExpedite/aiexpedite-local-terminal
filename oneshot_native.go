@@ -25,7 +25,8 @@ package main
 //   - The prompt reaches the child from an owner-only (0600) temp file, never
 //     argv, and the file is removed on every path.
 //   - Replay recovery runs only for a recognized missing-session failure on a
-//     non-zero exit, at most once per turn.
+//     non-zero exit, or a resume the CLI's own first record shows it answered
+//     with a new session (spec.RunCreatedSession), at most once per turn.
 //   - The native id is published only on the completion frame of a turn that
 //     succeeded and whose completion is publishable.
 //   - A START's model and effort flags (spec.LaunchArgs) are the only START
@@ -170,6 +171,22 @@ type oneShotNativeSpec struct {
 	ValidSeed func(id string) bool
 	// LooksLikeMissingSession recognizes a stale-resume failure.
 	LooksLikeMissingSession func(stdout, stderr string) bool
+	// RunCreatedSession, when set, reads the FIRST stdout line of a turn that
+	// resumes a confirmed id and reports whether the CLI created a new session
+	// under that id instead of resuming one: what a caller-supplied-id CLI
+	// does, with a zero exit, when the session it was given is gone. The run
+	// is then stopped before anything of it is published, and the turn takes
+	// the same bounded replay as a missing-session failure.
+	RunCreatedSession func(firstLine, nativeID string) bool
+	// OpeningRecord reports whether a stdout line is one of the records a
+	// run writes when its command is accepted, BEFORE the run starts
+	// executing. Reading the first record is not a barrier on its own: the
+	// child keeps running until the kill lands. So the replay runs only when
+	// everything the stopped run wrote is opening records; anything else
+	// means it had started, a replay could do part of the instruction twice,
+	// and the turn fails instead (the next turn replays). Required with
+	// RunCreatedSession; nil treats every record as past the opening.
+	OpeningRecord func(line string) bool
 	// ObserveTurn, when set, sees every finished turn's raw stdout — the
 	// bounded diagnostic prefix (oneShotNativeMaxRawStdout), not all of it —
 	// and its stderr (Muse Code reads its own sign-in refusal from them).
@@ -628,7 +645,10 @@ func (m *oneShotNativeManager) SendTurn(id, text string, publishFn PublishFunc, 
 	promptToSend, replay := oneShotTurnPrompt(m.spec.ReplayPreamble, nativeID, session.nativeConfirmed, session.Transcript, text)
 	usedReplay = replay
 
-	result := m.runOneShot(session, runDir, executable, promptToSend, nativeID, turnTimeout,
+	// Resuming an id a turn (or the cloud's seed) confirmed: the session is
+	// expected to exist, so a run that creates it is a gone session.
+	resumesConfirmed := useNativeResume && session.nativeConfirmed
+	result := m.runOneShot(session, runDir, executable, promptToSend, nativeID, resumesConfirmed, turnTimeout,
 		m.spec.FramePrefix+":"+id, publishFn)
 	if result.err != nil {
 		m.rotateUnconfirmedID(session)
@@ -651,10 +671,30 @@ func (m *oneShotNativeManager) SendTurn(id, text string, publishFn PublishFunc, 
 		return m.publishTurnError(session, publishFn, name+" turn timed out")
 	}
 
-	if session.nativeConfirmed && nativeID != "" && result.exitCode != 0 &&
+	if session.nativeConfirmed && nativeID != "" && result.sessionCreated && result.startedBeforeStop {
+		// The run had begun in the new session before the kill landed, so a
+		// replay could do part of the instruction twice. Never repeat it:
+		// fail this turn, and let the next one replay the transcript under a
+		// fresh id (oneShotTurnPrompt replays for an unconfirmed id).
+		m.logf(colorYellow, "%s had no session to resume for %s and had started a new one before it was stopped — not replaying", name, id)
+		session.nativeConfirmed = false
+		session.NativeSessionID = ""
+		if m.spec.MintNativeID != nil && resumeSupported {
+			session.NativeSessionID = m.spec.MintNativeID()
+		}
+		return m.publishTurnError(session, publishFn, fmt.Sprintf(
+			"%s no longer had this conversation and had started the message in a new one before it could be stopped, so it was not sent again (part of it may already have run). Send it again to continue with the earlier context.",
+			name))
+	}
+	missingSession := result.exitCode != 0 &&
 		m.spec.LooksLikeMissingSession != nil &&
-		m.spec.LooksLikeMissingSession(result.rawStdout, result.stderr) {
-		m.logf(colorYellow, "Native resume failed for %s — replaying bounded transcript", id)
+		m.spec.LooksLikeMissingSession(result.rawStdout, result.stderr)
+	if session.nativeConfirmed && nativeID != "" && (result.sessionCreated || missingSession) {
+		if result.sessionCreated {
+			m.logf(colorYellow, "%s had no session to resume for %s (it started a new one; stopped) — replaying bounded transcript", name, id)
+		} else {
+			m.logf(colorYellow, "Native resume failed for %s — replaying bounded transcript", id)
+		}
 		session.nativeConfirmed = false
 		session.NativeSessionID = ""
 		replayID := ""
@@ -663,7 +703,7 @@ func (m *oneShotNativeManager) SendTurn(id, text string, publishFn PublishFunc, 
 			session.NativeSessionID = replayID
 		}
 		replayPrompt := buildOneShotReplayPrompt(m.spec.ReplayPreamble, session.Transcript, text)
-		result2 := m.runOneShot(session, runDir, executable, replayPrompt, replayID, turnTimeout,
+		result2 := m.runOneShot(session, runDir, executable, replayPrompt, replayID, false, turnTimeout,
 			m.spec.FramePrefix+":"+id+":replay", publishFn)
 		if result2.err != nil {
 			m.rotateUnconfirmedID(session)
@@ -824,7 +864,14 @@ type oneShotRunResult struct {
 	exitCode      int
 	timedOut      bool
 	frameOverflow bool
-	err           error
+	// sessionCreated: the run's first record showed the CLI creating the
+	// session it was asked to resume (spec.RunCreatedSession); the run was
+	// stopped there and nothing of it was published.
+	sessionCreated bool
+	// startedBeforeStop: the stopped run had written a record past its
+	// opening (spec.OpeningRecord) before the kill landed.
+	startedBeforeStop bool
+	err               error
 }
 
 // killOneShotProcessTree kills the child and its tool descendants; the tree
@@ -906,9 +953,12 @@ func isOneShotShimWord(arg string) bool {
 	return true
 }
 
+// resumesConfirmed: nativeID names a session a turn or the cloud's seed
+// confirmed, so it is expected to exist (spec.RunCreatedSession).
 func (m *oneShotNativeManager) runOneShot(
 	session *oneShotNativeSession,
 	runDir, executable, prompt, nativeID string,
+	resumesConfirmed bool,
 	turnTimeout time.Duration,
 	registryLabel string,
 	publishFn PublishFunc,
@@ -989,9 +1039,17 @@ func (m *oneShotNativeManager) runOneShot(
 		wg        sync.WaitGroup
 	)
 	wg.Add(2)
+	var createdSession func(firstLine string) bool
+	if resumesConfirmed && nativeID != "" && m.spec.RunCreatedSession != nil {
+		createdSession = func(firstLine string) bool { return m.spec.RunCreatedSession(firstLine, nativeID) }
+	}
 	go func() {
 		defer wg.Done()
-		stream = m.streamEvents(session, stdout, publishFn, observeLine)
+		// A run in a session the CLI just created is stopped at its first
+		// record, well before the model can act (on Muse Code 1.4.18 the run
+		// starts ~180 ms and the provider answers ~1.1 s after it).
+		stream = m.streamEvents(session, stdout, publishFn, observeLine, createdSession,
+			func() { killOneShotProcessTree(cmd) })
 	}()
 	go func() {
 		defer wg.Done()
@@ -1021,15 +1079,40 @@ func (m *oneShotNativeManager) runOneShot(
 		text = stream.text.String()
 	}
 	return oneShotRunResult{
-		text:          strings.TrimSpace(text),
-		rawStdout:     strings.TrimSpace(stream.raw.String()),
-		stderr:        errOut,
-		sessionID:     stream.sessionID,
-		failure:       stream.failure,
-		exitCode:      exitCode,
-		timedOut:      timedOutFlag.Load(),
-		frameOverflow: stream.overflow,
+		text:              strings.TrimSpace(text),
+		rawStdout:         strings.TrimSpace(stream.raw.String()),
+		stderr:            errOut,
+		sessionID:         stream.sessionID,
+		failure:           stream.failure,
+		exitCode:          exitCode,
+		timedOut:          timedOutFlag.Load(),
+		frameOverflow:     stream.overflow,
+		sessionCreated:    stream.sessionCreated,
+		startedBeforeStop: stream.startedBeforeStop,
 	}
+}
+
+// stoppedRunStarted reads, to EOF and on the stream's own scanner (which may
+// already hold the next lines), what a run stopped at its first record had
+// written before the kill landed, and reports whether any of it is past the
+// run's opening records (spec.OpeningRecord). Nothing of it is published.
+func (m *oneShotNativeManager) stoppedRunStarted(scanner *bufio.Scanner, r interface{ Read([]byte) (int, error) }) bool {
+	started := false
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || started {
+			continue
+		}
+		if m.spec.OpeningRecord == nil || !m.spec.OpeningRecord(line) {
+			started = true
+		}
+	}
+	if scanner.Err() != nil {
+		// A line past the cap is not an opening record either.
+		started = true
+		_, _ = drainRemaining(r)
+	}
+	return started
 }
 
 type oneShotStreamState struct {
@@ -1040,18 +1123,27 @@ type oneShotStreamState struct {
 	failure   string
 	overflow  bool
 	bytes     int
+	// sessionCreated: createdSession recognized the first line (streamEvents),
+	// and startedBeforeStop: the stopped run had gone past its opening.
+	sessionCreated    bool
+	startedBeforeStop bool
 }
 
 // streamEvents publishes each stdout line as its own MESSAGE frame and folds
 // the parsed events into the turn result. Only assistant text accumulates —
 // tool payloads folded into the transcript would be replayed to the model as
 // if the assistant had said them. observeLine (spec.ObserveRun's, or nil)
-// sees every line the turn reads.
+// sees every line the turn reads. createdSession (or nil) reads the first
+// line: when it reports a session the CLI just created, stop is called at
+// once, and nothing of the run (that line or any after it) is published,
+// observed or kept; the rest is only read to EOF for startedBeforeStop.
 func (m *oneShotNativeManager) streamEvents(
 	session *oneShotNativeSession,
 	r interface{ Read([]byte) (int, error) },
 	publishFn PublishFunc,
 	observeLine func(line string),
+	createdSession func(firstLine string) bool,
+	stop func(),
 ) oneShotStreamState {
 	var state oneShotStreamState
 	scanner := bufio.NewScanner(r)
@@ -1065,6 +1157,18 @@ func (m *oneShotNativeManager) streamEvents(
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
+		}
+		if createdSession != nil {
+			created := createdSession(line)
+			createdSession = nil
+			if created {
+				state.sessionCreated = true
+				if stop != nil {
+					stop()
+				}
+				state.startedBeforeStop = m.stoppedRunStarted(scanner, r)
+				return state
+			}
 		}
 		state.bytes += len(line)
 		if state.bytes > oneShotNativeMaxStdout {
