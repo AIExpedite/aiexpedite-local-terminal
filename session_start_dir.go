@@ -60,11 +60,13 @@ type sessionStartDirError struct {
 	reason string
 }
 
+// The folder is printed as it is, in plain quotes: %q would double every
+// backslash of a Windows path in the message a person reads.
 func (e *sessionStartDirError) Error() string {
 	if e.reason == startDirNotADirectory {
-		return fmt.Sprintf("working folder %q is not a folder on this computer", e.dir)
+		return fmt.Sprintf(`working folder "%s" is not a folder on this computer`, e.dir)
 	}
-	return fmt.Sprintf("working folder %q does not exist on this computer", e.dir)
+	return fmt.Sprintf(`working folder "%s" does not exist on this computer`, e.dir)
 }
 
 func sessionStartDirErrorFrom(err error) *sessionStartDirError {

@@ -20,13 +20,45 @@ import (
 // captureSessionFrames routes the generic session path's frames (the
 // session_started ack, stream output, session_ended) into the same capture as
 // publishMsg, so a test sees a whole session without a Pub/Sub topic.
+//
+// The sink is read ONCE, here: a session's terminal frame is published from its
+// own goroutine, and reading the global publishMsg there raced the next test's
+// swap of it under -race.
 func captureSessionFrames(t *testing.T) {
 	t.Helper()
+	sink := publishMsg
 	prev := sessionPublishFnFor
 	sessionPublishFnFor = func(_ *pubsub.Publisher, _ string) PublishFunc {
-		return func(res resultMsg) { _ = publishMsg(context.Background(), nil, res) }
+		return func(res resultMsg) { _ = sink(context.Background(), nil, res) }
 	}
 	t.Cleanup(func() { sessionPublishFnFor = prev })
+}
+
+// waitForSessionEnded waits for the session_ended frame and then for every
+// in-flight terminal publish to return, so nothing this test's session started
+// is still running when the next test swaps the package globals.
+func waitForSessionEnded(t *testing.T, published func() []resultMsg, timeout time.Duration) []resultMsg {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, f := range published() {
+			if f.Type != "session_ended" {
+				continue
+			}
+			for time.Now().Before(deadline) {
+				drain.mu.Lock()
+				inFlight := drain.terminalPublishes
+				drain.mu.Unlock()
+				if inFlight == 0 {
+					return published()
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("the session did not end within %s: %+v", timeout, published())
+	return nil
 }
 
 // withStartDirHome stands in the home folder the fallback falls through to.
@@ -290,21 +322,7 @@ func TestDispatchSessionStart_AMarkedDefaultThatIsGoneRunsInTheFallbackFolder(t 
 	}
 	dispatchSessionCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-1", WorkingDirectory: own})
 
-	deadline := time.Now().Add(15 * time.Second)
-	var frames []resultMsg
-	for time.Now().Before(deadline) {
-		frames = published()
-		ended := false
-		for _, f := range frames {
-			if f.Type == "session_ended" {
-				ended = true
-			}
-		}
-		if ended {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	frames := waitForSessionEnded(t, published, 15*time.Second)
 
 	var started *resultMsg
 	var out strings.Builder
@@ -341,7 +359,7 @@ func TestDispatchSessionStart_AnExistingFolderAddsNothingToTheAck(t *testing.T) 
 		Command: "sh", Args: []string{"-c", "true"}, Cwd: dir, CwdFallback: cwdFallbackDeviceHome, TimeoutMs: 30000,
 	}
 	dispatchSessionCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-1", WorkingDirectory: t.TempDir()})
-	for _, f := range published() {
+	for _, f := range waitForSessionEnded(t, published, 15*time.Second) {
 		if f.Type == "session_started" && (f.Cwd != "" || f.CwdFallbackFrom != "" || f.CwdFallbackReason != "") {
 			t.Fatalf("session_started carried fallback fields for an existing folder: %+v", f)
 		}

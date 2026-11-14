@@ -83,21 +83,7 @@ func TestDispatchSessionStart_WindowsFallbackRunsInTheOwnFolder(t *testing.T) {
 	}
 	dispatchSessionCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-1", WorkingDirectory: own})
 
-	deadline := time.Now().Add(20 * time.Second)
-	var frames []resultMsg
-	for time.Now().Before(deadline) {
-		frames = published()
-		done := false
-		for _, f := range frames {
-			if f.Type == "session_ended" {
-				done = true
-			}
-		}
-		if done {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	frames := waitForSessionEnded(t, published, 20*time.Second)
 	var out strings.Builder
 	var started *resultMsg
 	for i := range frames {
