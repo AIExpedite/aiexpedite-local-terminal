@@ -26,7 +26,9 @@ import (
 // Env contract (all optional):
 //
 //	OPENCODE_STUB_VERSION    version string printed for `--version`
-//	OPENCODE_STUB_STDOUT     literal stdout, "\n"-escaped as \n
+//	OPENCODE_STUB_STDOUT     literal stdout, "\n"-escaped as \n; {{SESSION_ID}}
+//	                         in it (or in _FIRST_STDOUT) becomes the
+//	                         --session-id the run was given
 //	OPENCODE_STUB_STDOUT_FILE when readable, its contents (verbatim) are the
 //	                         run's stdout instead of OPENCODE_STUB_STDOUT —
 //	                         for more output than one environment variable
@@ -185,6 +187,15 @@ func main() {
 		exitCode, _ = strconv.Atoi(env("OPENCODE_STUB_FIRST_EXIT", "1"))
 		if s := unescape(os.Getenv("OPENCODE_STUB_FIRST_STDERR")); s != "" {
 			os.Stderr.WriteString(s)
+		}
+	}
+	// {{SESSION_ID}} in the stdout is the --session-id this run was given.
+	if strings.Contains(stdout, "{{SESSION_ID}}") {
+		for i := 1; i+1 < len(os.Args); i++ {
+			if os.Args[i] == "--session-id" {
+				stdout = strings.ReplaceAll(stdout, "{{SESSION_ID}}", os.Args[i+1])
+				break
+			}
 		}
 	}
 	if stdout != "" {

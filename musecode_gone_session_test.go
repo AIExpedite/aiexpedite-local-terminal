@@ -76,8 +76,9 @@ func TestMuseCode_GoneSessionIsRecoveredByReplayNotAnsweredBlank(t *testing.T) {
 		museDeltaRecord("ANSWER WITHOUT CONTEXT"),
 		museCompletedRecord("ANSWER WITHOUT CONTEXT"),
 	))
-	// Run 2: the replay.
-	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museFrameCompleted))
+	// Run 2: the replay, which creates its own fresh session (sequence 1 is
+	// expected there and must not stop it).
+	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museAcceptedRecord("{{SESSION_ID}}", 1), museFrameCompleted))
 	sink := h.send()
 
 	if h.runs() != 2 {
