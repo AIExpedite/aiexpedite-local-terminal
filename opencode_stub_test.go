@@ -26,7 +26,9 @@ import (
 // Env contract (all optional):
 //
 //	OPENCODE_STUB_VERSION    version string printed for `--version`
-//	OPENCODE_STUB_STDOUT     literal stdout, "\n"-escaped as \n
+//	OPENCODE_STUB_STDOUT     literal stdout, "\n"-escaped as \n; {{SESSION_ID}}
+//	                         in it (or in _FIRST_STDOUT) becomes the
+//	                         --session-id the run was given
 //	OPENCODE_STUB_STDOUT_FILE when readable, its contents (verbatim) are the
 //	                         run's stdout instead of OPENCODE_STUB_STDOUT —
 //	                         for more output than one environment variable
@@ -42,7 +44,9 @@ import (
 //	OPENCODE_STUB_SLEEP_MS   sleep this long before exiting (cancel/timeout)
 //	OPENCODE_STUB_RUN_LOG    append one line per invocation (replay counting)
 //	OPENCODE_STUB_FAIL_FIRST when set, invocation #1 uses
-//	                         …_FIRST_STDOUT/_FIRST_STDERR/_FIRST_EXIT
+//	                         …_FIRST_STDOUT/_FIRST_STDERR/_FIRST_EXIT; with
+//	                         _FIRST_SPLIT_MS it writes the first stdout line,
+//	                         sleeps that long, then writes the rest
 //	OPENCODE_STUB_MODELS     stdout for `models` (a diagnostic, not a run)
 //	OPENCODE_STUB_AUTH       stdout for `auth …` (a diagnostic, not a run)
 //	OPENCODE_STUB_DONE_LOG   written AFTER the sleep, just before exit — absent
@@ -185,6 +189,25 @@ func main() {
 		exitCode, _ = strconv.Atoi(env("OPENCODE_STUB_FIRST_EXIT", "1"))
 		if s := unescape(os.Getenv("OPENCODE_STUB_FIRST_STDERR")); s != "" {
 			os.Stderr.WriteString(s)
+		}
+	}
+	// {{SESSION_ID}} in the stdout is the --session-id this run was given.
+	if strings.Contains(stdout, "{{SESSION_ID}}") {
+		for i := 1; i+1 < len(os.Args); i++ {
+			if os.Args[i] == "--session-id" {
+				stdout = strings.ReplaceAll(stdout, "{{SESSION_ID}}", os.Args[i+1])
+				break
+			}
+		}
+	}
+	// The first run writes its first line, then waits before the rest: a run
+	// the parent stops at its first record never writes the rest.
+	if ms, err := strconv.Atoi(os.Getenv("OPENCODE_STUB_FIRST_SPLIT_MS")); err == nil && ms > 0 &&
+		os.Getenv("OPENCODE_STUB_FAIL_FIRST") != "" && runs == 1 {
+		if i := strings.Index(stdout, "\n"); i >= 0 {
+			os.Stdout.WriteString(stdout[:i+1])
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			stdout = stdout[i+1:]
 		}
 	}
 	if stdout != "" {

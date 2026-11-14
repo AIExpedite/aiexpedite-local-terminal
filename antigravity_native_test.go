@@ -742,7 +742,7 @@ func TestAntigravityNativeRunOneShot_LongPromptUsesStdin(t *testing.T) {
 
 	prompt := strings.Repeat("long \\\"quoted\\\" line with C:\\\\repo\\n", 5000)
 	session := &AntigravityNativeSession{ID: "long-stdin", status: "idle"}
-	out, stderr, exitCode, timedOut, truncated, err := NewAntigravityNativeManager(nil).runOneShot(
+	out, stderr, exitCode, timedOut, truncated, _, err := NewAntigravityNativeManager(nil).runOneShot(
 		session, dir, fakeAgy, prompt, "", 10*time.Second, "test:antigravity-long-stdin",
 	)
 	if err != nil {
@@ -1599,7 +1599,7 @@ func TestAntigravityNativeRunOneShot_ReleasesQuotaCaptureOnTimeout(t *testing.T)
 	session := &AntigravityNativeSession{ID: "capture-timeout", status: "idle"}
 	// The mock sleeps 600ms before answering; a 100ms turn budget forces the
 	// timeout/kill path.
-	_, _, _, timedOut, _, err := NewAntigravityNativeManager(nil).runOneShot(
+	_, _, _, timedOut, _, _, err := NewAntigravityNativeManager(nil).runOneShot(
 		session, t.TempDir(), executable, "hello", "", 100*time.Millisecond, "test:antigravity-capture-timeout")
 	if err != nil {
 		t.Fatalf("runOneShot: %v", err)
