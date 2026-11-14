@@ -60,11 +60,13 @@
 //     fresh 32-byte crypto/rand value (newAntigravityCSRFToken), which turns
 //     the listeners' token check on. The token goes into agy's child
 //     environment only: never argv, never a log line, never a file, never a
-//     frame to the server. What remains accepted: the variable is
-//     undocumented (a later agy could ignore it, so each certified agy version
-//     is re-checked), calls over the WebSocket bridge with the token set are
-//     unverified, and any program on the computer can reach loopback ports
-//     (with the token it also needs the per-launch secret).
+//     frame to the server. With the token set, calls over agy's WebSocket
+//     bridge without it were refused too (agy 1.5.9, probe §10). What remains
+//     accepted: the variable is undocumented (a later agy could ignore it, so
+//     each certified agy version is re-checked with the port check),
+//     streaming calls, agy's non-RPC web routes and most call types are
+//     untested with the token, and any program on the computer can reach
+//     loopback ports (with the token it also needs the per-launch secret).
 // -----------------------------------------------------------------------------
 
 package main

@@ -83,3 +83,22 @@ func TestACPDriversAreRepublishedWhenTheListChanges(t *testing.T) {
 		t.Fatalf("cached drivers after the downgrade = %v", got)
 	}
 }
+
+// The follow-up ledger's installed version for OpenCode and Antigravity is the
+// ACP driver's: a CLI the driver does not run has no live version at all.
+func TestLiveFollowUpInstalledVersionReadsTheACPDriver(t *testing.T) {
+	pinACPDriverBinaries(t, map[string]acpDriverBinary{
+		opencodeCliAgentID:    installedACPBinary("/b/opencode", "2.3.0"),
+		antigravityCliAgentID: installedACPBinary("/b/agy", "1.5.9"),
+	})
+	if v := liveFollowUpInstalledVersion(opencodeCliAgentID); v != "2.3.0" {
+		t.Fatalf("opencode = %q", v)
+	}
+	if v := liveFollowUpInstalledVersion(antigravityCliAgentID); v != "1.5.9" {
+		t.Fatalf("antigravity = %q", v)
+	}
+	pinACPDriverBinaries(t, map[string]acpDriverBinary{opencodeCliAgentID: installedACPBinary("/b/opencode", "1.19.5")})
+	if v := liveFollowUpInstalledVersion(opencodeCliAgentID); v != "" {
+		t.Fatalf("a 1.x OpenCode reads as live version %q", v)
+	}
+}

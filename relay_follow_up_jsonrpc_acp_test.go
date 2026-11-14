@@ -406,3 +406,24 @@ func TestTheACPTrackerFollowsTheSessionSetup(t *testing.T) {
 		t.Fatal("an unwritten prompt reads as a running turn")
 	}
 }
+
+// The stdin-boundary half of the idle fence: with no client prompt running,
+// the tracker admits no live write, whatever the earlier check saw.
+func TestTheACPTrackerAdmitsNoLiveWriteWithoutARunningPrompt(t *testing.T) {
+	for _, kind := range []string{opencodeCliAgentID, antigravityCliAgentID} {
+		tr := newLiveFollowUpTrackerFor(kind)
+		fence := func(s liveWriteState) string {
+			if s.NoActiveTurn {
+				return followUpReasonNoActiveTurn
+			}
+			return ""
+		}
+		if ch, reason := tr.admitLiveWrite("relay-followup-x", "x", "t", fence); ch != nil || reason != followUpReasonNoActiveTurn {
+			t.Fatalf("%s: admitted with no prompt running (reason %q)", kind, reason)
+		}
+		tr.outbound(`{"jsonrpc":"2.0","id":"p","method":"session/prompt","params":{}}`).done(true)
+		if ch, reason := tr.admitLiveWrite("relay-followup-y", "y", "t", fence); ch == nil || reason != "" {
+			t.Fatalf("%s: refused with a prompt running (reason %q)", kind, reason)
+		}
+	}
+}
