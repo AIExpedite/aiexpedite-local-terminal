@@ -1025,14 +1025,19 @@ func (m *GrokACPManager) removeSessionIfSame(id string, s *GrokACPSession) bool 
 // readStream forwards every grok stdout frame as `grok_acp_message` and
 // every stderr line as `grok_acp_stderr`. stdout frames are validated as
 // JSON (so a malformed frame is surfaced as `grok_acp_error` instead of
-// being silently passed through), but the original line text is forwarded
-// verbatim — we never edit grok's wire format.
+// being silently passed through), and the original line text is forwarded
+// verbatim, with ONE exception: consecutive reply chunks are merged into one
+// frame (grok_acp_chunk_merge.go), so the prompt answer that ends a turn no
+// longer queues behind every one of them. One frame can be delayed but never
+// edited: a prompt answer the live follow-up tracker holds while a stranded
+// interjection runs as a turn of its own (relay_follow_up_jsonrpc.go).
 //
 // Publishing uses a single ordered consumer goroutine that drains a bounded
 // queue. Every frame in the Grok ACP stdio protocol is a stateful JSON-RPC
 // message (a response correlated by id, a session/update notification, an
 // approval request); silently dropping one would corrupt the orchestrator's
-// session state.
+// session state. Both readers enqueue through the merger's lock, and a frame
+// takes its seq there, so the seqs follow the queue order with no gaps.
 func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFunc) {
 	defer close(session.streamDone)
 
@@ -1108,9 +1113,12 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 		return true
 	}
 
-	// publishMessage publishes one stdout frame verbatim. Its seq is taken here,
-	// so a prompt answer the live follow-up tracker held back takes one later
-	// than every frame read before its release.
+	// Every frame of the session goes through the merger: a message chunk may
+	// wait in it (up to grokChunkMergeDelay), and any other frame is published
+	// after it. A frame's seq is taken where it is published, under the
+	// merger's lock, so seqs follow the queue order — and a prompt answer the
+	// live follow-up tracker held back takes one later than every frame read
+	// before its release.
 	publishMessage := func(line string) bool {
 		seq := atomic.AddInt64(&session.seq, 1)
 		return publishOrFail(resultMsg{
@@ -1126,18 +1134,24 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 			Seq:         int(seq),
 		}, "grok_acp_message")
 	}
+	merger := newGrokChunkMerger(publishMessage)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
+		// Whatever the reader stops on, the held text goes out first.
+		defer merger.close()
 		// Live follow-ups (relay_follow_up_jsonrpc.go): the tracker reads every
-		// frame and may hold one prompt answer back while a stranded
-		// interjection runs (L1/L2 spec §2.8), releasing it through
-		// publishMessage. At EOF it publishes what it still holds, so before
-		// grok_acp_ended; after a fatal stop it publishes nothing more.
-		session.liveFollowUps.attachPublisher(publishMessage)
+		// frame that is not a reply chunk, and may hold one prompt answer back
+		// while a stranded interjection runs (L1/L2 spec §2.8). It releases it
+		// through the merger, after any reply text read before it. At EOF it
+		// publishes what it still holds, so before grok_acp_ended; after a
+		// fatal stop it publishes nothing more.
+		session.liveFollowUps.attachPublisher(func(line string) bool {
+			return merger.emit(func() bool { return publishMessage(line) })
+		})
 		defer session.liveFollowUps.readerDone(false)
 		scanner := bufio.NewScanner(session.Stdout)
 		scanner.Buffer(make([]byte, 0, 256*1024), grokACPMaxLineSize)
@@ -1153,6 +1167,7 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 			}
 
 			if len(trimmed) > grokACPMaxFrameSize {
+				merger.close()
 				failSessionFatally(
 					fmt.Sprintf(
 						"grok emitted a %d-byte frame exceeding the %d-byte publishable limit — session terminated to avoid silent drop",
@@ -1167,20 +1182,22 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 			if err := json.Unmarshal([]byte(trimmed), &probe); err != nil {
 				fmt.Printf("%s[grok-acp] Non-JSON stdout frame on %s: %v (line=%s)%s\n",
 					colorRed, session.ID, err, truncateString(trimmed, 200), colorReset)
-				seq := atomic.AddInt64(&session.seq, 1)
-				if !publishOrFail(resultMsg{
-					ID:          session.ID,
-					WorkspaceID: session.WorkspaceID,
-					UID:         session.UID,
-					Output:      fmt.Sprintf("non-JSON frame on grok acp stdout: %v", err),
-					Status:      "error",
-					Ts:          time.Now().UnixMilli(),
-					Version:     Version,
-					Type:        "grok_acp_error",
-					BootID:      agentBootID,
-					SessionID:   session.ID,
-					Seq:         int(seq),
-				}, "grok_acp_error") {
+				if !merger.emit(func() bool {
+					seq := atomic.AddInt64(&session.seq, 1)
+					return publishOrFail(resultMsg{
+						ID:          session.ID,
+						WorkspaceID: session.WorkspaceID,
+						UID:         session.UID,
+						Output:      fmt.Sprintf("non-JSON frame on grok acp stdout: %v", err),
+						Status:      "error",
+						Ts:          time.Now().UnixMilli(),
+						Version:     Version,
+						Type:        "grok_acp_error",
+						BootID:      agentBootID,
+						SessionID:   session.ID,
+						Seq:         int(seq),
+					}, "grok_acp_error")
+				}) {
 					return
 				}
 				continue
@@ -1214,10 +1231,16 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 			// Agents card stays Unknown for the primary Grok flow.
 			captureGrokUsageLimitLine(trimmed, time.Now(), session.limitNoticeScope)
 
+			if chunk, ok := parseGrokMessageChunk(trimmed); ok {
+				if !merger.add(chunk) {
+					return
+				}
+				continue
+			}
 			if session.liveFollowUps.inbound(trimmed) {
 				continue
 			}
-			if !publishMessage(trimmed) {
+			if !merger.emit(func() bool { return publishMessage(trimmed) }) {
 				return
 			}
 			if !session.liveFollowUps.publishReleased() {
@@ -1228,13 +1251,16 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 		if err := scanner.Err(); err != nil {
 			fmt.Printf("%s[grok-acp] stdout scanner error for %s: %v%s\n",
 				colorRed, session.ID, err, colorReset)
+			merger.close()
 			failSessionFatally(
 				fmt.Sprintf("grok stdout scanner error: %v — session terminated", err),
 				"grok_acp_scanner_error",
 			)
 		}
-		fmt.Printf("%s[grok-acp] stdout scanner done for %s (%d lines)%s\n",
-			colorYellow, session.ID, lineCount, colorReset)
+		merger.close()
+		merged, frames := merger.counts()
+		fmt.Printf("%s[grok-acp] stdout scanner done for %s (%d lines; %d reply chunks merged into %d frames)%s\n",
+			colorYellow, session.ID, lineCount, merged, frames, colorReset)
 	}()
 
 	go func() {
@@ -1248,22 +1274,27 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 			if strings.TrimSpace(line) == "" {
 				continue
 			}
-			seq := atomic.AddInt64(&session.seq, 1)
 			fmt.Printf("%s[grok-acp] stderr %s: %s%s\n",
 				colorYellow, session.ID, truncateString(line, 200), colorReset)
-			if !publishOrFail(resultMsg{
-				ID:          session.ID,
-				WorkspaceID: session.WorkspaceID,
-				UID:         session.UID,
-				Output:      line,
-				Status:      "success",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Type:        "grok_acp_stderr",
-				SessionID:   session.ID,
-				Seq:         int(seq),
-			}, "grok_acp_stderr") {
-				return
+			// After any reply text read before it, never ahead of it. Once the
+			// session has failed nothing more is published, but stderr is
+			// still drained to EOF so nothing writing to it can block.
+			if !merger.emit(func() bool {
+				seq := atomic.AddInt64(&session.seq, 1)
+				return publishOrFail(resultMsg{
+					ID:          session.ID,
+					WorkspaceID: session.WorkspaceID,
+					UID:         session.UID,
+					Output:      line,
+					Status:      "success",
+					Ts:          time.Now().UnixMilli(),
+					Version:     Version,
+					Type:        "grok_acp_stderr",
+					SessionID:   session.ID,
+					Seq:         int(seq),
+				}, "grok_acp_stderr")
+			}) {
+				continue
 			}
 		}
 		if err := scanner.Err(); err != nil {

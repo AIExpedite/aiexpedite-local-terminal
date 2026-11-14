@@ -98,7 +98,10 @@ const (
 	followUpReasonUnseen               = "unseen"
 	followUpReasonLedgerFull           = "ledgerFull"
 
-	// CLI_AGENT_IDS.CLAUDE_CODE. Codex and Grok's ids are in relay_follow_up_jsonrpc.go.
+	// CLI_AGENT_IDS.CLAUDE_CODE. Codex and Grok's ids are in
+	// relay_follow_up_jsonrpc.go: their app-server and ACP children keep stdin
+	// open for the whole session too, and take a live follow-up as a JSON-RPC
+	// request once certified (liveFollowUpCertified).
 	claudeCodeCliAgentID = "claudeCode"
 
 	followUpProcessedInCurrent = "current"
