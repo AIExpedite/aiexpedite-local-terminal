@@ -22,7 +22,10 @@ package main
 //   - `--session-id <uuid>` resumes EXACTLY (a non-UUID exits 2). The id is
 //     CALLER-SUPPLIED and an unknown id silently CREATES a session, so the manager mints the UUID per
 //     logical chat (spec.MintNativeID) and publishes it only after a turn under
-//     it succeeds. Interactive `muse resume` is never used.
+//     it succeeds. A resume whose session is gone is created the same way,
+//     with exit 0; the run's first record shows it (museCodeRunCreatedSession)
+//     and the turn is recovered by the bounded replay, never run blank.
+//     Interactive `muse resume` is never used.
 //   - `--disable-approval` skips approval prompts but KEEPS the sandbox. A
 //     remote chat user cannot answer a prompt on the workstation, so a headless
 //     turn must not block on one; `--yolo` (which also drops the sandbox) is
@@ -86,6 +89,7 @@ var museCodeNativeSpec = &oneShotNativeSpec{
 	LooksLikeMissingSession: func(stdout, stderr string) bool {
 		return looksLikeMissingMuseCodeSession(stdout, stderr)
 	},
+	RunCreatedSession: museCodeRunCreatedSession,
 	ObserveTurn: func(stdout, stderr string) {
 		observeMuseCodeAuthOutput(stdout+"\n"+stderr, time.Now())
 	},
@@ -357,10 +361,39 @@ func firstPositive(values ...int) int {
 	return 0
 }
 
+// museCodeRunCreatedSession reports whether a run that was given sessionID
+// to RESUME was instead given a new session under it. Muse Code creates a
+// session for an id it has no record of, a gone one included, and exits 0
+// with no warning on stdout or stderr (reproduced on 1.4.18, 2026-11-13: a
+// session whose folders were deleted, with the echo and the meta provider).
+// Its own first record says which it was: the run's
+// `runtime.command.accepted` on the session stream carries `sequence` 1 only
+// in a session the run created; in a session it resumed it carries the
+// session's count of runs (2 and 3 for the second and third). Read from that
+// record's own fields, never from text, and only from the run's first line.
+func museCodeRunCreatedSession(firstLine, sessionID string) bool {
+	var rec struct {
+		Stream struct {
+			Kind string `json:"kind"`
+			ID   string `json:"id"`
+		} `json:"stream"`
+		Sequence    *int64 `json:"sequence"`
+		PayloadType string `json:"payload_type"`
+	}
+	if err := json.Unmarshal([]byte(firstLine), &rec); err != nil {
+		return false
+	}
+	return rec.PayloadType == "runtime.command.accepted" &&
+		rec.Stream.Kind == "session" &&
+		strings.EqualFold(rec.Stream.ID, sessionID) &&
+		rec.Sequence != nil && *rec.Sequence == 1
+}
+
 // looksLikeMissingMuseCodeSession recognizes a stale-resume failure. Muse Code
-// normally CREATES a session for an unknown id (and warns about a missing
-// predecessor since 1.2.1), so this fires only on a non-zero exit — the core
-// already requires one — to stay clear of assistant text quoting the phrase.
+// normally CREATES a session for an unknown id (museCodeRunCreatedSession reads
+// that case from its first record; no warning accompanies it on 1.4.18), so
+// this fires only on a non-zero exit — the core already requires one — to stay
+// clear of assistant text quoting the phrase.
 func looksLikeMissingMuseCodeSession(stdout, stderr string) bool {
 	combined := strings.ToLower(stdout + "\n" + stderr)
 	for _, needle := range []string{
