@@ -178,6 +178,11 @@ func TestMain(m *testing.M) {
 	// exercise keep-awake install their own fake (helperFakeKeepAwake).
 	globalKeepAwake.acquire = func(func(error)) (func(), error) { return func() {}, nil }
 	globalKeepAwake.logf = func(string, ...any) {}
+	// …and the ACP-driver capability is never re-read on a background
+	// goroutine that could outlive the test that triggered it (a usage
+	// refresh, a too-old START) and race the next test's seams. The cases
+	// that exercise the trigger pin it (systemInfo_acp_test.go).
+	scheduleACPDriversRefresh = func() {}
 
 	// Confine every config/data write in this package to a throwaway directory
 	// BEFORE any test runs. Without this, anything that persists through

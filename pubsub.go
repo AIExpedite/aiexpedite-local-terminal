@@ -1784,7 +1784,7 @@ func prepareCLIUsageRefreshResult(secret, refreshID string, challengeTs int64, s
 		// The refresh re-read every CLI's version: a newly installed or
 		// updated OpenCode can change which ACP drivers this computer runs.
 		// Off this goroutine, and a no-op unless the list changed.
-		go refreshACPDriversCapability()
+		scheduleACPDriversRefresh()
 	}
 	return receipt, normalizedUsage, normalizedErrors, err
 }

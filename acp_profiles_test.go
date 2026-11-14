@@ -14,9 +14,15 @@ import (
 // agent id) for one test; an agent missing from bins reads as not installed.
 func pinACPDriverBinaries(t *testing.T, bins map[string]acpDriverBinary) {
 	t.Helper()
-	prev := readACPDriverBinary
-	readACPDriverBinary = func(p *acpAgentProfile) acpDriverBinary { return bins[p.cliAgentID] }
-	t.Cleanup(func() { readACPDriverBinary = prev })
+	acpDriverBinaryReaderMu.Lock()
+	prev := acpDriverBinaryReader
+	acpDriverBinaryReader = func(p *acpAgentProfile) acpDriverBinary { return bins[p.cliAgentID] }
+	acpDriverBinaryReaderMu.Unlock()
+	t.Cleanup(func() {
+		acpDriverBinaryReaderMu.Lock()
+		acpDriverBinaryReader = prev
+		acpDriverBinaryReaderMu.Unlock()
+	})
 }
 
 func installedACPBinary(path, version string) acpDriverBinary {

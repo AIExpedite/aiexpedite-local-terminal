@@ -3,6 +3,7 @@ package main
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestACPDriversListOnlyAgentsWhoseCLIQualifies(t *testing.T) {
@@ -100,5 +101,47 @@ func TestLiveFollowUpInstalledVersionReadsTheACPDriver(t *testing.T) {
 	pinACPDriverBinaries(t, map[string]acpDriverBinary{opencodeCliAgentID: installedACPBinary("/b/opencode", "1.19.5")})
 	if v := liveFollowUpInstalledVersion(opencodeCliAgentID); v != "" {
 		t.Fatalf("a 1.x OpenCode reads as live version %q", v)
+	}
+}
+
+// pinACPDriversRefresh counts the capability re-reads scheduled during a test.
+func pinACPDriversRefresh(t *testing.T) *int {
+	t.Helper()
+	n := 0
+	prev := scheduleACPDriversRefresh
+	scheduleACPDriversRefresh = func() { n++ }
+	t.Cleanup(func() { scheduleACPDriversRefresh = prev })
+	return &n
+}
+
+// A START that finds the CLI below its driver's minimum re-reads the drivers,
+// so terminal-service stops choosing a driver this computer cannot run.
+func TestATooOldStartRepublishesTheDrivers(t *testing.T) {
+	scheduled := pinACPDriversRefresh(t)
+	pinACPDriverBinaries(t, map[string]acpDriverBinary{opencodeCliAgentID: installedACPBinary("/b/opencode", "2.3.0")})
+	if _, err := prepareACPDriverBinary(openCodeACPProfile, "OpenCode"); err != nil || *scheduled != 0 {
+		t.Fatalf("an eligible CLI: %v, %d re-reads", err, *scheduled)
+	}
+	pinACPDriverBinaries(t, map[string]acpDriverBinary{opencodeCliAgentID: installedACPBinary("/b/opencode", "2.2.6")})
+	if _, err := prepareACPDriverBinary(openCodeACPProfile, "OpenCode"); err == nil || *scheduled != 1 {
+		t.Fatalf("a too-old CLI: %v, %d re-reads", err, *scheduled)
+	}
+}
+
+// A successful CLI usage refresh re-read every CLI's version, so it re-reads
+// the drivers too.
+func TestAUsageRefreshRepublishesTheDrivers(t *testing.T) {
+	scheduled := pinACPDriversRefresh(t)
+	if _, _, _, err := prepareCLIUsageRefreshResult("secret", "refresh-1", time.Now().UnixMilli(), true, []cliAgentUsage{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if *scheduled != 1 {
+		t.Fatalf("%d re-reads after a usage refresh", *scheduled)
+	}
+	if _, _, _, err := prepareCLIUsageRefreshResult("secret", "refresh-2", time.Now().UnixMilli(), false, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if *scheduled != 1 {
+		t.Fatal("a failed usage refresh re-read the drivers")
 	}
 }

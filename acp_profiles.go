@@ -80,6 +80,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -366,7 +367,21 @@ type acpDriverBinary struct {
 // and the CLI Agents card do, and reads its version through that same cached
 // probe (so a steady state spawns no `--version` child). An OpenCode npm
 // launcher is never probed: it is the 1.x line, refused whatever it says.
-var readACPDriverBinary = func(p *acpAgentProfile) acpDriverBinary {
+func readACPDriverBinary(p *acpAgentProfile) acpDriverBinary {
+	acpDriverBinaryReaderMu.RLock()
+	read := acpDriverBinaryReader
+	acpDriverBinaryReaderMu.RUnlock()
+	return read(p)
+}
+
+// acpDriverBinaryReader is readACPDriverBinary's source, swappable by a test
+// under its lock (a machine-info gather can read it from another goroutine).
+var (
+	acpDriverBinaryReaderMu sync.RWMutex
+	acpDriverBinaryReader   = readInstalledACPDriverBinary
+)
+
+func readInstalledACPDriverBinary(p *acpAgentProfile) acpDriverBinary {
 	var path string
 	switch p.cliAgentID {
 	case opencodeCliAgentID:
@@ -420,7 +435,7 @@ func prepareACPDriverBinary(p *acpAgentProfile, displayName string) (acpDriverBi
 	if acpDriverEligible(p, b) {
 		return b, nil
 	}
-	go refreshACPDriversCapability()
+	scheduleACPDriversRefresh()
 	minVersion := acpDriverMinVersion(p)
 	msg := fmt.Sprintf("%s %s is older than %s, the oldest that runs on this driver — update %s, or reinstall it", displayName, orUnknown(b.version), minVersion, displayName)
 	if b.shim {
@@ -621,6 +636,12 @@ func sameACPDrivers(a, b *acpDriversCapability) bool {
 	}
 	return true
 }
+
+// scheduleACPDriversRefresh runs refreshACPDriversCapability off the caller's
+// goroutine: a version probe of another CLI must never hold a START or a
+// usage refresh. A var so the test suite can keep it from outliving the test
+// that triggered it (TestMain); refreshACPDriversCapability is tested directly.
+var scheduleACPDriversRefresh = func() { go refreshACPDriversCapability() }
 
 // refreshACPDriversCapability re-reads the installed CLIs and, when the list
 // changed, folds it into the cached MachineInfo and sends it to the backend
