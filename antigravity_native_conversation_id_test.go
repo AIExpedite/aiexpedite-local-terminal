@@ -32,6 +32,9 @@ const (
 	mockAgyScrapeCwdEnv = "TEST_MOCK_AGY_SCRAPE_CWD"
 	// A delegated subagent's conversation, carried on a step_update.
 	mockAgySubagentConversationID = "99999999-9999-4999-8999-999999999999"
+	// When set, a run asked to resume (`--conversation <id>`) answers that
+	// the conversation is gone, as agy does for one it no longer has.
+	mockAgyResumeGoneEnv = "TEST_MOCK_AGY_RESUME_GONE"
 )
 
 func runMockAgyConversationID() {
@@ -45,6 +48,14 @@ func runMockAgyConversationID() {
 	if err := json.Unmarshal(bytes.TrimSpace(data), &input); err != nil || input.Event != "user" {
 		fmt.Println(`{"event":"result","result":{"status":"ERROR","error":"invalid stdin envelope"}}`)
 		os.Exit(1)
+	}
+	if os.Getenv(mockAgyResumeGoneEnv) != "" {
+		for _, arg := range os.Args[1:] {
+			if arg == "--conversation" {
+				fmt.Fprintln(os.Stderr, "Error: conversation not found")
+				os.Exit(1)
+			}
+		}
 	}
 	home, _ := os.UserHomeDir()
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
@@ -209,6 +220,25 @@ func TestAntigravityNativeSend_FallsBackToTheScrapeWhenNoEventNamesTheConversati
 
 	if got := h.send("s1", "hello"); got != agyOwnConversationID {
 		t.Fatalf("an agy that reports no id must still be captured by the scrape, got %q", got)
+	}
+}
+
+// A resume into a conversation agy no longer has falls back to the bounded
+// replay in a NEW conversation; that replay's own reported id is the one the
+// session continues, even with another agy in the folder.
+func TestAntigravityNativeSend_ReplayRecoveryRecordsTheReplaysConversation(t *testing.T) {
+	h := newAntigravityConversationIDHarness(t)
+	t.Setenv(mockAgyResumeGoneEnv, "1")
+	t.Setenv(mockAgyReportIDEnv, agyOwnConversationID)
+	t.Setenv(mockAgyScrapeIDEnv, agyForeignConversationID)
+	h.addSession("s1")
+	s := h.m.Get("s1")
+	s.NativeConversationID = "33333333-3333-4333-8333-333333333333"
+	s.Transcript = appendAntigravityTranscript(nil, "user", "earlier question")
+	s.Transcript = appendAntigravityTranscript(s.Transcript, "assistant", "earlier answer")
+
+	if got := h.send("s1", "follow up"); got != agyOwnConversationID {
+		t.Fatalf("the replay's reported conversation must be recorded, got %q", got)
 	}
 }
 
