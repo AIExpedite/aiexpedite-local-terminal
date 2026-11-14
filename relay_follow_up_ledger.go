@@ -1103,7 +1103,9 @@ func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollo
 		kind, tracker, status, send = grokCliAgentID, target.grok.liveFollowUps, target.grok.Status, globalGrokACPManager.SendAccepting
 		frame, err = grokInterjectFrame(rpcID, cmd.ConversationID, cmd.Input, attemptID)
 	case target.acp != nil && target.acpManager != nil:
-		kind, tracker, status, send = target.acpManager.profile.cliAgentID, target.acp.liveFollowUps, target.acp.Status, target.acpManager.SendAccepting
+		// The device's own frame: written past the client-frame fence, which
+		// no client may use to send OpenCode's steering (sendDeviceFrame).
+		kind, tracker, status, send = target.acpManager.profile.cliAgentID, target.acp.liveFollowUps, target.acp.Status, target.acpManager.sendDeviceFrame
 		switch kind {
 		case opencodeCliAgentID:
 			frame, err = openCodeSteerFrame(rpcID, cmd.ConversationID, cmd.Input)

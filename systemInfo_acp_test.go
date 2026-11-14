@@ -1,0 +1,85 @@
+package main
+
+import (
+	"reflect"
+	"testing"
+)
+
+func TestACPDriversListOnlyAgentsWhoseCLIQualifies(t *testing.T) {
+	cases := []struct {
+		name string
+		bins map[string]acpDriverBinary
+		want []string
+	}{
+		{"nothing installed", nil, []string{}},
+		{"opencode 2.2.7", map[string]acpDriverBinary{opencodeCliAgentID: installedACPBinary("/b/opencode", "2.2.7")}, []string{"opencode"}},
+		{"opencode 2.2.6", map[string]acpDriverBinary{opencodeCliAgentID: installedACPBinary("/b/opencode", "2.2.6")}, []string{}},
+		{"opencode 1.19.5", map[string]acpDriverBinary{opencodeCliAgentID: installedACPBinary("/b/opencode", "1.19.5")}, []string{}},
+		{"opencode npm launcher", map[string]acpDriverBinary{opencodeCliAgentID: {path: `C:\n\opencode.cmd`, found: true, shim: true, version: "2.3.0"}}, []string{}},
+		{"agy 1.5.4", map[string]acpDriverBinary{antigravityCliAgentID: installedACPBinary("/b/agy", "1.5.4")}, []string{"antigravity"}},
+		{"agy 1.5.3", map[string]acpDriverBinary{antigravityCliAgentID: installedACPBinary("/b/agy", "1.5.3")}, []string{}},
+		{"both", map[string]acpDriverBinary{
+			opencodeCliAgentID:    installedACPBinary("/b/opencode", "2.3.0"),
+			antigravityCliAgentID: installedACPBinary("/b/agy", "1.5.9"),
+		}, []string{"opencode", "antigravity"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pinACPDriverBinaries(t, c.bins)
+			got := newACPDriversCapability()
+			if got.Protocol != 1 || got.Agents == nil || !reflect.DeepEqual(got.Agents, c.want) {
+				t.Fatalf("acpDrivers = %+v, want protocol 1 agents %v", got, c.want)
+			}
+			if !reflect.DeepEqual(newMachineCapabilities().ACPDrivers, got) {
+				t.Fatal("newMachineCapabilities does not report the drivers")
+			}
+		})
+	}
+}
+
+// The owner's decision of 2026-11-14 includes Antigravity, under its
+// mitigation; turning the constant off is the device-side way out.
+func TestAntigravityACPDriverIsIncludedByTheOwnersDecision(t *testing.T) {
+	if !antigravityACPDriverIncluded {
+		t.Fatal("antigravityACPDriverIncluded is off: ANTIGRAVITY_ACP_RISK_ACCEPTANCE.md includes it")
+	}
+	profiles := acpDriverProfiles()
+	if len(profiles) != 2 || profiles[0] != openCodeACPProfile || profiles[1] != antigravityACPProfile {
+		t.Fatalf("drivers = %v", profiles)
+	}
+}
+
+func TestACPDriversAreRepublishedWhenTheListChanges(t *testing.T) {
+	prevCache := machineInfoCache
+	prevHook := onMachineCapabilityAdded
+	t.Cleanup(func() {
+		machineInfoMu.Lock()
+		machineInfoCache = prevCache
+		machineInfoMu.Unlock()
+		onMachineCapabilityAdded = prevHook
+	})
+	sent := 0
+	onMachineCapabilityAdded = func() { sent++ }
+	pinACPDriverBinaries(t, nil)
+	machineInfoMu.Lock()
+	machineInfoCache = &MachineInfo{Capabilities: newMachineCapabilities()}
+	machineInfoMu.Unlock()
+
+	if refreshACPDriversCapability() || sent != 0 {
+		t.Fatal("an unchanged list was sent again")
+	}
+	pinACPDriverBinaries(t, map[string]acpDriverBinary{opencodeCliAgentID: installedACPBinary("/b/opencode", "2.2.7")})
+	if !refreshACPDriversCapability() || sent != 1 {
+		t.Fatalf("an OpenCode upgrade was not sent (sent %d)", sent)
+	}
+	if got := GetMachineInfo().Capabilities.ACPDrivers.Agents; !reflect.DeepEqual(got, []string{"opencode"}) {
+		t.Fatalf("cached drivers = %v", got)
+	}
+	pinACPDriverBinaries(t, map[string]acpDriverBinary{opencodeCliAgentID: installedACPBinary("/b/opencode", "1.19.5")})
+	if !refreshACPDriversCapability() || sent != 2 {
+		t.Fatal("a downgrade was not sent")
+	}
+	if got := GetMachineInfo().Capabilities.ACPDrivers.Agents; len(got) != 0 {
+		t.Fatalf("cached drivers after the downgrade = %v", got)
+	}
+}

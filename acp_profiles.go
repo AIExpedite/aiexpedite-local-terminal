@@ -46,15 +46,32 @@
 //     127.0.0.1:4096 with no password unless the person set one. NEVER run
 //     through ACP: the version gate refuses it, and the npm launcher that
 //     carries the 1.x line is refused outright.
-//   - Antigravity (agy 1.5.4+): `agy acp` listens on two loopback ports of
-//     its own. Included only while antigravityACPDriverIncluded is true,
-//     which follows the security check of those listeners
-//     (AGY_ACP_PORT_PROBE.md: included for SAFE or SAME-AS-TODAY only).
+//   - Antigravity (agy 1.5.4+): `agy acp` runs a language server in-process
+//     on two loopback ports of its own (one HTTPS, one HTTP, random per
+//     launch). The port check of 2026-11-14 found them answering with NO
+//     secret in ACP mode — file read and write, command execution, account
+//     details and conversations, outside agy's own permission prompts — while
+//     the one-shot `agy` guards the same listeners with a per-launch token
+//     (C:/aiexpedite/aixwt/rs/_notes/design/AGY_ACP_PORT_PROBE.md, verdict
+//     UNSAFE). The owner accepted that risk on 2026-11-14 with one required
+//     mitigation (local/documents/security/ANTIGRAVITY_ACP_RISK_ACCEPTANCE.md,
+//     C:/aiexpedite/local/documents/security/ANTIGRAVITY_ACP_RISK_ACCEPTANCE.md):
+//     every `agy acp` is launched with ANTIGRAVITY_SERVER_CSRF_TOKEN set to a
+//     fresh 32-byte crypto/rand value (newAntigravityCSRFToken), which turns
+//     the listeners' token check on. The token goes into agy's child
+//     environment only: never argv, never a log line, never a file, never a
+//     frame to the server. What remains accepted: the variable is
+//     undocumented (a later agy could ignore it, so each certified agy version
+//     is re-checked), calls over the WebSocket bridge with the token set are
+//     unverified, and any program on the computer can reach loopback ports
+//     (with the token it also needs the per-launch secret).
 // -----------------------------------------------------------------------------
 
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -65,10 +82,40 @@ import (
 )
 
 // antigravityACPDriverIncluded decides whether this build runs Antigravity on
-// `agy acp` at all: when false, `antigravity` is never listed in
-// `capabilities.acpDrivers` and an antigravity_acp_start is refused. A
-// one-line change either way (see the header on agy's listeners).
-const antigravityACPDriverIncluded = false
+// `agy acp` at all. ON by the owner's decision of 2026-11-14, which accepts
+// the risk of agy's ACP-mode listeners with the per-launch CSRF token as the
+// required mitigation (local/documents/security/ANTIGRAVITY_ACP_RISK_ACCEPTANCE.md;
+// evidence: aixwt/rs/_notes/design/AGY_ACP_PORT_PROBE.md; see the header).
+//
+// To turn it off, set this to false: `antigravity` is then never listed in
+// `capabilities.acpDrivers` and an antigravity_acp_start is refused, so every
+// Antigravity session stays on the one-shot driver. The server-side switch
+// does the same without a release: remove `antigravity` from
+// terminal-service's TERMINAL_ACP_DRIVER_AGENTS.
+const antigravityACPDriverIncluded = true
+
+// antigravityCSRFTokenEnv is the variable agy's language server reads its
+// per-launch token from (AGY_ACP_PORT_PROBE.md §5, §6.1: set, it makes the
+// listeners refuse every call without it). Undocumented by agy.
+const antigravityCSRFTokenEnv = "ANTIGRAVITY_SERVER_CSRF_TOKEN"
+
+// antigravityExtensionCSRFTokensEnv names further tokens agy would accept;
+// an inherited value is removed, so the per-launch token is the only one.
+const antigravityExtensionCSRFTokensEnv = "ANTIGRAVITY_EXTENSION_SERVER_CSRF_TOKENS"
+
+// antigravityCSRFTokenBytes is the token's size before encoding: 32 bytes
+// (256 bits) from crypto/rand, hex-encoded so it is header-safe.
+const antigravityCSRFTokenBytes = 32
+
+// newAntigravityCSRFToken mints one launch's token. A var so a test can make
+// the random source fail; nothing else replaces it.
+var newAntigravityCSRFToken = func() (string, error) {
+	b := make([]byte, antigravityCSRFTokenBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
 
 // Wire values mirrored from shared-constants 3.23.579 (cliAgentPreference.js
 // CLI_AGENT_IDS, opencode.js, antigravity.js, residentKindsWire.js).
@@ -407,7 +454,46 @@ func prepareAntigravityACPLaunch(req acpLaunchRequest) (acpLaunch, error) {
 	if err != nil {
 		return acpLaunch{}, err
 	}
-	return acpLaunch{executable: b.path, env: sanitizeAntigravityEnv(os.Environ()), version: b.version, versionKey: b.key}, nil
+	env, err := antigravityACPEnv(os.Environ())
+	if err != nil {
+		return acpLaunch{}, err
+	}
+	return acpLaunch{executable: b.path, env: env, version: b.version, versionKey: b.key}, nil
+}
+
+// antigravityACPEnv is the `agy acp` child's environment: the one-shot
+// driver's sanitiser, no inherited CSRF tokens, and a fresh per-launch
+// ANTIGRAVITY_SERVER_CSRF_TOKEN (the required mitigation; see the header).
+// A launch whose token cannot be minted is refused: agy's listeners would
+// otherwise answer without one.
+func antigravityACPEnv(env []string) ([]string, error) {
+	env = sanitizeAntigravityEnv(env)
+	env = stripEnvNames(env, antigravityExtensionCSRFTokensEnv)
+	token, err := newAntigravityCSRFToken()
+	if err != nil || token == "" {
+		return nil, fmt.Errorf("could not create the per-launch token agy acp needs to protect its local ports: %v", err)
+	}
+	return setEnvVar(env, antigravityCSRFTokenEnv, token), nil
+}
+
+// stripEnvNames removes every entry for the named variables (names compared
+// as setEnvVar does).
+func stripEnvNames(env []string, names ...string) []string {
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		name, _, _ := strings.Cut(e, "=")
+		drop := false
+		for _, n := range names {
+			if envNameEqual(name, n) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 /* --------------------------------------------------------------------------

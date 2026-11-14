@@ -755,6 +755,22 @@ func (m *ACPManager) Send(id string, payload string) error {
 // A relayed voice turn records `accepted` in the durable turn inbox there
 // (relay_turn_inbox.go); an accept error refuses the turn.
 func (m *ACPManager) SendAccepting(id string, payload string, accept func() error) error {
+	return m.sendAccepting(id, payload, accept, false)
+}
+
+// sendDeviceFrame writes a frame the DEVICE built (a live follow-up's
+// `_session/steering` or `session/prompt`, relay_follow_up_jsonrpc.go) under
+// the follow-up ledger's acceptor. It skips the client-frame fence, which
+// governs what terminal-service may send: OpenCode's steering is exactly the
+// request no client may send, because only the ledger writes it, under its
+// own fences (an outstanding prompt, no open permission, the signed ACP
+// session). Everything else — the single-line JSON object check, the status
+// re-check under stdinMu, the write timeout — is Send's.
+func (m *ACPManager) sendDeviceFrame(id string, payload string, accept func() error) error {
+	return m.sendAccepting(id, payload, accept, true)
+}
+
+func (m *ACPManager) sendAccepting(id string, payload string, accept func() error, deviceBuilt bool) error {
 	p := m.profile
 	session := m.Get(id)
 	if session == nil {
@@ -792,14 +808,17 @@ func (m *ACPManager) SendAccepting(id string, payload string, accept func() erro
 	// synthetic test fixtures). For OpenCode and Antigravity the whole frame
 	// goes through the family's allowlist too (acp_fence.go); Grok keeps its
 	// setup-cwd gate alone.
+	// The ledger's own frame (sendDeviceFrame) takes no client fence.
 	var fenceCheck acpFenceCheck
-	if session.fence != nil {
+	switch {
+	case deviceBuilt:
+	case session.fence != nil:
 		check, err := session.fence.check(trimmed, session.WorkspaceRoot)
 		if err != nil {
 			return err
 		}
 		fenceCheck = check
-	} else if session.WorkspaceRoot != "" {
+	case session.WorkspaceRoot != "":
 		if err := validateGrokACPSendCwd(trimmed, session.WorkspaceRoot); err != nil {
 			return err
 		}

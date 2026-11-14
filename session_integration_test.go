@@ -232,6 +232,9 @@ func runMockCLI(mode string) {
 	case mockCLIWarmupMode:
 		os.Exit(0)
 
+	case mockACPDriverMode:
+		runMockACPDriver()
+
 	case "opencode":
 		// The OpenCode usage parser probes `opencode models` and
 		// `opencode auth list`. Replay the exact output a real 1.18.15 install

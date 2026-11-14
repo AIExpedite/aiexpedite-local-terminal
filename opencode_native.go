@@ -19,6 +19,22 @@ package main
 //     round-trips via `serve` would be a follow-up behind this same session
 //     kind.
 //
+//   - `opencode acp` (OpenCode 2.2.7+, acp_profiles.go) is the long-lived
+//     driver that gives OpenCode approvals, live follow-ups and exact resume
+//     WITHOUT that listener of ours: it is a stdio child like every other
+//     driver. It does start a loopback server of its own (`opencode serve
+//     --stdio --port 0`), and the owner accepted that on 2026-11-14 ("best
+//     practice"): what listens is OpenCode's private child server; OpenCode
+//     owns it; it is bound to 127.0.0.1 on a random port, guarded by a
+//     256-bit password OpenCode mints per launch, and lives only as long as
+//     its stdin. AI Expedite allocates, binds and connects to nothing: it
+//     never passes a hostname or a port. OpenCode 1.x never runs through
+//     ACP: its `acp` hosts an UNAUTHENTICATED server in-process on
+//     127.0.0.1:4096 (L3/L4 spec W-O20), so the version gate refuses it and
+//     its npm launcher is refused outright. This driver serves every computer
+//     whose OpenCode is older, and every session terminal-service starts on
+//     the one-shot kind.
+//
 //   - Unlike `agy --print` (complete-only output), `opencode run --format json`
 //     emits INCREMENTAL JSON events on stdout. Each line is published as its
 //     own opencode_native_message frame so the frontend renders text deltas and

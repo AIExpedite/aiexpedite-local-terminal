@@ -42,6 +42,9 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 		{"both failed", nil, nil},
 		{"memory reported zero", &cpuInfo{Cores: 4, Threads: 8}, &memoryInfo{TotalGB: 0}},
 	}
+	// The ACP drivers listed depend on the CLIs installed on the host, so the
+	// pin reads them as absent; systemInfo_acp_test.go covers the list.
+	pinACPDriverBinaries(t, nil)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			caps := newMachineCapabilities()
@@ -82,8 +85,10 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// `nativeLaunchArgs` with the one-shot managers applying a START's
 			// model and effort to every turn; `openCodeAuthRefusalFrame` with an
 			// OpenCode turn that fails on a missing provider key naming the
-			// provider in its error frame.
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`}` {
+			// provider in its error frame; `acpDrivers` with OpenCode and
+			// Antigravity on their long-lived ACP drivers (always present, an
+			// empty list when no installed CLI qualifies).
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]}}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})
