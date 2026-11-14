@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -85,6 +86,15 @@ func TestCodexLiveFollowUpCertification(t *testing.T) {
 			reply = `{"jsonrpc":"2.0","id":` + string(f.ID) + `,"result":{"decision":"decline"}}`
 		}
 		go func() { _ = client.send(reply) }()
+	}
+	// The test binary moves HOME and USERPROFILE into a sandbox at startup
+	// (test_environment_test.go), and the manager hands that environment to the
+	// child, so a Codex signed in through its default home would start with no
+	// login. Point it at the person's real Codex home: CODEX_HOME when they set
+	// one, else the home directory as it was before the sandbox. The thread is
+	// ephemeral, so no rollout is written there.
+	if os.Getenv("CODEX_HOME") == "" {
+		t.Setenv("CODEX_HOME", filepath.Join(realHomeAtStartup, ".codex"))
 	}
 	cwd := t.TempDir()
 	if err := m.Start(sid, cwd, codexCertOverrides, "ws-cert", "uid-cert", client.publish); err != nil {
