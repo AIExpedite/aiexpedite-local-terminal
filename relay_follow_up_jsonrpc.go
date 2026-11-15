@@ -131,6 +131,10 @@ const (
 	// it does not have (L3/L4 spec W-O12).
 	openCodeSessionNotFound = "session not found"
 
+	// ACP's stopReason for a turn that ended normally; agy also answers a
+	// prompt it hands its turn over from with it (acpHandoverAnswer).
+	acpStopReasonEndTurn = "end_turn"
+
 	// RELAY_TURN_PROMPT_RPC_ID_PREFIX: an Antigravity follow-up's prompt is
 	// `relay-turn-fu_<attemptId>` (relayPromptRpcId(relayFollowUpTurnId(…))),
 	// so a follow-up agy runs as a turn of its own settles under the id
@@ -456,11 +460,27 @@ type liveFollowUpAnswer struct {
 	ExpectedTurnID string
 }
 
-// acpHandoverAnswer reports an Antigravity prompt answer that hands its turn
-// over to the follow-up prompt written while it ran: a success with no
-// `usage` (W-A5; agy's normal end of a turn carries it). Anything else — a
-// success with `usage`, an error — ended that prompt's turn, so the
-// follow-up runs as the next turn.
+// acpHandoverAnswer reports an Antigravity prompt answer, read after the
+// device wrote a follow-up prompt while that prompt ran, that hands its turn
+// over to the follow-up: a success with stopReason `end_turn` (W-A5). agy
+// answers the running prompt the moment the new one arrives and carries the
+// turn on under it — its tools still running, the follow-up echoed at the
+// next step boundary.
+//
+// `usage` does not tell the two apart. The spec's reading (W-A9: a handover
+// answer has none, a normal end always has it) held only while no model step
+// of the turn had finished: certification on agy 1.5.9 (2026-11-15) recorded
+// a handover answered 14 ms after the write, mid-command, WITH the usage of
+// the step already done, and the command then finished under the follow-up.
+// Nothing else on the wire marks a handover, so every `end_turn` read after
+// the write is one. The only other way to read one — the turn ended on its own
+// and its answer crossed the write in the pipe, so agy runs the follow-up as
+// the next turn — ends the same way: the turn is settled by the follow-up
+// prompt's answer, with one reply for both.
+//
+// Anything else — an error, another stopReason (`cancelled`, `refusal`,
+// `max_tokens`), a success with none — ended that prompt's turn for a reason
+// of its own, so the follow-up runs as the next turn.
 func acpHandoverAnswer(frame string) bool {
 	var answer struct {
 		Result json.RawMessage `json:"result"`
@@ -469,12 +489,13 @@ func acpHandoverAnswer(frame string) bool {
 	if json.Unmarshal([]byte(frame), &answer) != nil || len(answer.Error) > 0 || len(answer.Result) == 0 {
 		return false
 	}
-	var result map[string]json.RawMessage
-	if json.Unmarshal(answer.Result, &result) != nil || result == nil {
+	var result struct {
+		StopReason string `json:"stopReason"`
+	}
+	if json.Unmarshal(answer.Result, &result) != nil {
 		return false
 	}
-	_, usage := result["usage"]
-	return !usage
+	return result.StopReason == acpStopReasonEndTurn
 }
 
 // acpTrackedPrompt is one client `session/prompt` on an OpenCode or

@@ -280,24 +280,30 @@ func TestNoOpenCodeSteerIsWrittenWhenFenced(t *testing.T) {
 
 /* --- Antigravity: a second `session/prompt` that takes the turn over --- */
 
-// The fake agy answers the running prompt the moment the follow-up prompt
-// arrives (W-A5), with `usage` (a normal end) or without (a handover).
-func agyAnswersRunningPrompt(usage bool) func(f jsonRPCFrame, line string) []string {
+// The fake agy answers the running prompt with `answer` the moment the
+// follow-up prompt arrives (W-A5).
+func agyAnswersRunningPrompt(answer string) func(f jsonRPCFrame, line string) []string {
 	return func(f jsonRPCFrame, line string) []string {
 		if id, _ := f.stringID(); f.Method == acpMethodSessionPrompt && strings.HasPrefix(id, "relay-turn-fu_") {
-			if usage {
-				return []string{promptT1Answer}
-			}
-			return []string{`{"result":{"stopReason":"end_turn"},"id":"relay-turn-t1"}`}
+			return []string{answer}
 		}
 		return nil
 	}
 }
 
+// agy's answers to the running prompt, as recorded: a handover before any
+// model step of the turn finished carries no usage (agy 1.5.8, W-A5); one
+// after a step finished carries that step's usage (agy 1.5.9, certification
+// 2026-11-15: answered 14 ms after the follow-up was written, mid-command).
+const (
+	agyHandoverAnswer          = `{"jsonrpc":"2.0","result":{"stopReason":"end_turn"},"id":"relay-turn-t1"}`
+	agyHandoverAnswerWithUsage = `{"jsonrpc":"2.0","result":{"stopReason":"end_turn","usage":{"inputTokens":2266,"outputTokens":59,"cachedReadTokens":9429,"cachedWriteTokens":0,"thoughtTokens":0,"totalTokens":11754}},"id":"relay-turn-t1"}`
+)
+
 func TestAnAntigravityFollowUpTakesTheRunningTurnOver(t *testing.T) {
 	h, s := newACPLiveHarness(t, antigravityACPProfile, false)
 	startACPPrompt(t, globalAntigravityACPManager, h, s)
-	h.child.setRespond(agyAnswersRunningPrompt(false))
+	h.child.setRespond(agyAnswersRunningPrompt(agyHandoverAnswer))
 	cmd := h.acpCmd("ag-1", "Also end with STEERED.")
 	h.handle(cmd)
 	h.handle(cmd)
@@ -329,17 +335,45 @@ func TestAnAntigravityFollowUpTakesTheRunningTurnOver(t *testing.T) {
 	}
 }
 
-// The race: the running prompt ended normally before agy took the new one,
-// so agy runs it as the next turn, settled under its own id.
-func TestAnAntigravityFollowUpAfterANormalEndRunsAsTheNextTurn(t *testing.T) {
+// A follow-up written after a model step of the turn finished: agy hands the
+// turn over with that step's usage on the answer, and the turn carries on
+// under the follow-up (its command finished there, certification 2026-11-15).
+// Reading the usage as a normal end settled the person's turn at the
+// handover, mid-task, and moved the rest of its work to a "next" turn.
+func TestAnAntigravityHandoverAfterAFinishedStepStillTakesTheTurnOver(t *testing.T) {
 	h, s := newACPLiveHarness(t, antigravityACPProfile, false)
 	startACPPrompt(t, globalAntigravityACPManager, h, s)
-	h.child.setRespond(agyAnswersRunningPrompt(true))
-	h.handle(h.acpCmd("ag-2", "next"))
-	wantAck(t, h.acks.snapshot()[0], followUpOutcomeWritten, "", followUpProcessedInNext)
-	waitForLive(t, "the turn's answer", func() bool { _, ok := h.messageWithID("antigravity_acp_message", "relay-turn-t1"); return ok })
-	if f, _ := h.messageWithID("antigravity_acp_message", "relay-turn-t1"); f.AcpHandoverTo != "" {
-		t.Fatalf("a normal end was annotated as a handover: %q", f.AcpHandoverTo)
+	h.child.setRespond(agyAnswersRunningPrompt(agyHandoverAnswerWithUsage))
+	h.handle(h.acpCmd("ag-2", "Also end with TOOLSTEER."))
+	wantAck(t, h.acks.snapshot()[0], followUpOutcomeWritten, "", followUpProcessedInCurrent)
+	waitForLive(t, "the handed-over answer", func() bool { _, ok := h.messageWithID("antigravity_acp_message", "relay-turn-t1"); return ok })
+	if f, _ := h.messageWithID("antigravity_acp_message", "relay-turn-t1"); f.AcpHandoverTo != "relay-turn-fu_ag-2" {
+		t.Fatalf("handover annotation = %q", f.AcpHandoverTo)
+	}
+	if !s.liveFollowUps.clientTurnRunning() {
+		t.Fatal("the turn ended at the handed-over answer")
+	}
+}
+
+// The running prompt ended for a reason of its own (a cancel, an error), so
+// agy runs the follow-up as the next turn, settled under its own id, and that
+// answer is never annotated.
+func TestAnAntigravityFollowUpAfterAnEndOfItsOwnRunsAsTheNextTurn(t *testing.T) {
+	for name, answer := range map[string]string{
+		"cancelled": `{"jsonrpc":"2.0","result":{"stopReason":"cancelled"},"id":"relay-turn-t1"}`,
+		"error":     `{"jsonrpc":"2.0","error":{"code":-32603,"message":"model failed"},"id":"relay-turn-t1"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, s := newACPLiveHarness(t, antigravityACPProfile, false)
+			startACPPrompt(t, globalAntigravityACPManager, h, s)
+			h.child.setRespond(agyAnswersRunningPrompt(answer))
+			h.handle(h.acpCmd("ag-n", "next"))
+			wantAck(t, h.acks.snapshot()[0], followUpOutcomeWritten, "", followUpProcessedInNext)
+			waitForLive(t, "the turn's answer", func() bool { _, ok := h.messageWithID("antigravity_acp_message", "relay-turn-t1"); return ok })
+			if f, _ := h.messageWithID("antigravity_acp_message", "relay-turn-t1"); f.AcpHandoverTo != "" {
+				t.Fatalf("an end of its own was annotated as a handover: %q", f.AcpHandoverTo)
+			}
+		})
 	}
 }
 
@@ -369,11 +403,17 @@ func TestAnAntigravityFollowUpIsNeverAPromptIntoAnIdleSession(t *testing.T) {
 
 func TestAcpHandoverAnswer(t *testing.T) {
 	for frame, want := range map[string]bool{
-		`{"result":{"stopReason":"end_turn"},"id":"p1"}`:                           true,
-		`{"result":{"stopReason":"end_turn","usage":{"totalTokens":1}},"id":"p1"}`: false,
-		`{"error":{"code":-32603,"message":"x"},"id":"p1"}`:                        false,
-		`{"result":null,"id":"p1"}`:                                                false,
-		`not json`:                                                                 false,
+		agyHandoverAnswer:                                 true,
+		agyHandoverAnswerWithUsage:                        true,
+		`{"result":{"stopReason":"cancelled"},"id":"p1"}`: false,
+		`{"result":{"stopReason":"refusal","usage":{"totalTokens":1}},"id":"p1"}`: false,
+		`{"result":{"stopReason":"max_tokens"},"id":"p1"}`:                        false,
+		`{"result":{"usage":{"totalTokens":1}},"id":"p1"}`:                        false,
+		`{"result":{},"id":"p1"}`:                                                 false,
+		`{"error":{"code":-32603,"message":"x"},"id":"p1"}`:                       false,
+		`{"result":null,"id":"p1"}`:                                               false,
+		`{"result":"end_turn","id":"p1"}`:                                         false,
+		`not json`:                                                                false,
 	} {
 		if got := acpHandoverAnswer(frame); got != want {
 			t.Errorf("%s: %v, want %v", frame, got, want)

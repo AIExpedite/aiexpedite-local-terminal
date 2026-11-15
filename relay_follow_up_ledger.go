@@ -1215,8 +1215,10 @@ func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollo
 		// agy processes every prompt written to it, as a steer or as the next
 		// turn, and answers it only when that turn ends: the write returning
 		// is the evidence (L3/L4 spec §2.6). The RUNNING prompt's answer says
-		// which: handed over (no `usage`) means this prompt carries the turn
-		// on, `current`; an ordinary end means agy runs it as the next turn,
+		// which: `end_turn` means agy handed the turn over and this prompt
+		// carries it on, `current` (acpHandoverAnswer: with or without
+		// `usage`); an error or another stopReason ended that turn for a
+		// reason of its own, so agy runs this prompt as the next turn,
 		// `next`, settled under this prompt's own id. No answer in time: the
 		// turn is still running with this prompt queued into it.
 		processedIn := followUpProcessedInCurrent
