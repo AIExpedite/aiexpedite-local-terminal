@@ -329,7 +329,10 @@ func prepareMuseCodeMSPLaunch(req acpLaunchRequest) (acpLaunch, error) {
 //     was launched with and only while that account is still signed in, so a
 //     chat session keeps the CLI Agents card current with no paid Refresh;
 //   - `turn/completed`: a turn Muse refused for sign-in (`error.kind`
-//     `authRequired`) marks Muse Code signed out; a completed turn signs it in;
+//     `authRequired`) marks Muse Code signed out; a completed turn signs it in.
+//     Both only while the launch account is still the one signed in: a host
+//     lives for hours, and after a login switch its turn speaks for the
+//     account it started with, not the one the computer uses now;
 //   - the `initialize` answer: the host's own sandbox report, logged as Muse
 //     gave it.
 func newMuseCodeMSPObserver(sessionID, accountKey string) func(line string) {
@@ -353,7 +356,7 @@ func newMuseCodeMSPObserver(sessionID, accountKey string) func(line string) {
 					Kind string `json:"kind"`
 				} `json:"error"`
 			}
-			if json.Unmarshal(f.Params, &p) != nil {
+			if json.Unmarshal(f.Params, &p) != nil || !museCodeAccountUnchanged(accountKey) {
 				return
 			}
 			now := time.Now()

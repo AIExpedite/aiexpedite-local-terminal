@@ -580,3 +580,25 @@ func TestTheMuseCodeMSPObserverRecordsSignInFromTurns(t *testing.T) {
 		t.Fatal("a completed turn did not clear the signed-out mark")
 	}
 }
+
+// A host lives for hours: after a login switch, its turns speak for the
+// account it was launched with, so they neither mark the new account signed
+// out nor clear a refusal of it (Codex P2 on #296).
+func TestTheMuseCodeMSPObserverIgnoresSignInAfterALoginSwitch(t *testing.T) {
+	home := isolateMuseCodeHome(t)
+	writeMuseConfig(t, home, "auth.json", museAuthFixture)
+	observe := newMuseCodeMSPObserver("s1", museCodeUsageAccountKey(currentMuseCodeAccountFingerprint()))
+	writeMuseConfig(t, home, "auth.json", strings.Replace(museAuthFixture, "Dev@Example.com", "other@example.com", 1))
+	observe(`{"jsonrpc":"2.0","method":"turn/completed","params":{"turnId":"t1","terminal":"failed","error":{"kind":"authRequired"}}}`)
+	if museCodeSignedOutMarked() {
+		t.Fatal("the old account's refusal marked the new account signed out")
+	}
+	// A refusal recorded for the new account is not cleared by the old
+	// account's completed turn either.
+	recordMuseCodeSignedOut(time.Now(), home, os.Getenv)
+	time.Sleep(5 * time.Millisecond)
+	observe(`{"jsonrpc":"2.0","method":"turn/completed","params":{"turnId":"t2","terminal":"completed"}}`)
+	if !museCodeSignedOutMarked() {
+		t.Fatal("the old account's completed turn cleared the new account's refusal")
+	}
+}
