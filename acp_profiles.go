@@ -81,7 +81,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"time"
 )
 
 // antigravityACPDriverIncluded decides whether this build runs Antigravity on
@@ -192,10 +191,6 @@ var openCodeACPProfile = &acpAgentProfile{
 	spawnFailed: acpDriverSpawnFailed("opencode acp", "opencode"),
 	fenceFrames: true,
 	endedOutput: func(exit int) string { return fmt.Sprintf("opencode acp ended (exit code: %d)", exit) },
-	firstFrameStall: func(timeout time.Duration) string {
-		return fmt.Sprintf("opencode produced no output within %v of starting — it is most likely waiting for a sign-in "+
-			"it cannot show here, or wedged at startup (run `opencode` in a terminal on this computer). Session terminated.", timeout)
-	},
 }
 
 var antigravityACPProfile = &acpAgentProfile{
@@ -225,10 +220,6 @@ var antigravityACPProfile = &acpAgentProfile{
 	spawnFailed: acpDriverSpawnFailed("agy acp", "agy"),
 	fenceFrames: true,
 	endedOutput: func(exit int) string { return fmt.Sprintf("agy acp ended (exit code: %d)", exit) },
-	firstFrameStall: func(timeout time.Duration) string {
-		return fmt.Sprintf("agy produced no output within %v of starting — it is most likely waiting for a sign-in "+
-			"it cannot show here, or wedged at startup (run `agy` in a terminal on this computer). Session terminated.", timeout)
-	},
 }
 
 // The launch hooks refer back to their profiles, so they are wired here

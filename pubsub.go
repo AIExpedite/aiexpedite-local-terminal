@@ -8229,7 +8229,10 @@ func handleACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandM
 
 		// Synchronous ack so terminal-service can send the ACP `initialize`
 		// request as soon as the pipe is up. The first message frame follows
-		// once the CLI answers it on stdout.
+		// once the CLI answers it on stdout. The first-frame watchdog arms
+		// itself when that first request reaches the child (acp_family.go
+		// armFirstFrameWatchdog), not here: a session whose handshake runs
+		// with its first message can sit idle for minutes first.
 		publishFn(resultMsg{
 			ID:          cmd.ID,
 			WorkspaceID: cmd.WorkspaceID,
@@ -8241,13 +8244,6 @@ func handleACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandM
 			Type:        p.resultTypes.Started,
 			SessionID:   cmd.SessionID,
 		})
-
-		// Arm the first-frame watchdog AFTER the ack publish. publishFn
-		// (newSessionPublishFn) can block for up to 30s when Pub/Sub is slow;
-		// arming the watchdog from Start would include that publish latency
-		// in the 45s budget and risk killing a healthy child that is just
-		// waiting on terminal-service's `initialize` frame.
-		m.ArmFirstFrameWatchdog(cmd.SessionID, publishFn)
 
 	case p.commandTypes.Send:
 		if cmd.SessionID == "" {
