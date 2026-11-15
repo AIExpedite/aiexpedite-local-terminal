@@ -1254,6 +1254,14 @@ type commandMsg struct {
 	// EXECUTION_LIVENESS_REDESIGN.md → PTY mode.
 	Tty bool `json:"tty,omitempty"`
 
+	// CwdFallback lets a session_start whose folder terminal-service chose as a
+	// DEFAULT (the saved Default working directory, or the device home) start in
+	// this computer's own working folder when that folder no longer exists. The
+	// only value is cwdFallbackDeviceHome; see session_start_dir.go. Unsigned
+	// metadata like Tty: it names no path, never moves a coding agent, and is
+	// ignored on read-only and signed-cwd starts.
+	CwdFallback string `json:"cwdFallback,omitempty"`
+
 	// CwdFence is the signed folder boundary for a start admitted through an
 	// ancestor grant (relay_cwd_fence.go). If the command's real directory
 	// escapes that boundary (e.g. symlink escape), the agent refuses the command
@@ -1292,18 +1300,23 @@ func (cmd *commandMsg) UnmarshalJSON(data []byte) error {
 
 /* Outgoing result payload (matches backend publishResult struct) */
 type resultMsg struct {
-	ID              string        `json:"id"`
-	WorkspaceID     string        `json:"workspaceID,omitempty"` // Workspace scope for audit trail
-	UID             string        `json:"uid"`
-	AgentID         string        `json:"agentId,omitempty"` // Agent ID for version updates on ping
-	Output          string        `json:"output"`
-	Status          string        `json:"status"` // "success" | "partial" | "error" | "denied" | "rate_limited" | "unauthorized"
-	Ts              int64         `json:"ts"`
-	Version         string        `json:"version,omitempty"`      // Terminal app version
-	Cwd             string        `json:"cwd,omitempty"`          // Working directory: post-execution for success results, requested cwd for rejections
-	Files           []FileInfo    `json:"files,omitempty"`        // Uploaded file metadata
-	UploadErrors    []UploadError `json:"uploadErrors,omitempty"` // File upload failures
-	RejectionReason string        `json:"rejectionReason,omitempty"`
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspaceID,omitempty"` // Workspace scope for audit trail
+	UID         string `json:"uid"`
+	AgentID     string `json:"agentId,omitempty"` // Agent ID for version updates on ping
+	Output      string `json:"output"`
+	Status      string `json:"status"` // "success" | "partial" | "error" | "denied" | "rate_limited" | "unauthorized"
+	Ts          int64  `json:"ts"`
+	Version     string `json:"version,omitempty"` // Terminal app version
+	Cwd         string `json:"cwd,omitempty"`     // Working directory: post-execution for success results, requested cwd for rejections
+	// Set on a session_started frame only when the session started somewhere
+	// other than the folder it was asked for (session_start_dir.go): the folder
+	// asked for, and why it could not be used. Cwd then names the folder used.
+	CwdFallbackFrom   string        `json:"cwdFallbackFrom,omitempty"`
+	CwdFallbackReason string        `json:"cwdFallbackReason,omitempty"`
+	Files             []FileInfo    `json:"files,omitempty"`        // Uploaded file metadata
+	UploadErrors      []UploadError `json:"uploadErrors,omitempty"` // File upload failures
+	RejectionReason   string        `json:"rejectionReason,omitempty"`
 	// Echoed back on rejections so terminal-service's persistRejection() can
 	// store what the AI agent actually tried. Empty otherwise — successful
 	// results don't need to repeat the command. Both are passed through
@@ -7357,6 +7370,11 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 // message is acked — which happens immediately after session_start returns,
 // while stream / session_ended frames are published for minutes afterward.
 // A cancelled context would silently drop every subsequent message.
+// sessionPublishFnFor is the publish function the generic session path uses: a
+// variable so a test can capture its frames (session_started, stream,
+// session_ended) without a Pub/Sub topic.
+var sessionPublishFnFor = newSessionPublishFn
+
 func newSessionPublishFn(topic *pubsub.Publisher, logPrefix string) PublishFunc {
 	return func(res resultMsg) {
 		data, err := json.Marshal(res)
@@ -7484,7 +7502,7 @@ func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd co
 		return
 	}
 
-	publishFn := newSessionPublishFn(topic, "[session]")
+	publishFn := sessionPublishFnFor(topic, "[session]")
 
 	switch cmd.Type {
 	case "session_start":
@@ -7502,6 +7520,8 @@ func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd co
 		globalSessionManager.ExpectStartAck(cmd.SessionID)
 
 		var err error
+		// Set only when the session starts somewhere other than cmd.Cwd.
+		var startedIn, startFallbackFrom, startFallbackReason string
 		if cmd.ReadOnly {
 			// The ENFORCED read-only shape (readonly_session.go): fixed argv,
 			// PATH-resolved executable outside cwd. The raw caller args go in —
@@ -7518,13 +7538,32 @@ func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd co
 				publishFn,
 			)
 		} else {
+			// A start folder that no longer exists is refused here with a typed
+			// error naming it, or, for a default folder terminal-service marked,
+			// replaced by this computer's own working folder
+			// (session_start_dir.go). A coding agent is never moved.
+			startDir, fallbackFrom, fallbackReason, dirErr := resolveSessionStartDir(cfg, cmd)
+			if typed := sessionStartDirErrorFrom(dirErr); typed != nil {
+				logSession(cmd.SessionID, "%s[session] Session %s not started: %v%s\n",
+					colorYellow, cmd.SessionID, typed, colorReset)
+				publishSessionErrorWithCode(ctx, topic, cmd,
+					fmt.Sprintf("failed to start session: %v", typed), sessionStartDirMissingErrorCode)
+				globalSessionManager.MarkSessionStartAcknowledged(cmd.SessionID)
+				return
+			}
+			if fallbackFrom != "" {
+				startFallbackFrom, startFallbackReason = fallbackFrom, fallbackReason
+				logSession(cmd.SessionID, "%s[session] Session %s: working folder %s is %s on this computer; starting in %s (this computer's own working folder) instead%s\n",
+					colorYellow, cmd.SessionID, fallbackFrom, strings.ReplaceAll(fallbackReason, "_", " "), startDir, colorReset)
+			}
+			startedIn = startDir
 			// cmd.ConversationID is the SIGNED exact-resume seed (empty on an
 			// ordinary start) — see cli_conversation_resume.go.
 			err = globalSessionManager.StartSessionResuming(
 				cmd.SessionID,
 				cmd.Command,
 				sessionStartArgsForCommand(cmd),
-				cmd.Cwd,
+				startDir,
 				cmd.WorkspaceID,
 				cmd.UID,
 				cmd.TimeoutMs,
@@ -7560,7 +7599,7 @@ func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd co
 		}
 
 		// Publish session_started acknowledgment
-		publishFn(resultMsg{
+		started := resultMsg{
 			ID:          cmd.ID,
 			WorkspaceID: cmd.WorkspaceID,
 			UID:         cmd.UID,
@@ -7570,7 +7609,13 @@ func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd co
 			Version:     Version,
 			Type:        "session_started",
 			SessionID:   cmd.SessionID,
-		})
+		}
+		if startFallbackFrom != "" {
+			started.Cwd = startedIn
+			started.CwdFallbackFrom = startFallbackFrom
+			started.CwdFallbackReason = startFallbackReason
+		}
+		publishFn(started)
 		// The start frame is OUT. Only now may a terminal frame follow it.
 		globalSessionManager.MarkSessionStartAcknowledged(cmd.SessionID)
 
