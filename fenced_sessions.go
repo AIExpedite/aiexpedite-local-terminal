@@ -414,7 +414,7 @@ func isSessionEndCommandType(t string) bool {
 	switch t {
 	case "session_end", "codex_appserver_end", "claude_native_end",
 		"grok_acp_end", "antigravity_native_end", "opencode_native_end",
-		"opencode_acp_end", "antigravity_acp_end",
+		"opencode_acp_end", "antigravity_acp_end", "musecode_msp_end",
 		"musecode_native_end":
 		return true
 	}

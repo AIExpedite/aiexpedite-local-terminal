@@ -22,6 +22,13 @@
 // Muse history), no workspace writes and no shell, in a private empty temp
 // directory that is removed on close, and the whole process tree is killed on
 // close. Server-initiated requests (approvals, questions) are never answered.
+//
+// This is NOT the chat host. Muse Code's MSP chat driver
+// (musecode_msp_driver.go, `muse serve --disable-request-user-input` on the
+// ACP family's transport) runs in the session's own folder with a durable
+// session log, writes and a shell, because a person directs it and answers
+// its approvals; this probe host runs with none of them, because nobody does.
+// The two differ on purpose; neither borrows the other's argv.
 package main
 
 import (

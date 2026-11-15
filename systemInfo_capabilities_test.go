@@ -45,6 +45,7 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 	// The ACP drivers listed depend on the CLIs installed on the host, so the
 	// pin reads them as absent; systemInfo_acp_test.go covers the list.
 	pinACPDriverBinaries(t, nil)
+	pinMSPDriverBinary(t, mspDriverBinary{})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			caps := newMachineCapabilities()
@@ -86,9 +87,10 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// model and effort to every turn; `openCodeAuthRefusalFrame` with an
 			// OpenCode turn that fails on a missing provider key naming the
 			// provider in its error frame; `acpDrivers` with OpenCode and
-			// Antigravity on their long-lived ACP drivers (always present, an
-			// empty list when no installed CLI qualifies).
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]}}` {
+			// Antigravity on their long-lived ACP drivers, and `mspDrivers` with
+			// Muse Code on `muse serve` (both always present, an empty list when
+			// no installed CLI qualifies).
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]},"mspDrivers":{"protocol":1,"agents":[]}}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})

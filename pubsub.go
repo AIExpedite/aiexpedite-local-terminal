@@ -7277,19 +7277,22 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// short-circuit exists to close (a later raw execute would skip the ACP
 		// manager's API-key/env-sanitisation gates). Treat "Always" as one-time.
 		persistOnAlways = false
-	case openCodeACPProfile.commandTypes.Start, antigravityACPProfile.commandTypes.Start:
-		// The selected ACP drivers (acp_profiles.go): the profile owns the
-		// argv (exactly `<cli> acp`; START args are refused) and the
+	case openCodeACPProfile.commandTypes.Start, antigravityACPProfile.commandTypes.Start,
+		museCodeMSPProfile.commandTypes.Start:
+		// The selected drivers (acp_profiles.go, musecode_msp_driver.go): the
+		// profile owns the argv (exactly `<cli> acp`, or `muse serve
+		// --disable-request-user-input`; START args are refused) and the
 		// environment, so a SIGNED start needs no allowlist entry, as
 		// grok_acp_start's does not. Unsigned (or a signed high-risk step),
 		// the person sees the dialog with the argv that will run. "Always"
-		// never persists: it would write a blanket `opencode *` / `agy *`.
+		// never persists: it would write a blanket `opencode *` / `agy *` /
+		// `muse *`.
 		if cfg.CommandSecret != "" && !forceNative {
 			return true
 		}
 		p := acpDriverProfileForCommand(cmd.Type)
 		allowCommand = p.cliName
-		allowArgs = []string{"acp"}
+		allowArgs, _ = p.buildArgs(nil, ACPStartOptions{})
 		dialogArgs = allowArgs
 		denyOutput = p.noun + " session denied by user: not in allow list"
 		persistOnAlways = false

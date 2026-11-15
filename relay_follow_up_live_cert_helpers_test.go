@@ -1,4 +1,4 @@
-//go:build codexlive || groklive || opencodelive || agylive
+//go:build codexlive || groklive || opencodelive || agylive || muselive
 
 package main
 
@@ -18,7 +18,8 @@ import (
 // (relay_follow_up_codex_certification_test.go,
 // relay_follow_up_grok_certification_test.go,
 // relay_follow_up_opencode_certification_test.go,
-// relay_follow_up_agy_certification_test.go). Never part of `go test ./...`.
+// relay_follow_up_agy_certification_test.go,
+// relay_follow_up_musecode_certification_test.go). Never part of `go test ./...`.
 
 const liveCertSecret = "test-secret"
 
@@ -36,7 +37,7 @@ type liveCertClient struct {
 
 func (c *liveCertClient) publish(res resultMsg) {
 	switch res.Type {
-	case "codex_appserver_message", "grok_acp_message", "opencode_acp_message", "antigravity_acp_message":
+	case "codex_appserver_message", "grok_acp_message", "opencode_acp_message", "antigravity_acp_message", "musecode_msp_message":
 	default:
 		return
 	}

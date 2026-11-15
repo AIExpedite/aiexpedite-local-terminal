@@ -36,6 +36,9 @@
 //
 // The fence reads the envelope of the frames it sees and the few params
 // named above, never prompt text.
+//
+// Muse Code's MSP driver (`muse serve`) has a fence of its own, chosen by the
+// profile's protocol: msp_fence.go.
 // -----------------------------------------------------------------------------
 
 package main
@@ -85,9 +88,12 @@ const (
 	acpFenceOpenRequestsMax = 256
 )
 
-// acpClientFence is one OpenCode or Antigravity child's fence.
+// acpClientFence is one OpenCode, Antigravity or Muse Code (MSP) child's
+// fence.
 type acpClientFence struct {
 	noun string
+	// msp is the MSP fence's own state (msp_fence.go); nil on an ACP child.
+	msp *mspFenceState
 
 	mu sync.Mutex
 	// open holds the agent-to-client requests not yet answered, by id key
@@ -103,13 +109,23 @@ type acpOpenRequest struct {
 }
 
 // acpFenceCheck is what a passed check knows that the write's outcome
-// completes: the request a response answers.
+// completes: the request a response answers, and (MSP) what admitting the
+// frame reserves.
 type acpFenceCheck struct {
 	responseKey string
+
+	mspStep   mspFenceStep
+	mspCanon  string
+	mspKey    string
+	mspMethod string
 }
 
 func newACPClientFence(p *acpAgentProfile) *acpClientFence {
-	return &acpClientFence{noun: p.noun, open: map[string]acpOpenRequest{}}
+	f := &acpClientFence{noun: p.noun, open: map[string]acpOpenRequest{}}
+	if p.protocol == acpProtocolMSP {
+		f.msp = newMSPFenceState()
+	}
+	return f
 }
 
 func (f *acpClientFence) refuse(format string, args ...any) error {
@@ -132,6 +148,9 @@ type acpFenceParams struct {
 func (f *acpClientFence) check(frame, root string) (acpFenceCheck, error) {
 	if f == nil {
 		return acpFenceCheck{}, nil
+	}
+	if f.msp != nil {
+		return f.checkMSP(frame, root)
 	}
 	rpc, ok := parseJSONRPCFrame(frame)
 	if !ok {
@@ -235,10 +254,27 @@ func checkACPSetupCwd(method, cwd, root string) error {
 	return nil
 }
 
+// admit re-decides, under the session's stdin lock right before the write,
+// what a concurrent write could have changed since check, and reserves it.
+// Only the MSP fence has anything to reserve.
+func (f *acpClientFence) admit(c acpFenceCheck) error {
+	if f == nil || f.msp == nil {
+		return nil
+	}
+	return f.admitMSP(c)
+}
+
 // written records that a checked frame reached the child: a response closes
 // the request it answered.
 func (f *acpClientFence) written(c acpFenceCheck) {
-	if f == nil || c.responseKey == "" {
+	if f == nil {
+		return
+	}
+	if f.msp != nil {
+		f.settleMSP(c, true)
+		return
+	}
+	if c.responseKey == "" {
 		return
 	}
 	f.mu.Lock()
@@ -246,15 +282,33 @@ func (f *acpClientFence) written(c acpFenceCheck) {
 	delete(f.open, c.responseKey)
 }
 
+// release undoes what admit reserved for a frame that never reached the child.
+func (f *acpClientFence) release(c acpFenceCheck) {
+	if f == nil || f.msp == nil {
+		return
+	}
+	f.settleMSP(c, false)
+}
+
 // inbound reads one frame off the child's stdout: a request it makes of the
 // client is open until a response to it is written.
 func (f *acpClientFence) inbound(line string) {
+	_ = f.inboundFrame(line, "")
+}
+
+// inboundFrame is inbound with the session's start folder, for the MSP fence's
+// check of a resumed conversation's folder. A non-nil error means the frame
+// must not be published and the child must be ended (acp_family.go).
+func (f *acpClientFence) inboundFrame(line, root string) error {
 	if f == nil {
-		return
+		return nil
+	}
+	if f.msp != nil {
+		return f.inboundMSP(line, root)
 	}
 	rpc, ok := parseJSONRPCFrame(line)
 	if !ok || !rpc.isRequest() {
-		return
+		return nil
 	}
 	req := acpOpenRequest{method: rpc.Method}
 	if rpc.Method == acpMethodRequestPermission {
@@ -273,9 +327,15 @@ func (f *acpClientFence) inbound(line string) {
 			}
 		}
 	}
-	key := rpc.idKey()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.recordOpenLocked(rpc.idKey(), req)
+	return nil
+}
+
+// recordOpenLocked keeps an agent-to-client request open, within the cap.
+// Caller holds f.mu.
+func (f *acpClientFence) recordOpenLocked(key string, req acpOpenRequest) {
 	if _, seen := f.open[key]; !seen {
 		f.order = append(f.order, key)
 	}

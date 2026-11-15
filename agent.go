@@ -368,6 +368,11 @@ func StartAgent(cfg *Config) {
 	go globalOpenCodeACPManager.CleanupStale(acpFamilyMaxLifetime)
 	globalAntigravityACPManager = newACPManager(cfg, antigravityACPProfile)
 	go globalAntigravityACPManager.CleanupStale(acpFamilyMaxLifetime)
+	// Muse Code on `muse serve` (musecode_msp_driver.go): the same family
+	// manager, speaking MSP; started only when capabilities.mspDrivers lists
+	// museCode.
+	globalMuseCodeMSPManager = newACPManager(cfg, museCodeMSPProfile)
+	go globalMuseCodeMSPManager.CleanupStale(acpFamilyMaxLifetime)
 	fmt.Println("[aiexpedite] ACP driver managers ready")
 
 	/* 3b'''. Initialize Claude native manager (stream-json over stdio) ---- */
