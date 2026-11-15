@@ -23,9 +23,11 @@ func startWatchdogMock(t *testing.T, stall string) (*ACPManager, string, *frameL
 	if stall != "" {
 		t.Setenv(mockACPStallEnv, stall)
 	}
-	m, id, log := startMockACPDriver(t, openCodeACPProfile, "2.2.7")
-	m.firstFrameTimeout = testFirstFrameWindow
-	return m, id, log
+	// The window is shortened BEFORE the start, so a watchdog armed at the
+	// spawn would run with it too.
+	return startMockACPDriverWith(t, openCodeACPProfile, "2.2.7", func(m *ACPManager) {
+		m.firstFrameTimeout = testFirstFrameWindow
+	})
 }
 
 const watchdogInitialize = `{"jsonrpc":"2.0","id":"relay-acp-init","method":"initialize","params":{"protocolVersion":1}}`

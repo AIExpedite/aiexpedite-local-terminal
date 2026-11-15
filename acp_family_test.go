@@ -101,6 +101,13 @@ func (l *frameLog) ofType(typ string) []resultMsg {
 // as that CLI at version.
 func startMockACPDriver(t *testing.T, p *acpAgentProfile, version string) (*ACPManager, string, *frameLog) {
 	t.Helper()
+	return startMockACPDriverWith(t, p, version, nil)
+}
+
+// startMockACPDriverWith is startMockACPDriver with configure run on the
+// manager before the start.
+func startMockACPDriverWith(t *testing.T, p *acpAgentProfile, version string, configure func(*ACPManager)) (*ACPManager, string, *frameLog) {
+	t.Helper()
 	if runtime.GOOS != "windows" && runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("integration test only runs on win/linux/darwin")
 	}
@@ -123,6 +130,9 @@ func startMockACPDriver(t *testing.T, p *acpAgentProfile, version string) (*ACPM
 	t.Setenv(antigravityCSRFTokenEnv, "")
 
 	m := newACPManager(nil, p)
+	if configure != nil {
+		configure(m)
+	}
 	log := &frameLog{}
 	id := fmt.Sprintf("acp-test-%d", time.Now().UnixNano())
 	if err := m.Start(id, dir, nil, "ws", "uid", ACPStartOptions{}, log.publish); err != nil {
