@@ -100,6 +100,12 @@ func runMockMSPDriver() {
 			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "turn/started", "params": map[string]any{"turnId": turn}})
 			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "item/completed", "params": map[string]any{
 				"item": map[string]any{"kind": "agentMessage", "turnId": turn, "text": "hello"}}})
+			now := time.Now()
+			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "usage/changed", "params": map[string]any{
+				"window":       map[string]any{"usedPercent": 12, "windowDurationMins": 300, "resetsAtMs": now.Add(time.Hour).UnixMilli()},
+				"weekly":       map[string]any{"usedPercent": 40, "resetsAtMs": now.Add(24 * time.Hour).UnixMilli()},
+				"observedAtMs": now.UnixMilli(),
+			}})
 			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "method": "turn/completed", "params": map[string]any{"turnId": turn, "terminal": "completed"}})
 		}
 	}
@@ -401,10 +407,14 @@ func TestMuseCodeMSPStartRefusalsKeepTheSettlePrefixAndTheirCode(t *testing.T) {
 /* --- the host, end to end on a stand-in `muse serve` --- */
 
 // The whole driver: the chat host's argv, other agents' credentials stripped,
-// every frame forwarded verbatim under Muse Code's own types, a refused frame
-// typed and never written, and the ended frame on END.
+// every frame forwarded verbatim under Muse Code's own types, the host's own
+// quota report kept for the CLI Agents card, a refused frame typed and never
+// written, and the ended frame on END.
 func TestMuseCodeMSPDriverLifecycle(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-should-not-reach-muse")
+	home := isolateMuseCodeHome(t)
+	writeMuseConfig(t, home, "auth.json", museAuthFixture)
+	account := museCodeUsageAccountKey(currentMuseCodeAccountFingerprint())
 	m, id, log, dir := startMockMSPDriver(t)
 	if err := m.Send(id, `{"jsonrpc":"2.0","id":"relay-msp-init","method":"initialize","params":{"clientInfo":{"name":"aiexpedite","version":"1"},"capabilities":{"userInputDialogs":false}}}`); err != nil {
 		t.Fatal(err)
@@ -431,6 +441,9 @@ func TestMuseCodeMSPDriverLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForFrame(t, log, "musecode_msp_message", `"turn/completed"`)
+	if reading, ok := loadMuseCodeUsageLive(account); !ok || reading.Window.UsedPercent != 12 || reading.Weekly.UsedPercent != 40 {
+		t.Fatalf("the host's usage/changed was not kept: %+v ok=%v", reading, ok)
+	}
 	// A second conversation in the same host, and a looser mode, are refused
 	// and never written.
 	for _, frame := range []string{
