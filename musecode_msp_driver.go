@@ -77,6 +77,14 @@
 // certification run (relay_follow_up_musecode_certification_test.go) records
 // it. Both hosts exited on their own within 5 s of stdin closing; the
 // design pass saw 1.4.18 hosts that did not, which is why End kills the tree.
+// 1.4.20 does not always exit either (2026-11-15, Windows): of six hosts
+// probed with no turn, three outlived their closed stdin by a minute or more
+// (two still running when killed at 56 s and 60 s, one gone at 76 s) and three
+// went within 0.3 s; and a dev chat host outlived End's 5 s after a refused
+// turn and was killed (exit code 1). The ended frame then waits for the
+// session's media scan, which reads several folders at once
+// (artifact_scan_walk.go) because that scan, not the host, was most of that
+// session's 42 s end.
 // -----------------------------------------------------------------------------
 
 package main

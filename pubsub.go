@@ -6676,12 +6676,6 @@ const mtimeSkew = 5 * time.Second
 // generous for a single test run.
 const maxUploadFiles = 50
 
-// errFileLimitReached is the sentinel returned from the WalkDir callback to
-// abort the walk once we've collected maxUploadFiles. A typed sentinel lets
-// the caller distinguish "we hit our cap" from "the filesystem returned a
-// real error" without comparing length counts.
-var errFileLimitReached = errors.New("file upload limit reached")
-
 // detectOutputFilesSince finds media files newly written under workDir during
 // the current command/session. Files are kept if:
 //  1. Extension is in mediaExtensions (PNG, JPG, GIF, WEBP, WEBM, MP4, MOV)
@@ -6774,116 +6768,13 @@ func scanOutputFilesSince(ctx context.Context, workDir string, sessionStart time
 		cutoff = sessionStart.Add(-mtimeSkew)
 	}
 
-	walkErr := filepath.WalkDir(absBase, func(path string, d fs.DirEntry, err error) error {
-		// Stop the moment the caller has given up on us.
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		if err != nil {
-			// Permission and not-exist errors on individual subtrees (or on
-			// the root itself, when the workdir was removed between command
-			// dispatch and session end) should not abort the walk or spam
-			// stderr — they're expected operational states.
-			if !errors.Is(err, fs.ErrPermission) && !errors.Is(err, fs.ErrNotExist) {
-				fmt.Printf("[file-upload] Walk error at %s: %v\n", path, err)
-			}
-			if d != nil && d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-
-		if d.IsDir() {
-			// Defense in depth: refuse any "directory" entry that is not a
-			// pure directory. This catches symlinked dirs on POSIX, NTFS
-			// junctions (created by `mklink /J`) and mount points on
-			// Windows — both of which have ModeIrregular set on Go 1.20+
-			// even though IsDir() returns true — plus anything else exotic
-			// the OS surfaces (Windows reparse-point tags we don't know
-			// about). filepath.WalkDir doesn't follow symlinks, but it DOES
-			// descend into junctions, which is the gap we're closing here.
-			if d.Type()&^os.ModeDir != 0 {
-				return fs.SkipDir
-			}
-
-			// Prune ignored directories. Match by base name only — a project
-			// named "vendor" at the repo root is rare enough that the false
-			// positive is acceptable, and the user can rename if needed.
-			if path != absBase {
-				if _, skip := ignoredDirs[d.Name()]; skip {
-					return fs.SkipDir
-				}
-				// Hidden directories are pruned too, EXCEPT the .maestro
-				// convention used by Maestro for mobile UI testing output.
-				name := d.Name()
-				if strings.HasPrefix(name, ".") && name != ".maestro" {
-					return fs.SkipDir
-				}
-			}
-			return nil
-		}
-
-		if len(files) >= maxUploadFiles {
-			return errFileLimitReached
-		}
-
-		// Only upload regular files. d.Type() returns just the type bits
-		// (ModeDir, ModeSymlink, ModeNamedPipe, ModeSocket, ModeDevice,
-		// ModeCharDevice, ModeIrregular) — a value of zero means a regular
-		// file. This blocks symlinks, pipes, sockets, devices, and the
-		// ModeIrregular tag Windows uses for reparse points other than
-		// symlinks (e.g. NTFS junctions).
-		if d.Type() != 0 {
-			return nil
-		}
-
-		ext := strings.ToLower(filepath.Ext(path))
-		if _, ok := mediaExtensions[ext]; !ok {
-			return nil
-		}
-
-		// Sensitive-name guard: even though the extension is on the media
-		// allowlist, refuse to upload basenames that look like disguised
-		// credential / secret files. Catches the case where someone (or
-		// some misconfigured tool) drops `.env.png` or `id_rsa.jpg` into
-		// the workdir.
-		baseLower := strings.ToLower(filepath.Base(path))
-		for _, prefix := range sensitiveBasenamePrefixes {
-			if strings.HasPrefix(baseLower, prefix) {
-				LogSecurityEvent(SecEvtPathTraversal, "blocked sensitive-looking filename from upload",
-					"path", path, "site", "detectOutputFilesSince.sensitiveBasename")
-				return nil
-			}
-		}
-
-		// Defense in depth: the walk shouldn't leave absBase since we
-		// rejected symlinks, but verify before uploading.
-		if !isPathSafeUnder(path, absBase) {
-			LogSecurityEvent(SecEvtPathTraversal, "blocked file outside base during walk",
-				"path", path, "base_dir", absBase, "site", "detectOutputFilesSince")
-			return nil
-		}
-
-		if !cutoff.IsZero() {
-			info, infoErr := d.Info()
-			if infoErr != nil {
-				return nil
-			}
-			if info.ModTime().Before(cutoff) {
-				return nil
-			}
-		}
-
-		files = append(files, path)
-		return nil
-	})
-
-	if walkErr != nil && !errors.Is(walkErr, errFileLimitReached) {
-		// Only log genuine walk errors, not our own sentinel stop error.
+	// Several folders are read at once (artifact_scan_walk.go): the same
+	// folders pruned and files kept, in the same order, as one at a time.
+	found, walkErr := walkArtifactCandidates(ctx, absBase, cutoff)
+	if walkErr != nil {
 		fmt.Printf("[file-upload] Walk error in %s: %v\n", absBase, walkErr)
 	}
-
-	return files, ""
+	return append(files, found...), ""
 }
 
 // extractWorkspaceID extracts workspaceID from command message
