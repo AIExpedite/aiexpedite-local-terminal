@@ -172,22 +172,23 @@ func TestTheMSPFenceHoldsTheSessionStart(t *testing.T) {
 	_, root := newTestMSPFence(t)
 	outside := filepath.Dir(root)
 	cases := map[string]string{
-		"approval mode allowAll":    strings.Replace(mspStartFrame(root, ""), "promptUnmatched", "allowAll", 1),
-		"no approval mode":          strings.Replace(mspStartFrame(root, ""), `,"approvalMode":"promptUnmatched"`, "", 1),
-		"a session id of its own":   mspStartFrame(root, `,"sessionId":"`+mspFenceSession+`"`),
-		"a permission profile":      mspStartFrame(root, `,"permissionProfile":":unrestricted"`),
-		"extra workspace roots":     mspStartFrame(root, `,"workspaceRoots":[`+strconv.Quote(root)+`]`),
-		"config":                    mspStartFrame(root, `,"config":{"mcpServers":{}}`),
-		"a provider":                mspStartFrame(root, `,"providerId":"echo"`),
-		"a workspace outside":       mspStartFrame(outside, ""),
-		"a relative workspace":      mspStartFrame("ws", ""),
-		"no workspace":              `{"jsonrpc":"2.0","id":"relay-msp-start","method":"session/start","params":{"commandId":"` + mspFenceCmd1 + `","approvalMode":"promptUnmatched"}}`,
-		"resume with a profile":     `{"jsonrpc":"2.0","id":"relay-msp-resume","method":"session/resume","params":{"commandId":"` + mspFenceCmd1 + `","sessionId":"` + mspFenceSession + `","permissionProfile":"x"}}`,
-		"resume with config":        `{"jsonrpc":"2.0","id":"relay-msp-resume","method":"session/resume","params":{"commandId":"` + mspFenceCmd1 + `","sessionId":"` + mspFenceSession + `","config":{}}}`,
-		"resume of no session":      `{"jsonrpc":"2.0","id":"relay-msp-resume","method":"session/resume","params":{"commandId":"` + mspFenceCmd1 + `","sessionId":"not-a-uuid"}}`,
-		"initialize asking a grant": `{"jsonrpc":"2.0","id":"relay-msp-init","method":"initialize","params":{"clientInfo":{"name":"aiexpedite","version":"1"},"capabilities":{"userInputDialogs":false,"requestedCapabilities":["userShell"]}}}`,
-		"initialize with dialogs":   `{"jsonrpc":"2.0","id":"relay-msp-init","method":"initialize","params":{"clientInfo":{"name":"aiexpedite","version":"1"},"capabilities":{"userInputDialogs":true}}}`,
-		"a turn before any session": `{"jsonrpc":"2.0","id":"relay-turn-t1","method":"turn/start","params":{"commandId":"` + mspFenceCmd2 + `","sessionId":"` + mspFenceSession + `","input":[]}}`,
+		"approval mode allowAll":                  strings.Replace(mspStartFrame(root, ""), "promptUnmatched", "allowAll", 1),
+		"no approval mode":                        strings.Replace(mspStartFrame(root, ""), `,"approvalMode":"promptUnmatched"`, "", 1),
+		"a session id of its own":                 mspStartFrame(root, `,"sessionId":"`+mspFenceSession+`"`),
+		"a permission profile":                    mspStartFrame(root, `,"permissionProfile":":unrestricted"`),
+		"extra workspace roots":                   mspStartFrame(root, `,"workspaceRoots":[`+strconv.Quote(root)+`]`),
+		"config":                                  mspStartFrame(root, `,"config":{"mcpServers":{}}`),
+		"a provider":                              mspStartFrame(root, `,"providerId":"echo"`),
+		"a workspace outside":                     mspStartFrame(outside, ""),
+		"a relative workspace":                    mspStartFrame("ws", ""),
+		"no workspace":                            `{"jsonrpc":"2.0","id":"relay-msp-start","method":"session/start","params":{"commandId":"` + mspFenceCmd1 + `","approvalMode":"promptUnmatched"}}`,
+		"resume with a profile":                   `{"jsonrpc":"2.0","id":"relay-msp-resume","method":"session/resume","params":{"commandId":"` + mspFenceCmd1 + `","sessionId":"` + mspFenceSession + `","permissionProfile":"x"}}`,
+		"resume with config":                      `{"jsonrpc":"2.0","id":"relay-msp-resume","method":"session/resume","params":{"commandId":"` + mspFenceCmd1 + `","sessionId":"` + mspFenceSession + `","config":{}}}`,
+		"resume of no session":                    `{"jsonrpc":"2.0","id":"relay-msp-resume","method":"session/resume","params":{"commandId":"` + mspFenceCmd1 + `","sessionId":"not-a-uuid"}}`,
+		"initialize asking a grant":               `{"jsonrpc":"2.0","id":"relay-msp-init","method":"initialize","params":{"clientInfo":{"name":"aiexpedite","version":"1"},"capabilities":{"userInputDialogs":false,"requestedCapabilities":["userShell"]}}}`,
+		"initialize with dialogs":                 `{"jsonrpc":"2.0","id":"relay-msp-init","method":"initialize","params":{"clientInfo":{"name":"aiexpedite","version":"1"},"capabilities":{"userInputDialogs":true}}}`,
+		"initialize declaring another capability": `{"jsonrpc":"2.0","id":"relay-msp-init","method":"initialize","params":{"clientInfo":{"name":"aiexpedite","version":"1"},"capabilities":{"userInputDialogs":false,"experimentalApi":false}}}`,
+		"a turn before any session":               `{"jsonrpc":"2.0","id":"relay-turn-t1","method":"turn/start","params":{"commandId":"` + mspFenceCmd2 + `","sessionId":"` + mspFenceSession + `","input":[]}}`,
 	}
 	for name, frame := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -341,5 +342,110 @@ func TestAMuseCodeMSPBatchIsRefused(t *testing.T) {
 	m.sessions["msp"] = &ACPSession{ID: "msp", status: "running", fence: newACPClientFence(museCodeMSPProfile)}
 	if err := m.Send("msp", `[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}]`); err == nil {
 		t.Fatal("a batch reached the fence")
+	}
+}
+
+// The checks made before the stdin lock refuse on their own: a write that
+// would never be admitted is told so without taking the lock.
+func TestTheMSPFenceRefusesAtTheCheckBeforeTheLock(t *testing.T) {
+	// A second conversation, once the host has one.
+	f, root := establishMSPSession(t)
+	if _, err := f.check(strings.Replace(mspStartFrame(root, ""), mspFenceCmd1, mspFenceCmd2, 1), root); acpTypedErrorCode(err) != acpErrorCodeFrameRefused {
+		t.Fatalf("a second conversation passed the check: %v", err)
+	}
+	// Another initialize.
+	if _, err := f.check(`{"jsonrpc":"2.0","id":"relay-msp-init","method":"initialize","params":{"clientInfo":{"name":"other","version":"1"}}}`, root); acpTypedErrorCode(err) != acpErrorCodeFrameRefused {
+		t.Fatalf("another initialize passed the check: %v", err)
+	}
+	// A receipt to a request the host never made.
+	if _, err := f.check(`{"jsonrpc":"2.0","id":8,"result":{}}`, root); acpTypedErrorCode(err) != acpErrorCodeFrameRefused {
+		t.Fatalf("a receipt to no request passed the check: %v", err)
+	}
+	// Another setup while one is in flight.
+	g, root := newTestMSPFence(t)
+	if err := mspSend(g, mspStartFrame(root, ""), root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.check(strings.Replace(mspStartFrame(root, ""), mspFenceCmd1, mspFenceCmd2, 1), root); acpTypedErrorCode(err) != acpErrorCodeFrameRefused {
+		t.Fatalf("a second setup in flight passed the check: %v", err)
+	}
+	// A choice the request never offered is named as such.
+	if err := g.inboundFrame(mspStartAnswer(root), root); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.inboundFrame(mspApprovalRequest, root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.check(mspDecide("c-made-up"), root); err == nil || !strings.Contains(err.Error(), "did not offer") {
+		t.Fatalf("a made-up choice: %v", err)
+	}
+}
+
+// What two concurrent writes could both pass at the check is decided again at
+// the write, under the stdin lock: only the first setup, and only the first
+// receipt, goes out.
+func TestTheMSPFenceDecidesAgainAtTheWrite(t *testing.T) {
+	f, root := newTestMSPFence(t)
+	first, err := f.check(mspStartFrame(root, ""), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.check(strings.Replace(mspStartFrame(root, ""), mspFenceCmd1, mspFenceCmd2, 1), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.admit(first); err != nil {
+		t.Fatal(err)
+	}
+	f.written(first)
+	if err := f.admit(second); acpTypedErrorCode(err) != acpErrorCodeFrameRefused {
+		t.Fatalf("a second setup admitted while the first was in flight: %v", err)
+	}
+	// Once the host has its conversation, a setup checked before that is
+	// refused at the write too.
+	e, root := newTestMSPFence(t)
+	a1, err1 := e.check(mspStartFrame(root, ""), root)
+	a2, err2 := e.check(strings.Replace(mspStartFrame(root, ""), mspFenceCmd1, mspFenceCmd2, 1), root)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("checks: %v %v", err1, err2)
+	}
+	if err := e.admit(a1); err != nil {
+		t.Fatal(err)
+	}
+	e.written(a1)
+	if err := e.inboundFrame(mspStartAnswer(root), root); err != nil || e.mspHostSession() != mspFenceSession {
+		t.Fatalf("established: %v", err)
+	}
+	if err := e.admit(a2); err == nil || !strings.Contains(err.Error(), "already serves a conversation") {
+		t.Fatalf("a setup admitted after the host had its conversation: %v", err)
+	}
+
+	g, root := establishMSPSession(t)
+	if err := g.inboundFrame(mspApprovalRequest, root); err != nil {
+		t.Fatal(err)
+	}
+	receipt := `{"jsonrpc":"2.0","id":7,"result":{}}`
+	a, errA := g.check(receipt, root)
+	b, errB := g.check(receipt, root)
+	if errA != nil || errB != nil {
+		t.Fatalf("receipt checks: %v %v", errA, errB)
+	}
+	if err := g.admit(a); err != nil {
+		t.Fatal(err)
+	}
+	g.written(a)
+	if err := g.admit(b); acpTypedErrorCode(err) != acpErrorCodeFrameRefused {
+		t.Fatalf("a second receipt admitted: %v", err)
+	}
+	// Two different initializes, both checked before either was written.
+	h, root := newTestMSPFence(t)
+	i1, _ := h.check(`{"jsonrpc":"2.0","id":"relay-msp-init","method":"initialize","params":{"clientInfo":{"name":"aiexpedite","version":"1"}}}`, root)
+	i2, _ := h.check(`{"jsonrpc":"2.0","id":"relay-msp-init","method":"initialize","params":{"clientInfo":{"name":"other","version":"1"}}}`, root)
+	if err := h.admit(i1); err != nil {
+		t.Fatal(err)
+	}
+	h.written(i1)
+	if err := h.admit(i2); acpTypedErrorCode(err) != acpErrorCodeFrameRefused {
+		t.Fatalf("a second, different initialize admitted: %v", err)
 	}
 }

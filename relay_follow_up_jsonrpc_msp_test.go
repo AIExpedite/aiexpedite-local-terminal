@@ -504,3 +504,43 @@ func TestTheMSPTrackerFollowsTheHost(t *testing.T) {
 		t.Fatal("state survived the host's exit")
 	}
 }
+
+// The stdin-boundary half of the fence, on the tracker itself: whatever the
+// earlier check saw, nothing is admitted once the foreground is done, into
+// another turn, or beside an open request; an admitted write keeps the turn it
+// named for reading Muse's answer.
+func TestTheMSPTrackerAdmitsALiveWriteOnlyIntoTheRunningTurn(t *testing.T) {
+	fence := func(s liveWriteState) string {
+		c := okCheck(time.Now())
+		c.SessionRunning = !s.Closed
+		c.ApprovalPending = s.ApprovalPending
+		c.NoActiveTurn = s.NoActiveTurn
+		c.TurnMismatch = s.TurnMismatch
+		return c.fenceReason()
+	}
+	tr := newLiveFollowUpTrackerFor(museCodeCliAgentID)
+	if ch, reason := tr.admitLiveWriteFor("relay-followup-a", "a", "t", mspTestTurn, fence); ch != nil || reason != followUpReasonNoActiveTurn {
+		t.Fatalf("no turn: %q", reason)
+	}
+	tr.inbound(`{"jsonrpc":"2.0","method":"turn/started","params":{"turnId":"` + mspTestTurn + `"}}`)
+	if ch, reason := tr.admitLiveWriteFor("relay-followup-b", "b", "t", mspOtherTurn, fence); ch != nil || reason != followUpReasonTurnMismatch {
+		t.Fatalf("another turn: %q", reason)
+	}
+	tr.inbound(`{"jsonrpc":"2.0","id":4,"method":"approval/request","params":{"approvalId":"apr","turnId":"` + mspTestTurn + `"}}`)
+	if ch, reason := tr.admitLiveWriteFor("relay-followup-c", "c", "t", mspTestTurn, fence); ch != nil || reason != followUpReasonApprovalPending {
+		t.Fatalf("beside an approval: %q", reason)
+	}
+	tr.inbound(`{"jsonrpc":"2.0","method":"approval/resolved","params":{"approvalId":"apr"}}`)
+	ch, reason := tr.admitLiveWriteFor("relay-followup-d", "d", "t", mspTestTurn, fence)
+	if ch == nil || reason != "" {
+		t.Fatalf("into the running turn: %q", reason)
+	}
+	tr.inbound(`{"jsonrpc":"2.0","id":"relay-followup-d","result":{"status":"accepted","turnId":"` + mspTestTurn + `"}}`)
+	if a := <-ch; a.ExpectedTurnID != mspTestTurn || classifyLiveFollowUpAnswerFor(museCodeCliAgentID, a).State != followUpRowWritten {
+		t.Fatalf("answer %+v", a)
+	}
+	tr.inbound(`{"jsonrpc":"2.0","method":"turn/foregroundCompleted","params":{"turnId":"` + mspTestTurn + `"}}`)
+	if ch, reason := tr.admitLiveWriteFor("relay-followup-e", "e", "t", mspTestTurn, fence); ch != nil || reason != followUpReasonNoActiveTurn {
+		t.Fatalf("after the foreground: %q", reason)
+	}
+}
