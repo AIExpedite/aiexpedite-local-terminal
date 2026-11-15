@@ -1,4 +1,4 @@
-//go:build codexlive || groklive
+//go:build codexlive || groklive || opencodelive || agylive
 
 package main
 
@@ -7,15 +7,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// Shared by the Codex and Grok live follow-up certification runs
+// Shared by the live follow-up certification runs
 // (relay_follow_up_codex_certification_test.go,
-// relay_follow_up_grok_certification_test.go). Never part of `go test ./...`.
+// relay_follow_up_grok_certification_test.go,
+// relay_follow_up_opencode_certification_test.go,
+// relay_follow_up_agy_certification_test.go). Never part of `go test ./...`.
 
 const liveCertSecret = "test-secret"
 
@@ -32,7 +35,9 @@ type liveCertClient struct {
 }
 
 func (c *liveCertClient) publish(res resultMsg) {
-	if res.Type != "codex_appserver_message" && res.Type != "grok_acp_message" {
+	switch res.Type {
+	case "codex_appserver_message", "grok_acp_message", "opencode_acp_message", "antigravity_acp_message":
+	default:
 		return
 	}
 	c.mu.Lock()
@@ -213,4 +218,23 @@ func containsAll(s string, parts ...string) bool {
 		}
 	}
 	return true
+}
+
+// certPermissionAnswer selects the request's option of the given kind.
+func certPermissionAnswer(f jsonRPCFrame, kind string) string {
+	reply := `{"jsonrpc":"2.0","id":` + string(f.ID) + `,"result":{"outcome":{"outcome":"cancelled"}}}`
+	var p struct {
+		Options []struct {
+			OptionID string `json:"optionId"`
+			Kind     string `json:"kind"`
+		} `json:"options"`
+	}
+	if json.Unmarshal(f.Params, &p) == nil {
+		for _, o := range p.Options {
+			if o.Kind == kind {
+				return `{"jsonrpc":"2.0","id":` + string(f.ID) + `,"result":{"outcome":{"outcome":"selected","optionId":` + strconv.Quote(o.OptionID) + `}}}`
+			}
+		}
+	}
+	return reply
 }

@@ -1,26 +1,38 @@
 // File: relay_follow_up_jsonrpc.go
 // -----------------------------------------------------------------------------
-// Live follow-ups for Codex (`turn/steer`) and Grok Build (`_x.ai/interject`),
-// device half (L1/L2 live follow-ups spec §2.3, §2.3.1, §2.8).
+// Live follow-ups for Codex (`turn/steer`), Grok Build (`_x.ai/interject`),
+// and OpenCode (`_session/steering`) and Antigravity (a second
+// `session/prompt`) on their ACP drivers; device half (L1/L2 live follow-ups
+// spec §2.3, §2.3.1, §2.8; L3/L4 ACP drivers spec §2.2, §2.6).
 //
 // Claude Code takes a live follow-up as a stream-json user message, and the
-// stdin write returning is all the evidence there is. Codex and Grok take one as
-// a JSON-RPC REQUEST and answer it, so the device builds the request itself
-// (codexSteerFrame, grokInterjectFrame), writes it under the follow-up ledger
-// (relay_follow_up_ledger.go) and settles the attempt from the CLI's own
-// answer. Neither CLI de-duplicates the request (the same steer or interjection
-// sent twice is applied twice), so that ledger is the only at-most-once guard.
+// stdin write returning is all the evidence there is. Codex, Grok and OpenCode
+// take one as a JSON-RPC REQUEST and answer it, so the device builds the
+// request itself (codexSteerFrame, grokInterjectFrame, openCodeSteerFrame),
+// writes it under the follow-up ledger (relay_follow_up_ledger.go) and settles
+// the attempt from the CLI's own answer. Antigravity takes one as a second
+// `session/prompt` (antigravityFollowUpPromptFrame) that it answers only when
+// the turn ends, so its write returning is the evidence, as for Claude Code;
+// the running prompt's answer then says where the message went (L3/L4 §2.6).
+// No CLI de-duplicates the request (the same steer or interjection sent twice
+// is applied twice), so that ledger is the only at-most-once guard.
 //
-// Each Codex and Grok child gets one liveFollowUpTracker, fed with every frame
-// written through Send (outbound) and every frame read off stdout (inbound). It
-// knows only what the live write needs:
+// Each Codex, Grok, OpenCode and Antigravity child gets one
+// liveFollowUpTracker, fed with every frame written through Send (outbound)
+// and every frame read off stdout (inbound). It knows only what the live write
+// needs:
 //
 //   - answer waiters for the ids the device itself chose (`relay-followup-…`);
-//   - the open client-bound requests (Codex: any server request; Grok:
-//     `session/request_permission`), so nothing is written beside an approval;
+//   - the open client-bound requests (Codex: any server request; Grok,
+//     OpenCode and Antigravity: `session/request_permission`), so nothing is
+//     written beside an approval;
 //   - Grok only: the outstanding client `session/prompt` requests, Grok's own
 //     id for the one running, whether its turn has finished, the ACP session
-//     the child is on, and the interjections written during each prompt.
+//     the child is on, and the interjections written during each prompt;
+//   - OpenCode and Antigravity: the outstanding client `session/prompt`
+//     requests (a turn runs while one is unanswered), the ACP session the
+//     child is on, whether OpenCode's `initialize` advertised steering, and
+//     the follow-up prompt the device wrote while an Antigravity prompt ran.
 //
 // Grok runs an interjection that misses the running turn's last drain as a
 // "fallback" turn of its own, after that turn (owner decision O1: keep it
@@ -105,6 +117,24 @@ const (
 	followUpReasonWriteFailed        = "writeFailed"
 	followUpReasonAnswerUnrecognised = "answerUnrecognised"
 
+	// ACP `initialize`: its answer advertises OpenCode's steering
+	// (`_meta.steering.supported`).
+	acpMethodInitialize = "initialize"
+
+	// OPENCODE_STEERING_METHOD / OPENCODE_STEERING_OUTCOMES (3.23.579).
+	openCodeMethodSteering      = "_session/steering"
+	openCodeSteerInjected       = "injected"
+	openCodeSteerPromptRequired = "promptRequired"
+	// openCodeSessionNotFound is the text of OpenCode's -32602 for a session
+	// it does not have (L3/L4 spec W-O12).
+	openCodeSessionNotFound = "session not found"
+
+	// RELAY_TURN_PROMPT_RPC_ID_PREFIX: an Antigravity follow-up's prompt is
+	// `relay-turn-fu_<attemptId>` (relayPromptRpcId(relayFollowUpTurnId(…))),
+	// so a follow-up agy runs as a turn of its own settles under the id
+	// terminal-service's `next` binding already waits for.
+	relayTurnPromptRPCIDPrefix = "relay-turn-"
+
 	// grokAnsweredInterjectionsMax bounds the interjections remembered from
 	// prompts already answered (only to log a fallback that ran after its
 	// prompt's answer); grokSeenFallbacksMax bounds the fallback ids already
@@ -135,6 +165,18 @@ func relayLiveFollowUpRPCID(attemptID string) string {
 
 func isRelayLiveFollowUpRPCID(id string) bool {
 	return strings.HasPrefix(id, relayLiveFollowUpRPCIDPrefix) && len(id) > len(relayLiveFollowUpRPCIDPrefix)
+}
+
+// relayFollowUpPromptRPCID is the id of the `session/prompt` an Antigravity
+// live follow-up writes: `relay-turn-fu_<attemptId>`.
+func relayFollowUpPromptRPCID(attemptID string) string {
+	return relayTurnPromptRPCIDPrefix + relayFollowUpTurnPrefix + attemptID
+}
+
+// isACPDriverKind reports the agents whose live follow-up rides a selected
+// ACP driver (acp_profiles.go): OpenCode and Antigravity.
+func isACPDriverKind(kind string) bool {
+	return kind == opencodeCliAgentID || kind == antigravityCliAgentID
 }
 
 /* --------------------------------------------------------------------------
@@ -186,6 +228,37 @@ func grokInterjectFrame(rpcID, acpSessionID, text, attemptID string) (string, er
 		SessionID:      acpSessionID,
 		Text:           text,
 		InterjectionID: attemptID,
+	})
+}
+
+// acpPromptParams are the params of OpenCode's `_session/steering` and of an
+// ACP `session/prompt`: the session and one text block.
+type acpPromptParams struct {
+	SessionID string         `json:"sessionId"`
+	Prompt    []acpTextBlock `json:"prompt"`
+}
+
+type acpTextBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// openCodeSteerFrame is the `_session/steering` an OpenCode live attempt
+// writes into the signed ACP session (L3/L4 spec §2.6).
+func openCodeSteerFrame(rpcID, acpSessionID, text string) (string, error) {
+	return marshalLiveFollowUpRequest(rpcID, openCodeMethodSteering, acpPromptParams{
+		SessionID: acpSessionID,
+		Prompt:    []acpTextBlock{{Type: "text", Text: text}},
+	})
+}
+
+// antigravityFollowUpPromptFrame is the `session/prompt` an Antigravity live
+// attempt writes into the signed ACP session while a turn runs: agy answers
+// the running prompt at once and carries the turn on under this one (W-A5).
+func antigravityFollowUpPromptFrame(rpcID, acpSessionID, text string) (string, error) {
+	return marshalLiveFollowUpRequest(rpcID, acpMethodSessionPrompt, acpPromptParams{
+		SessionID: acpSessionID,
+		Prompt:    []acpTextBlock{{Type: "text", Text: text}},
 	})
 }
 
@@ -256,6 +329,10 @@ func classifyLiveFollowUpAnswer(kind, frame string) liveFollowUpVerdict {
 			if kind == grokCliAgentID && bytes.Contains(e.Data, []byte("session not found")) {
 				return refusedVerdict(followUpReasonConversationMismatch)
 			}
+			if kind == opencodeCliAgentID && (strings.Contains(e.Message, openCodeSessionNotFound) ||
+				bytes.Contains(e.Data, []byte(openCodeSessionNotFound))) {
+				return refusedVerdict(followUpReasonConversationMismatch)
+			}
 			return refusedVerdict(followUpReasonCliRefused)
 		}
 		return liveFollowUpVerdict{State: followUpRowUnknown}
@@ -281,6 +358,21 @@ func classifyLiveFollowUpAnswer(kind, frame string) liveFollowUpVerdict {
 		}
 		if json.Unmarshal(answer.Result, &r) == nil && r.Result.Status == "queued" {
 			return liveFollowUpVerdict{State: followUpRowWritten}
+		}
+	case opencodeCliAgentID:
+		// `{"outcome":"injected"}`, or `{"outcome":"promptRequired",
+		// "reason":"noRunningTurn"}` when no turn was running and OpenCode
+		// added nothing (W-O5).
+		var r struct {
+			Outcome string `json:"outcome"`
+		}
+		if json.Unmarshal(answer.Result, &r) == nil {
+			switch r.Outcome {
+			case openCodeSteerInjected:
+				return liveFollowUpVerdict{State: followUpRowWritten}
+			case openCodeSteerPromptRequired:
+				return refusedVerdict(followUpReasonNoActiveTurn)
+			}
 		}
 	}
 	return liveFollowUpVerdict{State: followUpRowUnknown, Reason: followUpReasonAnswerUnrecognised}
@@ -347,10 +439,47 @@ func (f jsonRPCFrame) stringID() (string, bool) {
 }
 
 // liveFollowUpAnswer is what an answer waiter receives: the CLI's response
-// frame, or exited when the child's stdout ended first.
+// frame, or exited when the child's stdout ended first. AfterPrompt (OpenCode)
+// says the prompt that was running at the write had already been answered
+// when this answer was read: an `injected` steer is then held in OpenCode's
+// inbox until the next prompt (W-O6). For Antigravity the frame is the
+// running prompt's own answer (acpHandoverAnswer).
 type liveFollowUpAnswer struct {
-	Frame  string
-	Exited bool
+	Frame       string
+	Exited      bool
+	AfterPrompt bool
+}
+
+// acpHandoverAnswer reports an Antigravity prompt answer that hands its turn
+// over to the follow-up prompt written while it ran: a success with no
+// `usage` (W-A5; agy's normal end of a turn carries it). Anything else — a
+// success with `usage`, an error — ended that prompt's turn, so the
+// follow-up runs as the next turn.
+func acpHandoverAnswer(frame string) bool {
+	var answer struct {
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal([]byte(frame), &answer) != nil || len(answer.Error) > 0 || len(answer.Result) == 0 {
+		return false
+	}
+	var result map[string]json.RawMessage
+	if json.Unmarshal(answer.Result, &result) != nil || result == nil {
+		return false
+	}
+	_, usage := result["usage"]
+	return !usage
+}
+
+// acpTrackedPrompt is one client `session/prompt` on an OpenCode or
+// Antigravity child, from its write until its answer is read.
+type acpTrackedPrompt struct {
+	rpcKey   string
+	answered bool
+	// handoverTo (Antigravity) is the id of the follow-up prompt the device
+	// wrote while this one ran; handoverWaiter receives this prompt's answer.
+	handoverTo     string
+	handoverWaiter chan liveFollowUpAnswer
 }
 
 // liveWriteState is the tracker's part of the stdin-boundary fence, read
@@ -396,13 +525,32 @@ type liveFollowUpTracker struct {
 	waiters map[string]chan liveFollowUpAnswer
 	open    map[string]struct{}
 
-	// Grok only.
+	// Grok, OpenCode and Antigravity: the ACP session the child is on, and
+	// the `session/new` requests whose answer names it.
 	acpSessionID string
 	pendingNew   map[string]struct{}
-	prompts      []*grokTrackedPrompt
-	answered     []grokInterjection
-	seen         []string
-	released     []string
+
+	// Grok only.
+	prompts  []*grokTrackedPrompt
+	answered []grokInterjection
+	seen     []string
+	released []string
+
+	// OpenCode and Antigravity only.
+	acpPrompts []*acpTrackedPrompt
+	// acpSetup: `session/load` / `session/resume` requests by id key, with
+	// the session each names; acpInit: the `initialize` request's id key.
+	acpSetup map[string]string
+	acpInit  string
+	// steering: OpenCode's `initialize` answer advertised
+	// `_meta.steering.supported` (W-O3). A session that did not is never
+	// written to live, whatever its version said.
+	steering bool
+	// waiterPrompt: the prompt that was running when an OpenCode steer was
+	// written, per waiter id; lateWaiters: waiters whose attempt was already
+	// answered unknown for want of an answer.
+	waiterPrompt map[string]*acpTrackedPrompt
+	lateWaiters  map[string]bool
 
 	// publishMu orders every publish the tracker makes (a released answer, the
 	// cap, the flush at the end) against the reader detaching, which happens
@@ -424,10 +572,13 @@ func newLiveFollowUpTracker(cliAgentID, launchedVersion string) *liveFollowUpTra
 
 func newLiveFollowUpTrackerFor(cliAgentID string) *liveFollowUpTracker {
 	return &liveFollowUpTracker{
-		kind:       cliAgentID,
-		waiters:    map[string]chan liveFollowUpAnswer{},
-		open:       map[string]struct{}{},
-		pendingNew: map[string]struct{}{},
+		kind:         cliAgentID,
+		waiters:      map[string]chan liveFollowUpAnswer{},
+		open:         map[string]struct{}{},
+		pendingNew:   map[string]struct{}{},
+		acpSetup:     map[string]string{},
+		waiterPrompt: map[string]*acpTrackedPrompt{},
+		lateWaiters:  map[string]bool{},
 	}
 }
 
@@ -439,6 +590,8 @@ type liveFollowUpOutbound struct {
 	loadSession string
 	promptKey   string
 	newKey      string
+	setupKey    string
+	initKey     string
 }
 
 // outbound reads a frame about to be written to the child. A client
@@ -458,7 +611,13 @@ func (t *liveFollowUpTracker) outbound(frame string) liveFollowUpOutbound {
 		out.responseKey = f.idKey()
 		return out
 	}
-	if t.kind != grokCliAgentID || !f.isRequest() {
+	if !f.isRequest() {
+		return out
+	}
+	if isACPDriverKind(t.kind) {
+		return t.acpOutbound(f, out)
+	}
+	if t.kind != grokCliAgentID {
 		return out
 	}
 	t.mu.Lock()
@@ -493,10 +652,20 @@ func (o liveFollowUpOutbound) done(written bool) {
 	defer t.mu.Unlock()
 	if !written {
 		if o.promptKey != "" {
-			t.removePromptLocked(o.promptKey)
+			if isACPDriverKind(t.kind) {
+				t.removeACPPromptLocked(o.promptKey)
+			} else {
+				t.removePromptLocked(o.promptKey)
+			}
 		}
 		if o.newKey != "" {
 			delete(t.pendingNew, o.newKey)
+		}
+		if o.setupKey != "" {
+			delete(t.acpSetup, o.setupKey)
+		}
+		if o.initKey != "" && t.acpInit == o.initKey {
+			t.acpInit = ""
 		}
 		return
 	}
@@ -522,12 +691,20 @@ func (t *liveFollowUpTracker) removePromptLocked(key string) {
 // stranded interjection's fallback turn); every other frame is published
 // verbatim as before.
 func (t *liveFollowUpTracker) inbound(frame string) (hold bool) {
+	hold, _ = t.inboundAnnotated(frame)
+	return hold
+}
+
+// inboundAnnotated is inbound plus what the device adds to the frame's
+// published result (acpFrameAnnotation): an Antigravity prompt answer that
+// handed its turn over, an OpenCode steer answer's ledger outcome.
+func (t *liveFollowUpTracker) inboundAnnotated(frame string) (hold bool, ann acpFrameAnnotation) {
 	if t == nil {
-		return false
+		return false, ann
 	}
 	f, ok := parseJSONRPCFrame(frame)
 	if !ok {
-		return false
+		return false, ann
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -535,13 +712,23 @@ func (t *liveFollowUpTracker) inbound(frame string) (hold bool) {
 	case f.isResponse():
 		if id, ok := f.stringID(); ok && isRelayLiveFollowUpRPCID(id) {
 			if ch := t.waiters[id]; ch != nil {
+				prompt, late := t.waiterPrompt[id], t.lateWaiters[id]
 				delete(t.waiters, id)
-				ch <- liveFollowUpAnswer{Frame: strings.TrimSpace(frame)}
+				delete(t.waiterPrompt, id)
+				delete(t.lateWaiters, id)
+				trimmed := strings.TrimSpace(frame)
+				ch <- liveFollowUpAnswer{Frame: trimmed, AfterPrompt: prompt != nil && prompt.answered}
+				if t.kind == opencodeCliAgentID {
+					ann.steerOutcome = steerOutcomeOf(classifyLiveFollowUpAnswer(t.kind, trimmed), late)
+				}
 			}
-			return false
+			return false, ann
 		}
 		if t.kind == grokCliAgentID {
-			return t.grokResponseLocked(f, frame)
+			return t.grokResponseLocked(f, frame), ann
+		}
+		if isACPDriverKind(t.kind) {
+			return false, t.acpResponseLocked(f, frame)
 		}
 	case f.isRequest():
 		if t.kind == codexCliAgentID || f.Method == acpMethodRequestPermission {
@@ -555,7 +742,178 @@ func (t *liveFollowUpTracker) inbound(frame string) (hold bool) {
 			t.grokNotificationLocked(f)
 		}
 	}
-	return false
+	return false, ann
+}
+
+// steerOutcomeOf is the ledger outcome (DEVICE_FOLLOW_UP_OUTCOME) a verdict
+// becomes. An answer read after the attempt was answered unknown can only
+// lift it to written (LateWritten): anything else leaves it unknown.
+func steerOutcomeOf(v liveFollowUpVerdict, late bool) string {
+	switch {
+	case v.State == followUpRowWritten:
+		return followUpOutcomeWritten
+	case late:
+		return followUpOutcomeUnknown
+	case v.State == followUpRowRefused:
+		return followUpOutcomeNotWritten
+	}
+	return followUpOutcomeUnknown
+}
+
+/* --------------------------------------------------------------------------
+   OpenCode and Antigravity (the ACP drivers)
+   -------------------------------------------------------------------------- */
+
+// acpOutbound records, before the write, a client request the ACP drivers'
+// tracker follows: a prompt (a turn runs until it is answered), a session
+// setup (its answer names the ACP session), and `initialize` (its answer says
+// whether OpenCode steers).
+func (t *liveFollowUpTracker) acpOutbound(f jsonRPCFrame, out liveFollowUpOutbound) liveFollowUpOutbound {
+	key := f.idKey()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch f.Method {
+	case acpMethodSessionPrompt:
+		out.promptKey = key
+		t.acpPrompts = append(t.acpPrompts, &acpTrackedPrompt{rpcKey: key})
+	case acpMethodSessionNew:
+		out.newKey = key
+		t.pendingNew[key] = struct{}{}
+	case acpMethodSessionLoad, acpMethodSessionResume:
+		var p struct {
+			SessionID string `json:"sessionId"`
+		}
+		_ = json.Unmarshal(f.Params, &p)
+		out.setupKey = key
+		t.acpSetup[key] = p.SessionID
+	case acpMethodInitialize:
+		out.initKey = key
+		t.acpInit = key
+	}
+	return out
+}
+
+func (t *liveFollowUpTracker) removeACPPromptLocked(key string) {
+	for i, p := range t.acpPrompts {
+		if p.rpcKey == key {
+			t.acpPrompts = append(t.acpPrompts[:i], t.acpPrompts[i+1:]...)
+			return
+		}
+	}
+}
+
+// acpResponseLocked reads an answer to one of the client requests acpOutbound
+// recorded.
+func (t *liveFollowUpTracker) acpResponseLocked(f jsonRPCFrame, frame string) (ann acpFrameAnnotation) {
+	key := f.idKey()
+	success := len(f.Error) == 0 && len(f.Result) > 0
+	if _, ok := t.pendingNew[key]; ok {
+		delete(t.pendingNew, key)
+		var r struct {
+			SessionID string `json:"sessionId"`
+		}
+		if success && json.Unmarshal(f.Result, &r) == nil && r.SessionID != "" {
+			t.acpSessionID = r.SessionID
+		}
+		return ann
+	}
+	if requested, ok := t.acpSetup[key]; ok {
+		delete(t.acpSetup, key)
+		if success {
+			var r struct {
+				SessionID string `json:"sessionId"`
+			}
+			if json.Unmarshal(f.Result, &r) == nil && r.SessionID != "" {
+				requested = r.SessionID
+			}
+			if requested != "" {
+				t.acpSessionID = requested
+			}
+		}
+		return ann
+	}
+	if t.acpInit != "" && key == t.acpInit {
+		t.acpInit = ""
+		var r struct {
+			Meta struct {
+				Steering struct {
+					Supported bool `json:"supported"`
+				} `json:"steering"`
+			} `json:"_meta"`
+		}
+		t.steering = success && json.Unmarshal(f.Result, &r) == nil && r.Meta.Steering.Supported
+		return ann
+	}
+	for i, p := range t.acpPrompts {
+		if p.rpcKey != key {
+			continue
+		}
+		t.acpPrompts = append(t.acpPrompts[:i], t.acpPrompts[i+1:]...)
+		p.answered = true
+		// The prompt's permission requests close with it (agy 1.5.1 closes
+		// them then, W-A6) — unless another prompt still runs: a request asked
+		// under a prompt that handed its turn over may still be open.
+		if len(t.acpPrompts) == 0 {
+			t.open = map[string]struct{}{}
+		}
+		if p.handoverTo != "" {
+			trimmed := strings.TrimSpace(frame)
+			if acpHandoverAnswer(trimmed) {
+				ann.handoverTo = p.handoverTo
+			}
+			if p.handoverWaiter != nil {
+				p.handoverWaiter <- liveFollowUpAnswer{Frame: trimmed}
+				p.handoverWaiter = nil
+			}
+		}
+		return ann
+	}
+	return ann
+}
+
+// acpRunningPromptLocked is the newest client prompt still unanswered: the
+// turn a follow-up joins (OpenCode runs one prompt at a time, W-O7; agy hands
+// a running turn over to each newer prompt, W-A5).
+func (t *liveFollowUpTracker) acpRunningPromptLocked() *acpTrackedPrompt {
+	if n := len(t.acpPrompts); n > 0 {
+		return t.acpPrompts[n-1]
+	}
+	return nil
+}
+
+// clientTurnRunning reports whether a client prompt's turn is running on an
+// OpenCode or Antigravity child.
+func (t *liveFollowUpTracker) clientTurnRunning() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.acpRunningPromptLocked() != nil
+}
+
+// steeringAdvertised reports whether OpenCode's `initialize` answer
+// advertised `_meta.steering.supported`.
+func (t *liveFollowUpTracker) steeringAdvertised() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.steering
+}
+
+// markLate notes that the attempt waiting on rpcID was answered unknown for
+// want of an answer: a refusal read now cannot change that.
+func (t *liveFollowUpTracker) markLate(rpcID string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.waiters[rpcID]; ok {
+		t.lateWaiters[rpcID] = true
+	}
 }
 
 func (t *liveFollowUpTracker) codexNotificationLocked(f jsonRPCFrame) {
@@ -788,11 +1146,26 @@ func (t *liveFollowUpTracker) admitLiveWrite(rpcID, attemptID, text string, fenc
 		running = t.runningPromptLocked()
 		state.NoActiveTurn = running == nil
 	}
+	var acpRunning *acpTrackedPrompt
+	if isACPDriverKind(t.kind) {
+		acpRunning = t.acpRunningPromptLocked()
+		state.NoActiveTurn = acpRunning == nil
+	}
 	if reason := fence(state); reason != "" {
 		return nil, reason
 	}
 	ch := make(chan liveFollowUpAnswer, 1)
+	if acpRunning != nil && t.kind == antigravityCliAgentID {
+		// agy answers the follow-up prompt only when the turn ends: what the
+		// ledger waits for is the RUNNING prompt's answer (acpHandoverAnswer).
+		acpRunning.handoverTo = rpcID
+		acpRunning.handoverWaiter = ch
+		return ch, ""
+	}
 	t.waiters[rpcID] = ch
+	if t.kind == opencodeCliAgentID {
+		t.waiterPrompt[rpcID] = acpRunning
+	}
 	if running != nil {
 		running.interjections = append(running.interjections, grokInterjection{attemptID: attemptID, text: text})
 	}
@@ -800,7 +1173,10 @@ func (t *liveFollowUpTracker) admitLiveWrite(rpcID, attemptID, text string, fenc
 }
 
 // forget drops the answer waiter for rpcID (a failed write, or the late
-// window ended). An answer read afterwards is still forwarded as a frame.
+// window ended). An answer read afterwards is still forwarded as a frame. For
+// Antigravity it also drops the handover a failed write recorded, so the
+// running prompt's answer is never read as handed over to a prompt agy may
+// not have received.
 func (t *liveFollowUpTracker) forget(rpcID string) {
 	if t == nil {
 		return
@@ -808,6 +1184,14 @@ func (t *liveFollowUpTracker) forget(rpcID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.waiters, rpcID)
+	delete(t.waiterPrompt, rpcID)
+	delete(t.lateWaiters, rpcID)
+	for _, p := range t.acpPrompts {
+		if p.handoverTo == rpcID {
+			p.handoverTo = ""
+			p.handoverWaiter = nil
+		}
+	}
 }
 
 // attachPublisher gives the tracker the reader's own publish (Grok), through
@@ -900,6 +1284,15 @@ func (t *liveFollowUpTracker) readerDone(flush bool) {
 	t.open = map[string]struct{}{}
 	waiters := t.waiters
 	t.waiters = map[string]chan liveFollowUpAnswer{}
+	t.waiterPrompt = map[string]*acpTrackedPrompt{}
+	t.lateWaiters = map[string]bool{}
+	for _, p := range t.acpPrompts {
+		if p.handoverWaiter != nil {
+			waiters[p.handoverTo] = p.handoverWaiter
+			p.handoverWaiter = nil
+		}
+	}
+	t.acpPrompts = nil
 	t.mu.Unlock()
 	for _, ch := range waiters {
 		ch <- liveFollowUpAnswer{Exited: true}

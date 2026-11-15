@@ -246,6 +246,16 @@ type capabilitiesInfo struct {
 	// answers from the ledger. `liveAgents` lists only CLIs certified for live
 	// follow-ups (empty until a certification run passes).
 	RelayFollowUps *relayFollowUpsCapability `json:"relayFollowUps,omitempty"`
+	// ACPDrivers (DEVICE_RELAY_CAPABILITIES.ACP_DRIVERS, acp_profiles.go): the
+	// selected ACP drivers this computer can run now — `opencode` on
+	// `opencode acp` when OpenCode 2.2.7 or newer is installed as its native
+	// binary (and `antigravity` only in a build that includes that driver).
+	// terminal-service chooses the ACP driver for an agent only when it is
+	// listed here, the reported CLI version meets the minimum, and its own
+	// switch names the agent. Never omitempty: present on every build that has
+	// the drivers, an empty list meaning "the CLI is too old or missing".
+	// Re-read after every CLI usage refresh (refreshACPDriversCapability).
+	ACPDrivers *acpDriversCapability `json:"acpDrivers"`
 }
 
 type relayFollowUpsCapability struct {
@@ -401,6 +411,7 @@ func newMachineCapabilities() *capabilitiesInfo {
 		SignedExecutionID:   true,
 		SignedCommandExpiry: true,
 		WhatsApp:            currentWhatsAppCapability(),
+		ACPDrivers:          newACPDriversCapability(),
 	}
 }
 

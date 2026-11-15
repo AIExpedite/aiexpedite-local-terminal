@@ -360,6 +360,16 @@ func StartAgent(cfg *Config) {
 	go globalGrokACPManager.CleanupStale(grokACPMaxLifetime)
 	fmt.Println("[aiexpedite] Grok ACP manager ready")
 
+	/* 3b''a. Initialize the selected ACP drivers (acp_profiles.go) -------- */
+	// OpenCode on `opencode acp` and Antigravity on `agy acp`: the same ACP
+	// family manager as Grok's, one per agent. terminal-service starts a
+	// session on one only when capabilities.acpDrivers lists the agent.
+	globalOpenCodeACPManager = newACPManager(cfg, openCodeACPProfile)
+	go globalOpenCodeACPManager.CleanupStale(acpFamilyMaxLifetime)
+	globalAntigravityACPManager = newACPManager(cfg, antigravityACPProfile)
+	go globalAntigravityACPManager.CleanupStale(acpFamilyMaxLifetime)
+	fmt.Println("[aiexpedite] ACP driver managers ready")
+
 	/* 3b'''. Initialize Claude native manager (stream-json over stdio) ---- */
 	// Drives `claude --output-format stream-json` for Claude Code native-chat
 	// rendering. Same manager shape as codex/grok, but forwards Claude's
@@ -416,6 +426,13 @@ func StartAgent(cfg *Config) {
 			return globalGrokACPManager.ActiveCount()
 		}
 		return 0
+	})
+	registerDrainWorkSource(func() int {
+		n := 0
+		for _, m := range acpDriverManagers() {
+			n += m.ActiveCount()
+		}
+		return n
 	})
 	registerDrainWorkSource(func() int {
 		if globalClaudeNativeManager != nil {

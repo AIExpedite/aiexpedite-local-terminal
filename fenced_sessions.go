@@ -101,6 +101,14 @@ func endSessionOnDevice(sessionID string) {
 			fmt.Printf("%s[fence] Ending grok session %s: %v%s\n", colorYellow, sessionID, err, colorReset)
 		}
 	}
+	for _, m := range acpDriverManagers() {
+		if m.Get(sessionID) != nil {
+			ended = true
+			if err := m.End(sessionID); err != nil {
+				fmt.Printf("%s[fence] Ending %s session %s: %v%s\n", colorYellow, m.profile.noun, sessionID, err, colorReset)
+			}
+		}
+	}
 	if m := globalAntigravityNativeManager; m != nil && m.Get(sessionID) != nil {
 		ended = true
 		if err := m.End(sessionID); err != nil {
@@ -406,6 +414,7 @@ func isSessionEndCommandType(t string) bool {
 	switch t {
 	case "session_end", "codex_appserver_end", "claude_native_end",
 		"grok_acp_end", "antigravity_native_end", "opencode_native_end",
+		"opencode_acp_end", "antigravity_acp_end",
 		"musecode_native_end":
 		return true
 	}
