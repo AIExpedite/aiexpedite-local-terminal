@@ -83,11 +83,13 @@ func TestFollowUpWireValuesArePinned(t *testing.T) {
 	// Each certified CLI is listed at exactly the version its own run passed
 	// at, never lower. Every other CLI stays uncertified until its own run
 	// passes: listing it would advertise a delivery path that does not exist
-	// for it (Antigravity, OpenCode and Muse Code run one process per turn).
+	// for it (OpenCode and Muse Code take one only on drivers not yet
+	// certified; Antigravity is certified on its ACP driver alone).
 	want := map[string]string{
-		claudeCodeCliAgentID: "2.1.322",
-		codexCliAgentID:      "0.168.0",
-		grokCliAgentID:       "1.0.77",
+		claudeCodeCliAgentID:  "2.1.322",
+		codexCliAgentID:       "0.168.0",
+		grokCliAgentID:        "1.0.77",
+		antigravityCliAgentID: "1.5.9",
 	}
 	for id, version := range want {
 		if liveFollowUpCertified[id] != version {

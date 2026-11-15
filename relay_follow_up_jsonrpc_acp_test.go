@@ -8,8 +8,9 @@ import (
 )
 
 // Live follow-ups on the ACP drivers (L3/L4 spec §2.6), against a fake CLI
-// over pipes. The kinds are certified for the test only: the shipped
-// liveFollowUpCertified lists neither.
+// over pipes. The kinds are certified for the test only, at a version of the
+// test's own: the shipped liveFollowUpCertified lists Antigravity (1.5.9) but
+// not OpenCode.
 
 const acpTestSession = "ses_1"
 
