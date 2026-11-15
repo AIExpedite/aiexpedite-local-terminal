@@ -256,6 +256,13 @@ type capabilitiesInfo struct {
 	// the drivers, an empty list meaning "the CLI is too old or missing".
 	// Re-read after every CLI usage refresh (refreshACPDriversCapability).
 	ACPDrivers *acpDriversCapability `json:"acpDrivers"`
+	// MSPDrivers (DEVICE_RELAY_CAPABILITIES.MSP_DRIVERS,
+	// musecode_msp_driver.go): `museCode` when Muse Code 1.4.18 or newer is
+	// installed and its own schema export has the MSP surface the
+	// `muse serve` chat driver uses. The same shape and rules as ACPDrivers:
+	// never omitempty, an empty list meaning "the CLI does not qualify", and
+	// re-read with it.
+	MSPDrivers *mspDriversCapability `json:"mspDrivers"`
 }
 
 type relayFollowUpsCapability struct {
@@ -412,6 +419,7 @@ func newMachineCapabilities() *capabilitiesInfo {
 		SignedCommandExpiry: true,
 		WhatsApp:            currentWhatsAppCapability(),
 		ACPDrivers:          newACPDriversCapability(),
+		MSPDrivers:          newMSPDriversCapability(),
 	}
 }
 

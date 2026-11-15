@@ -1,0 +1,360 @@
+{
+  "source": "muse schema generate-json-schema (stable MSP bundle, manifest schemaVersion 1), Muse Code 1.4.18 (1.4.18-R8587.1)",
+  "schemaSha256": "b0b823c56e7b955a456cd5300b27eb1792f425da33918631b6aa08fa0dc71924",
+  "methods": [
+    "approval/decide",
+    "approval/listPending",
+    "computerUseSettings/read",
+    "computerUseSettings/update",
+    "computerUseSetup/check",
+    "computerUseSetup/read",
+    "computerUseSetup/start",
+    "feedback/submit",
+    "goal/clear",
+    "goal/edit",
+    "goal/pause",
+    "goal/resume",
+    "goal/set",
+    "hook/list",
+    "initialize",
+    "item/readOutput",
+    "media/upload",
+    "model/cancel",
+    "model/complete",
+    "model/list",
+    "plugin/install",
+    "plugin/list",
+    "plugin/marketplaceAdd",
+    "plugin/marketplaceRemove",
+    "plugin/marketplaceUpdate",
+    "recap/cancel",
+    "recap/request",
+    "session/clearExternalWait",
+    "session/compact",
+    "session/declareExternalWait",
+    "session/fork",
+    "session/leave",
+    "session/list",
+    "session/read",
+    "session/rename",
+    "session/resume",
+    "session/setApprovalMode",
+    "session/setModel",
+    "session/setReasoningEffort",
+    "session/sideChat",
+    "session/start",
+    "session/userShell",
+    "skill/import",
+    "skill/list",
+    "skill/setActivation",
+    "subagent/close",
+    "subagent/followupTask",
+    "subagent/interrupt",
+    "subagent/list",
+    "subagent/readResult",
+    "subagent/reopen",
+    "subagent/resume",
+    "subagent/sendMessage",
+    "subagent/stop",
+    "task/background",
+    "task/list",
+    "task/stop",
+    "task/stopAll",
+    "turn/cancel",
+    "turn/interrupt",
+    "turn/start",
+    "turn/steer",
+    "turn/unqueue",
+    "usage/read",
+    "userInput/answer",
+    "userInput/cancel",
+    "userInput/clarify",
+    "userInput/interrupt",
+    "view/page",
+    "view/subscribe",
+    "view/unsubscribe",
+    "workflow/cancel",
+    "workflow/childControl",
+    "workflow/pause",
+    "workflow/resume"
+  ],
+  "notifications": [
+    "approval/requested",
+    "approval/resolved",
+    "approval/reviewing",
+    "approval/updated",
+    "computerUseSetup/changed",
+    "initialized",
+    "item/completed",
+    "item/delta",
+    "item/started",
+    "item/updated",
+    "model/completed",
+    "monitor/inboxItemAdmitted",
+    "monitor/inboxItemDrained",
+    "monitor/inboxItemVoided",
+    "plugin/changed",
+    "plugin/marketplaceChanged",
+    "recap/completed",
+    "session/approvalModeChanged",
+    "session/branchChanged",
+    "session/closed",
+    "session/contextUsage",
+    "session/goalChanged",
+    "session/leaveCompleted",
+    "session/listChanged",
+    "session/modelChanged",
+    "session/modelRouteUnserved",
+    "session/nameChanged",
+    "session/reasoningEffortChanged",
+    "session/started",
+    "session/statusChanged",
+    "session/todoListChanged",
+    "session/tokenUsage",
+    "session/viewHealthChanged",
+    "skill/changed",
+    "turn/completed",
+    "turn/foregroundCompleted",
+    "turn/modelAttemptStarted",
+    "turn/modelRetryScheduled",
+    "turn/retracted",
+    "turn/retryScheduled",
+    "turn/started",
+    "turn/unqueued",
+    "usage/changed",
+    "userInput/engaged",
+    "userInput/requested",
+    "userInput/settled",
+    "view/gap"
+  ],
+  "serverRequests": [
+    "approval/request",
+    "userInput/request"
+  ],
+  "errors": [
+    {
+      "code": -32700,
+      "kind": "parseError"
+    },
+    {
+      "code": -32600,
+      "kind": "invalidRequest"
+    },
+    {
+      "code": -32601,
+      "kind": "methodNotFound"
+    },
+    {
+      "code": -32602,
+      "kind": "invalidParams"
+    },
+    {
+      "code": -32603,
+      "kind": "internal"
+    },
+    {
+      "code": -32001,
+      "kind": "overloaded"
+    },
+    {
+      "code": -32002,
+      "kind": "inputTooLarge"
+    },
+    {
+      "code": -32010,
+      "kind": "capabilityRequired"
+    },
+    {
+      "code": -32011,
+      "kind": "notFound"
+    },
+    {
+      "code": -32013,
+      "kind": "interrupted"
+    },
+    {
+      "code": -32014,
+      "kind": "cancelled"
+    },
+    {
+      "code": -32020,
+      "kind": "sessionNotFound"
+    },
+    {
+      "code": -32021,
+      "kind": "sessionInUse"
+    },
+    {
+      "code": -32022,
+      "kind": "sessionAmbiguous"
+    },
+    {
+      "code": -32023,
+      "kind": "forkBoundaryInvalid"
+    },
+    {
+      "code": -32024,
+      "kind": "sessionNotLoaded"
+    },
+    {
+      "code": -32025,
+      "kind": "sessionStreamMismatch"
+    },
+    {
+      "code": -32030,
+      "kind": "commandRejected"
+    },
+    {
+      "code": -32031,
+      "kind": "backpressured"
+    },
+    {
+      "code": -32032,
+      "kind": "skillNotFound"
+    },
+    {
+      "code": -32033,
+      "kind": "computerUseUnavailable"
+    },
+    {
+      "code": -32034,
+      "kind": "marketplaceNotFound"
+    },
+    {
+      "code": -32035,
+      "kind": "pluginNotFound"
+    },
+    {
+      "code": -32036,
+      "kind": "marketplaceAlreadyExists"
+    },
+    {
+      "code": -32037,
+      "kind": "pluginMutationsDisabled"
+    },
+    {
+      "code": -32038,
+      "kind": "uploadNotFound"
+    },
+    {
+      "code": -32040,
+      "kind": "viewTruncated"
+    },
+    {
+      "code": -32041,
+      "kind": "outputUnavailable"
+    },
+    {
+      "code": -32042,
+      "kind": "boundaryPruned"
+    },
+    {
+      "code": -32050,
+      "kind": "approvalNotFound"
+    },
+    {
+      "code": -32051,
+      "kind": "approvalAlreadyResolved"
+    },
+    {
+      "code": -32052,
+      "kind": "approvalChoiceInvalid"
+    },
+    {
+      "code": -32053,
+      "kind": "approvalRequirementStale"
+    },
+    {
+      "code": -32054,
+      "kind": "approvalReviewerUnavailable"
+    },
+    {
+      "code": -32055,
+      "kind": "userInputNotFound"
+    },
+    {
+      "code": -32056,
+      "kind": "userInputAlreadySettled"
+    },
+    {
+      "code": -32057,
+      "kind": "userInputAnswerInvalid"
+    },
+    {
+      "code": -32058,
+      "kind": "approvalBrokerUnavailable"
+    },
+    {
+      "code": -32059,
+      "kind": "approvalResolving"
+    }
+  ],
+  "turnSteerParamsRequired": [
+    "commandId",
+    "expectedTurnId",
+    "input",
+    "sessionId"
+  ],
+  "approvalModes": [
+    "allowAll",
+    "promptUnmatched",
+    "onRequest",
+    "denyUnmatched"
+  ],
+  "enums": {
+    "IfBusy": [
+      "queue",
+      "steer",
+      "replace"
+    ],
+    "TurnTerminal": [
+      "completed",
+      "failed",
+      "cancelled"
+    ],
+    "ItemKind": [
+      "userMessage",
+      "agentMessage",
+      "reasoning",
+      "toolCall",
+      "userShell",
+      "subagent",
+      "workflow",
+      "reminderChild",
+      "compaction",
+      "hookRun",
+      "sideChat",
+      "webSearch",
+      "monitorFeed",
+      "damagedRange",
+      "scheduledFire",
+      "backgroundTerminalCompletion",
+      "overdueNotice",
+      "earlierHistory",
+      "peerMessage",
+      "subagentInput",
+      "subagentResult",
+      "systemNotice",
+      "bodyCompletion"
+    ],
+    "ApprovalDecision": [
+      "approved",
+      "approvedForSession",
+      "approvedPolicyAmendment",
+      "denied",
+      "deniedPolicyAmendment",
+      "timedOut",
+      "abort"
+    ],
+    "ApprovalChoiceScope": [
+      "once",
+      "session",
+      "localPersistent"
+    ],
+    "ApprovalResolvedBy": [
+      "user",
+      "policy",
+      "llmJudge"
+    ]
+  }
+}

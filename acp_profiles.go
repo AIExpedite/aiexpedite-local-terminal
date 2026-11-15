@@ -257,21 +257,25 @@ var (
 )
 
 // acpDriverManagerFor is the manager of one selected driver (nil before the
-// agent initialised it).
+// agent initialised it): OpenCode and Antigravity on ACP, Muse Code on MSP
+// (musecode_msp_driver.go).
 func acpDriverManagerFor(p *acpAgentProfile) *ACPManager {
 	switch p {
 	case openCodeACPProfile:
 		return globalOpenCodeACPManager
 	case antigravityACPProfile:
 		return globalAntigravityACPManager
+	case museCodeMSPProfile:
+		return globalMuseCodeMSPManager
 	}
 	return nil
 }
 
-// acpDriverManagers are the selected drivers' managers that exist.
+// acpDriverManagers are the selected drivers' managers that exist, Muse
+// Code's MSP driver included.
 func acpDriverManagers() []*ACPManager {
 	var out []*ACPManager
-	for _, m := range []*ACPManager{globalOpenCodeACPManager, globalAntigravityACPManager} {
+	for _, m := range []*ACPManager{globalOpenCodeACPManager, globalAntigravityACPManager, globalMuseCodeMSPManager} {
 		if m != nil {
 			out = append(out, m)
 		}
@@ -280,9 +284,9 @@ func acpDriverManagers() []*ACPManager {
 }
 
 // acpDriverProfileForCommand is the selected driver a command type belongs to
-// (`opencode_acp_*`, `antigravity_acp_*`), or nil.
+// (`opencode_acp_*`, `antigravity_acp_*`, `musecode_msp_*`), or nil.
 func acpDriverProfileForCommand(cmdType string) *acpAgentProfile {
-	for _, p := range []*acpAgentProfile{openCodeACPProfile, antigravityACPProfile} {
+	for _, p := range []*acpAgentProfile{openCodeACPProfile, antigravityACPProfile, museCodeMSPProfile} {
 		switch cmdType {
 		case p.commandTypes.Start, p.commandTypes.Send, p.commandTypes.End:
 			return p
@@ -643,27 +647,32 @@ func sameACPDrivers(a, b *acpDriversCapability) bool {
 // that triggered it (TestMain); refreshACPDriversCapability is tested directly.
 var scheduleACPDriversRefresh = func() { go refreshACPDriversCapability() }
 
-// refreshACPDriversCapability re-reads the installed CLIs and, when the list
-// changed, folds it into the cached MachineInfo and sends it to the backend
-// now (the republishRelayFollowUpCapability pattern), rather than leaving
-// terminal-service to choose a driver from a 6-hour-old report. Called after
-// every CLI usage refresh (which re-reads the versions) and whenever a START
-// finds the CLI below its driver's minimum. Reports whether anything changed.
+// refreshACPDriversCapability re-reads the installed CLIs and, when either
+// list changed, folds them into the cached MachineInfo and sends it to the
+// backend now (the republishRelayFollowUpCapability pattern), rather than
+// leaving terminal-service to choose a driver from a 6-hour-old report: the
+// ACP drivers (acpDrivers) and Muse Code's MSP driver (mspDrivers). Called
+// after every CLI usage refresh (which re-reads the versions) and whenever a
+// START finds the CLI no longer fit for its driver. Reports whether anything
+// changed.
 func refreshACPDriversCapability() bool {
 	caps := newACPDriversCapability()
+	mspCaps := newMSPDriversCapability()
 	machineInfoMu.Lock()
 	if machineInfoCache == nil || machineInfoCache.Capabilities == nil ||
-		sameACPDrivers(machineInfoCache.Capabilities.ACPDrivers, caps) {
+		(sameACPDrivers(machineInfoCache.Capabilities.ACPDrivers, caps) &&
+			sameACPDrivers(machineInfoCache.Capabilities.MSPDrivers, mspCaps)) {
 		machineInfoMu.Unlock()
 		return false
 	}
 	updated := *machineInfoCache
 	updatedCaps := *updated.Capabilities
 	updatedCaps.ACPDrivers = caps
+	updatedCaps.MSPDrivers = mspCaps
 	updated.Capabilities = &updatedCaps
 	machineInfoCache = &updated
 	machineInfoMu.Unlock()
-	fmt.Printf("%s[acp] ACP drivers now %v%s\n", colorCyan, caps.Agents, colorReset)
+	fmt.Printf("%s[acp] ACP drivers now %v, MSP drivers now %v%s\n", colorCyan, caps.Agents, mspCaps.Agents, colorReset)
 	if onMachineCapabilityAdded != nil {
 		onMachineCapabilityAdded()
 	}

@@ -26,10 +26,15 @@ package main
 //     with exit 0; the run's first record shows it (museCodeRunCreatedSession)
 //     and the turn is recovered by the bounded replay, never run blank.
 //     Interactive `muse resume` is never used.
-//   - `--disable-approval` skips approval prompts but KEEPS the sandbox. A
-//     remote chat user cannot answer a prompt on the workstation, so a headless
-//     turn must not block on one; `--yolo` (which also drops the sandbox) is
-//     never passed and is stripped from caller args.
+//   - `--disable-approval` skips approval prompts but does not turn the
+//     sandbox off (whether Muse CAN sandbox a shell is its own report: on
+//     Windows its `muse serve` host reports `sandboxAvailability:
+//     "unavailable"`, so nothing here claims a sandbox there). A remote chat
+//     user cannot answer a prompt on the workstation, so a headless turn must
+//     not block on one; `--yolo` (which also drops the sandbox) is never
+//     passed and is stripped from caller args. A computer with Muse Code
+//     1.4.18 or newer can run Muse on the MSP chat driver instead
+//     (musecode_msp_driver.go), which asks before risky actions.
 //   - Exit codes: 0 completed, 1 failed/cancelled, 2 usage error, 130/143 on
 //     SIGINT/SIGTERM.
 //   - Auth is the user's local action: `muse login` or META_API_KEY.

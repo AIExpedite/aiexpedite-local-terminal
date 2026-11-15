@@ -1,14 +1,19 @@
 // File: acp_family.go
 // -----------------------------------------------------------------------------
 // ACPManager — the ACP family's long-lived drivers: one child process per
-// session, speaking the Agent Client Protocol (JSON-RPC 2.0, one JSON object
-// per line) over its stdio. Three coding agents run on it, each through its
-// own acpAgentProfile and its own manager instance:
+// session, speaking JSON-RPC 2.0 (one JSON object per line) over its stdio:
+// the Agent Client Protocol, or for Muse Code its own session protocol (MSP).
+// Four coding agents run on it, each through its own acpAgentProfile and its
+// own manager instance:
 //
 //   - Grok Build: `grok agent stdio` (grok_acp.go; always this driver).
 //   - OpenCode:   `opencode acp`, OpenCode 2.2.7 and newer (acp_profiles.go).
 //   - Antigravity: `agy acp`, agy 1.5.4 and newer (acp_profiles.go), only
 //     while antigravityACPDriverIncluded says so.
+//   - Muse Code:  `muse serve`, Muse Code 1.4.18 and newer
+//     (musecode_msp_driver.go), speaking MSP: the profile's protocol picks
+//     its client-frame fence (msp_fence.go) and its follow-up tracker
+//     (relay_follow_up_msp.go). Nothing else here is protocol-specific.
 //
 // The transport, framing, fail-fast policy, lifecycle and cleanup below were
 // GrokACPManager's, and are unchanged for Grok. What differs per agent lives
@@ -153,6 +158,12 @@ const (
    Profiles — what differs per coding agent
    -------------------------------------------------------------------------- */
 
+// The protocols a profile's child speaks (acpAgentProfile.protocol).
+const (
+	acpProtocolACP = ""
+	acpProtocolMSP = "msp"
+)
+
 // acpFrameTypes are one agent's device command or result frame types.
 type acpCommandTypes struct{ Start, Send, End string }
 
@@ -210,6 +221,10 @@ type acpLaunch struct {
 	version    string
 	versionKey versionProbeKey
 
+	// observe, when set, sees every valid stdout frame of the child before it
+	// is published (Muse Code: its usage, sign-in and sandbox reports).
+	observe func(line string)
+
 	// Grok only: the isolated GROK_HOME and its housekeeping (grok_acp.go).
 	isolatedHome      string
 	persistentHome    string
@@ -227,8 +242,12 @@ type acpLaunch struct {
 // acpAgentProfile is one coding agent's driver on the ACP family.
 type acpAgentProfile struct {
 	// cliAgentID is shared-constants CLI_AGENT_IDS (`grok`, `opencode`,
-	// `antigravity`).
+	// `antigravity`, `museCode`).
 	cliAgentID string
+	// protocol is what the child speaks: ACP (the zero value), or MSP (Muse
+	// Code's `muse serve`). It picks the client-frame fence and the live
+	// follow-up tracker's mode.
+	protocol string
 	// noun names a session in every error the device publishes ("<noun>
 	// session <id> not found", "failed to start <noun>: …"): terminal-service
 	// matches both shapes (RESIDENT_START_REFUSAL_RE, sessionAbsentOnDevice).
@@ -260,9 +279,15 @@ type acpAgentProfile struct {
 	// spawnFailed is the error a failed spawn returns.
 	spawnFailed func(err error) error
 	// fenceFrames: every client frame goes through the family's allowlist
-	// (acp_fence.go). Off for Grok, whose frames are fenced only on their
-	// session-setup cwd (validateGrokACPSendCwd), as they always were.
+	// (acp_fence.go; msp_fence.go for MSP). Off for Grok, whose frames are
+	// fenced only on their session-setup cwd (validateGrokACPSendCwd), as they
+	// always were.
 	fenceFrames bool
+	// killProcessTree: the child gets its own process group (macOS, Linux),
+	// every forced kill reaps its whole tree (killAntigravityProcessTree), and
+	// End goes straight from a closed stdin to that kill, without an
+	// interrupt. For a host that runs shells under it.
+	killProcessTree bool
 	// onStdoutFrame sees every valid stdout frame before it is published.
 	onStdoutFrame func(s *ACPSession, line string)
 	// onExit runs once the child has exited, before the ended frame.
@@ -359,6 +384,9 @@ type ACPSession struct {
 	// fence is the client-frame fence (acp_fence.go), nil unless the
 	// profile fences frames. Set once at Start.
 	fence *acpClientFence
+	// observe is the launch's frame observer (acpLaunch.observe), nil for
+	// most agents. Set once at Start.
+	observe func(line string)
 
 	mu            sync.Mutex
 	status        string // "running" | "ended"
@@ -557,6 +585,10 @@ func (m *ACPManager) Start(id, cwd string, extraArgs []string, workspaceID, uid 
 
 	proc := exec.Command(launch.executable, args...)
 	hideWindow(proc)
+	if p.killProcessTree {
+		// Its own process group, so a forced kill reaches the shells it runs.
+		detachControllingTTY(proc)
+	}
 	if cwd != "" {
 		proc.Dir = cwd
 	}
@@ -640,6 +672,7 @@ func (m *ACPManager) Start(id, cwd string, extraArgs []string, workspaceID, uid 
 		producerContested: launch.producerContested,
 		launchedVersion:   launchedVersion,
 		liveFollowUps:     newLiveFollowUpTracker(p.cliAgentID, launchedVersion),
+		observe:           launch.observe,
 		status:            "running",
 		done:              make(chan struct{}),
 		processExited:     make(chan struct{}),
@@ -683,9 +716,7 @@ func (m *ACPManager) Start(id, cwd string, extraArgs []string, workspaceID, uid 
 			seq := atomic.AddInt64(&session.seq, 1)
 			fmt.Printf("%s%s Session %s timed out after %dms — killing%s\n",
 				colorYellow, p.logTag, session.ID, session.TimeoutMs, colorReset)
-			if session.Process != nil && session.Process.Process != nil {
-				_ = session.Process.Process.Kill()
-			}
+			_ = m.forceKill(session)
 			publishFn(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,
@@ -833,7 +864,14 @@ func (m *ACPManager) sendAccepting(id string, payload string, accept func() erro
 	if session.Status() == "ended" {
 		return fmt.Errorf("%s session %s has ended", p.noun, id)
 	}
+	// What the fence must reserve against a concurrent write (MSP: the one
+	// `initialize`, the session setup in flight, a receipt) is decided here,
+	// under stdinMu, and released again if the frame never reaches the child.
+	if err := session.fence.admit(fenceCheck); err != nil {
+		return err
+	}
 	if err := acceptRelayDelivery(accept); err != nil {
+		session.fence.release(fenceCheck)
 		return err
 	}
 	// The live follow-up tracker (relay_follow_up_jsonrpc.go) reads the frame
@@ -844,6 +882,8 @@ func (m *ACPManager) sendAccepting(id string, payload string, accept func() erro
 		sent.done(wrote)
 		if wrote {
 			session.fence.written(fenceCheck)
+		} else {
+			session.fence.release(fenceCheck)
 		}
 	}()
 
@@ -869,9 +909,7 @@ func (m *ACPManager) sendAccepting(id string, payload string, accept func() erro
 		session.mu.Lock()
 		session.status = "ended"
 		session.mu.Unlock()
-		if session.Process != nil && session.Process.Process != nil {
-			_ = session.Process.Process.Kill()
-		}
+		_ = m.forceKill(session)
 		return fmt.Errorf("timeout writing to %s session %s stdin — session terminated to prevent frame interleave", p.noun, id)
 	}
 	wrote = true
@@ -919,11 +957,9 @@ func (m *ACPManager) End(id string) error {
 			}
 			return fmt.Errorf("%s session %s not found", p.noun, id)
 		}
-		if session.Process.Process != nil {
-			if killErr := session.Process.Process.Kill(); killErr != nil {
-				fmt.Printf("%s%s Re-kill failed for %s: %v%s\n",
-					colorRed, p.logTag, id, killErr, colorReset)
-			}
+		if killErr := m.forceKill(session); killErr != nil {
+			fmt.Printf("%s%s Re-kill failed for %s: %v%s\n",
+				colorRed, p.logTag, id, killErr, colorReset)
 		}
 		if waitDoneConfirm(processExited, killConfirmTimeout) {
 			return nil
@@ -936,33 +972,49 @@ func (m *ACPManager) End(id string) error {
 
 	session.closeStdin()
 
+	// forceKillConfirmed kills the child (its whole tree, for a profile that
+	// asks) and waits, BOUNDED, for the exit watcher — see end_confirm.go for
+	// why blocking here indefinitely wedged an entire device (2026-08-27).
+	forceKillConfirmed := func() error {
+		fmt.Printf("%s%s Force killing session %s%s\n",
+			colorRed, p.logTag, id, colorReset)
+		if killErr := m.forceKill(session); killErr != nil {
+			fmt.Printf("%s%s Kill failed for %s: %v%s\n",
+				colorRed, p.logTag, id, killErr, colorReset)
+		}
+		if !waitDoneConfirm(processExited, killConfirmTimeout) {
+			fmt.Printf("%s%s Kill unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
+				colorRed, p.logTag, id, killConfirmTimeout, colorReset)
+			session.markKillUnconfirmed()
+			// Deliberately NOT "session <id> not found": the process may
+			// still be alive, and the server must keep the device fenced
+			// until absence is VERIFIED (see the tombstone branch above).
+			return fmt.Errorf("%s session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", p.noun, id, killConfirmTimeout, errEndUnconfirmed)
+		}
+		return nil
+	}
+
 	select {
 	case <-processExited:
 	case <-time.After(acpFamilyGracefulShutdownTimeout):
+		if p.killProcessTree {
+			// No interrupt: a host that ignored its closed stdin is ended
+			// with everything it runs.
+			fmt.Printf("%s%s Stdin close didn't exit %s — killing its process tree%s\n",
+				colorYellow, p.logTag, id, colorReset)
+			if err := forceKillConfirmed(); err != nil {
+				return err
+			}
+			break
+		}
 		fmt.Printf("%s%s Stdin close didn't exit %s — interrupting%s\n",
 			colorYellow, p.logTag, id, colorReset)
 		_ = interruptProcess(session.Process)
 		select {
 		case <-processExited:
 		case <-time.After(acpFamilyGracefulShutdownTimeout):
-			fmt.Printf("%s%s Force killing session %s%s\n",
-				colorRed, p.logTag, id, colorReset)
-			if session.Process.Process != nil {
-				if killErr := session.Process.Process.Kill(); killErr != nil {
-					fmt.Printf("%s%s Kill failed for %s: %v%s\n",
-						colorRed, p.logTag, id, killErr, colorReset)
-				}
-			}
-			// BOUNDED wait — see end_confirm.go for why blocking here
-			// indefinitely wedged an entire device (2026-08-27).
-			if !waitDoneConfirm(processExited, killConfirmTimeout) {
-				fmt.Printf("%s%s Kill unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
-					colorRed, p.logTag, id, killConfirmTimeout, colorReset)
-				session.markKillUnconfirmed()
-				// Deliberately NOT "session <id> not found": the process may
-				// still be alive, and the server must keep the device fenced
-				// until absence is VERIFIED (see the tombstone branch above).
-				return fmt.Errorf("%s session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", p.noun, id, killConfirmTimeout, errEndUnconfirmed)
+			if err := forceKillConfirmed(); err != nil {
+				return err
 			}
 		}
 	}
@@ -970,6 +1022,19 @@ func (m *ACPManager) End(id string) error {
 	// The watcher retains the exited session until terminal publication is
 	// reserved, so a replacement cannot steal the old frame's session ID.
 	return nil
+}
+
+// forceKill kills a session's child: its whole process tree for a profile
+// that asks (killProcessTree), else the process itself.
+func (m *ACPManager) forceKill(s *ACPSession) error {
+	if s.Process == nil || s.Process.Process == nil {
+		return nil
+	}
+	if m.profile.killProcessTree {
+		killAntigravityProcessTree(s.Process)
+		return nil
+	}
+	return s.Process.Process.Kill()
 }
 
 // Get returns the session for id, or nil if it does not exist.
@@ -1130,9 +1195,10 @@ func (m *ACPManager) readStream(session *ACPSession, publishFn PublishFunc) {
 	// Pub/Sub is responsive-but-slow; a true outage degrades to "child killed
 	// late, no diagnostic" which is still safe (no dropped JSON-RPC frame is
 	// mistaken for a live session), just not observable.
-	failSessionFatally := func(reason string, droppedType string) {
-		fmt.Printf("%s%s Publish queue stalled for %s — failing session (dropped %s)%s\n",
-			colorRed, p.logTag, session.ID, droppedType, colorReset)
+	// publishFatal publishes a session-fatal error frame synchronously
+	// (bypassing the queue, which may be wedged) and kills the child, so
+	// waitForExit publishes the ended frame.
+	publishFatal := func(reason, errorCode string) {
 		seq := atomic.AddInt64(&session.seq, 1)
 		publishFn(resultMsg{
 			ID:          session.ID,
@@ -1146,10 +1212,14 @@ func (m *ACPManager) readStream(session *ACPSession, publishFn PublishFunc) {
 			BootID:      agentBootID,
 			SessionID:   session.ID,
 			Seq:         int(seq),
+			ErrorCode:   errorCode,
 		})
-		if session.Process != nil && session.Process.Process != nil {
-			_ = session.Process.Process.Kill()
-		}
+		_ = m.forceKill(session)
+	}
+	failSessionFatally := func(reason string, droppedType string) {
+		fmt.Printf("%s%s Publish queue stalled for %s — failing session (dropped %s)%s\n",
+			colorRed, p.logTag, session.ID, droppedType, colorReset)
+		publishFatal(reason, "")
 	}
 
 	publishOrFail := func(msg resultMsg, droppedType string) bool {
@@ -1291,7 +1361,19 @@ func (m *ACPManager) readStream(session *ACPSession, publishFn PublishFunc) {
 			}
 			// The client-frame fence learns which agent-to-client requests are
 			// open, so it lets through only answers to those (acp_fence.go).
-			session.fence.inbound(trimmed)
+			// The MSP fence also holds a resumed conversation to the session's
+			// folder: an answer naming another is never published, and the
+			// host is ended (msp_fence.go).
+			if err := session.fence.inboundFrame(trimmed, session.WorkspaceRoot); err != nil {
+				fmt.Printf("%s%s Refused a frame from %s — ending it: %v%s\n",
+					colorRed, p.logTag, session.ID, err, colorReset)
+				merger.close()
+				publishFatal(err.Error(), acpTypedErrorCode(err))
+				return
+			}
+			if session.observe != nil {
+				session.observe(trimmed)
+			}
 
 			if p.mergeReplyChunks {
 				if chunk, ok := parseGrokMessageChunk(trimmed); ok {
@@ -1547,9 +1629,7 @@ func (m *ACPManager) watchFirstFrame(session *ACPSession, publishFn PublishFunc,
 	seq := atomic.AddInt64(&session.seq, 1)
 	fmt.Printf("%s%s Session %s produced no output within %v — assuming auth/startup stall, killing%s\n",
 		colorYellow, p.logTag, session.ID, timeout, colorReset)
-	if session.Process != nil && session.Process.Process != nil {
-		_ = session.Process.Process.Kill()
-	}
+	_ = m.forceKill(session)
 	publishFn(resultMsg{
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,

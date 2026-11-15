@@ -183,6 +183,10 @@ func TestMain(m *testing.M) {
 	// refresh, a too-old START) and race the next test's seams. The cases
 	// that exercise the trigger pin it (systemInfo_acp_test.go).
 	scheduleACPDriversRefresh = func() {}
+	// …and Muse Code's MSP driver reads as not installed, so no gather spawns
+	// the developer's own `muse` for its schema; the cases that need a Muse
+	// pin one (pinMSPDriverBinary).
+	mspDriverBinaryReader = func() mspDriverBinary { return mspDriverBinary{} }
 
 	// Confine every config/data write in this package to a throwaway directory
 	// BEFORE any test runs. Without this, anything that persists through
@@ -239,6 +243,12 @@ func runMockCLI(mode string) {
 
 	case mockACPDriverMode:
 		runMockACPDriver()
+
+	case mockMSPDriverMode:
+		runMockMSPDriver()
+
+	case mockMSPSleeperMode:
+		runMockMSPSleeper()
 
 	case "opencode":
 		// The OpenCode usage parser probes `opencode models` and

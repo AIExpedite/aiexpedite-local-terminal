@@ -1,0 +1,40 @@
+{
+  "description": "mspFollowUpCommandId(attemptId, signedTsMs) test vectors (L5 spec §4.4). shared-constants and the desktop agent's Go mirror both pin them.",
+  "vectors": [
+    {
+      "attemptId": "0123456789abcdef0123456789abcdef",
+      "signedTsMs": 1794787200000,
+      "commandId": "01a1e1a7-4c00-7c9b-8b50-82add3829d81"
+    },
+    {
+      "attemptId": "9f1c2b3a4d5e6f708192a3b4c5d6e7f8",
+      "signedTsMs": 1794700000123,
+      "commandId": "01a1dc74-bb7b-7284-94c8-97857d20f87e"
+    },
+    {
+      "attemptId": "fu_9f1c2b3a4d5e6f708192a3b4c5d6e7f8",
+      "signedTsMs": 1794700000123,
+      "commandId": "01a1dc74-bb7b-7848-901b-cc485ca417c0"
+    },
+    {
+      "attemptId": "a",
+      "signedTsMs": 0,
+      "commandId": "00000000-0000-7080-9f11-2aeba5c2e825"
+    },
+    {
+      "attemptId": "a",
+      "signedTsMs": 1,
+      "commandId": "00000000-0001-7080-9f11-2aeba5c2e825"
+    },
+    {
+      "attemptId": "attempt-ä-日本",
+      "signedTsMs": 1794787200000,
+      "commandId": "01a1e1a7-4c00-795e-8b68-24cadd814f4a"
+    },
+    {
+      "attemptId": "0123456789abcdef0123456789abcdef",
+      "signedTsMs": 281474976710655,
+      "commandId": "ffffffff-ffff-7c9b-8b50-82add3829d81"
+    }
+  ]
+}

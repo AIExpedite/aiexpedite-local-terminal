@@ -14,11 +14,13 @@
 //   - LIVE: a signed `relay_follow_up` (envelope `relayfollowup_<attemptId>`)
 //     written into the RUNNING CLI as a conversational user message — never on
 //     the approval channel. Claude Code takes it as a stream-json user
-//     message; Codex as a `turn/steer`, Grok Build as an `_x.ai/interject`
-//     and OpenCode (on its ACP driver) as a `_session/steering` the device
-//     builds itself and settles from the CLI's own answer, and Antigravity (on
-//     its ACP driver) as a second `session/prompt` whose write returning is
-//     the evidence (relay_follow_up_jsonrpc.go). Only a kind certified for live follow-ups
+//     message; Codex as a `turn/steer`, Grok Build as an `_x.ai/interject`,
+//     OpenCode (on its ACP driver) as a `_session/steering` and Muse Code (on
+//     its MSP driver) as a `turn/steer` naming the running turn, each built by
+//     the device itself and settled from the CLI's own answer, and
+//     Antigravity (on its ACP driver) as a second `session/prompt` whose write
+//     returning is the evidence (relay_follow_up_jsonrpc.go,
+//     relay_follow_up_msp.go). Only a kind certified for live follow-ups
 //     at the version its session was launched from takes it
 //     (liveFollowUpCertified); every other one answers notWritten.
 //
@@ -387,8 +389,13 @@ type followUpAttemptCheck struct {
 	EmptyText bool
 	// NoActiveTurn: no client prompt's turn is running on the child (Grok,
 	// whose interjection into an idle session starts a turn of its own, G8).
-	// Codex enforces the same itself through the signed expectedTurnId.
+	// Codex enforces the same itself through the signed expectedTurnId. For
+	// Muse Code, also a turn whose foreground is done (its steer was dropped
+	// there, L5 spec S10).
 	NoActiveTurn bool
+	// TurnMismatch (Muse Code): a turn runs, but not the one the signed
+	// expectedTurnId names.
+	TurnMismatch bool
 }
 
 // expiresAtMs is the attempt's expiry: the EARLIER of the broker's
@@ -428,6 +435,9 @@ func (c followUpAttemptCheck) fenceReason() string {
 	}
 	if c.NoActiveTurn {
 		return followUpReasonNoActiveTurn
+	}
+	if c.TurnMismatch {
+		return followUpReasonTurnMismatch
 	}
 	return ""
 }
@@ -854,6 +864,9 @@ var liveFollowUpInstalledVersion = func(cliAgentID string) string {
 		// Live only on the ACP driver: a version the driver does not run (or
 		// a build without the driver) is no version at all here.
 		return acpDriverInstalledVersion(cliAgentID)
+	case museCodeCliAgentID:
+		// Live only on the MSP driver, likewise.
+		return mspDriverInstalledVersion()
 	default:
 		return ""
 	}
@@ -950,8 +963,9 @@ type liveFollowUpTarget struct {
 	claude *ClaudeNativeSession
 	codex  *CodexAppServerSession
 	grok   *GrokACPSession
-	// acp is an OpenCode or Antigravity session on its ACP driver, and
-	// acpManager the manager (its profile) that holds it.
+	// acp is an OpenCode or Antigravity session on its ACP driver, or a Muse
+	// Code session on its MSP driver, and acpManager the manager (its
+	// profile) that holds it.
 	acp        *ACPSession
 	acpManager *ACPManager
 }
@@ -1018,6 +1032,20 @@ func (t liveFollowUpTarget) attemptCheck(cmd commandMsg, p relayFollowUpPayload,
 		check.ConversationOK = metadataMatches && cmd.ConversationID != "" && cmd.ConversationID == s.liveFollowUps.acpSession()
 		check.ApprovalPending = s.liveFollowUps.approvalPending()
 		check.NoActiveTurn = !s.liveFollowUps.grokTurnRunning()
+	case t.acp != nil && t.acpManager != nil && isMSPDriverKind(t.acpManager.profile.cliAgentID):
+		s := t.acp
+		check.LiveKind = s.liveFollowUps != nil && liveFollowUpVersionCertified(museCodeCliAgentID, s.launchedVersion)
+		check.EmptyText = strings.TrimSpace(cmd.Input) == ""
+		check.SessionRunning = s.Status() == "running" && !fenced
+		// The signed conversation must be the session this host serves, and
+		// the signed expectedTurnId must name a turn: Muse itself refuses a
+		// steer into any other (L5 spec §4.3).
+		check.ConversationOK = metadataMatches && cmd.ConversationID != "" && cmd.ExpectedTurnID != "" &&
+			cmd.ConversationID == s.liveFollowUps.mspSession()
+		check.ApprovalPending = s.liveFollowUps.approvalPending()
+		running, foregroundDone := s.liveFollowUps.mspTurn()
+		check.NoActiveTurn = running == "" || foregroundDone
+		check.TurnMismatch = !check.NoActiveTurn && running != cmd.ExpectedTurnID
 	case t.acp != nil && t.acpManager != nil:
 		s := t.acp
 		kind := t.acpManager.profile.cliAgentID
@@ -1113,6 +1141,15 @@ func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollo
 			// A prompt, not a follow-up request: its answer is a turn's end.
 			rpcID = relayFollowUpPromptRPCID(attemptID)
 			frame, err = antigravityFollowUpPromptFrame(rpcID, cmd.ConversationID, cmd.Input)
+		case museCodeCliAgentID:
+			// Muse takes only a UUIDv7 commandId: one derived from the
+			// attempt and its signed ts, so a redelivery carries the same.
+			commandID, ok := mspFollowUpCommandID(attemptID, cmd.Ts)
+			if !ok {
+				publish(ledger.RefuseAccepted(attemptID, followUpReasonCliRefused))
+				return
+			}
+			frame, err = mspSteerFrame(rpcID, cmd.ConversationID, cmd.ExpectedTurnID, commandID, cmd.Input)
 		default:
 			publish(ledger.RefuseAccepted(attemptID, followUpReasonNotLiveKind))
 			return
@@ -1136,11 +1173,12 @@ func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollo
 		recheck := check
 		recheck.Now = time.Now()
 		recheck.SessionRunning = status() == "running" && !isSessionFenced(cmd.SessionID)
-		ch, reason := tracker.admitLiveWrite(rpcID, attemptID, cmd.Input, func(s liveWriteState) string {
+		ch, reason := tracker.admitLiveWriteFor(rpcID, attemptID, cmd.Input, cmd.ExpectedTurnID, func(s liveWriteState) string {
 			c := recheck
 			c.SessionRunning = c.SessionRunning && !s.Closed
 			c.ApprovalPending = s.ApprovalPending
 			c.NoActiveTurn = s.NoActiveTurn
+			c.TurnMismatch = s.TurnMismatch
 			return c.fenceReason()
 		})
 		if reason != "" {
@@ -1215,7 +1253,7 @@ func settleLiveFollowUpAnswer(ledger *relayFollowUpLedger, kind, attemptID strin
 	if a.Exited {
 		return ledger.Settle(attemptID, followUpRowUnknown, followUpReasonNoAnswer, "")
 	}
-	v := classifyLiveFollowUpAnswer(kind, a.Frame)
+	v := classifyLiveFollowUpAnswerFor(kind, a)
 	processedIn := ""
 	if v.State == followUpRowWritten {
 		processedIn = liveFollowUpProcessedIn(kind, a)
@@ -1246,7 +1284,7 @@ func awaitLateLiveFollowUpAnswer(publish func(relayFollowUpRow), ledger *relayFo
 	defer timer.Stop()
 	select {
 	case a := <-answer:
-		if a.Exited || classifyLiveFollowUpAnswer(kind, a.Frame).State != followUpRowWritten {
+		if a.Exited || classifyLiveFollowUpAnswerFor(kind, a).State != followUpRowWritten {
 			return
 		}
 		if row, ok := ledger.LateWritten(attemptID, followUpID, sessionID, liveFollowUpProcessedIn(kind, a)); ok {

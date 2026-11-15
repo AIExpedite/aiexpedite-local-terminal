@@ -538,7 +538,10 @@ func museCodeLiveProbeConverse(ctx context.Context, client *museCodeMSPClient, r
 	// its outbound notifications until the next inbound frame arrives: a
 	// client that only waits never sees `usage/changed` (observed 2026-09-29;
 	// a Node client on named pipes did). Each poll is both a free query and
-	// the frame that releases anything queued.
+	// the frame that releases anything queued. Muse Code 1.4.18 no longer holds
+	// them (2026-11-13: eight notifications arrived in real time over the same
+	// anonymous pipes with nothing written to the host), but the poll stays for
+	// the older builds still installed.
 	poll := time.NewTicker(museCodeUsagePollInterval)
 	defer poll.Stop()
 	for {

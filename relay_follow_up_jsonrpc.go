@@ -3,7 +3,9 @@
 // Live follow-ups for Codex (`turn/steer`), Grok Build (`_x.ai/interject`),
 // and OpenCode (`_session/steering`) and Antigravity (a second
 // `session/prompt`) on their ACP drivers; device half (L1/L2 live follow-ups
-// spec §2.3, §2.3.1, §2.8; L3/L4 ACP drivers spec §2.2, §2.6).
+// spec §2.3, §2.3.1, §2.8; L3/L4 ACP drivers spec §2.2, §2.6). Muse Code on
+// its MSP driver (`turn/steer` naming the running turn) has its tracker mode,
+// frame and answer reading in relay_follow_up_msp.go.
 //
 // Claude Code takes a live follow-up as a stream-json user message, and the
 // stdin write returning is all the evidence there is. Codex, Grok and OpenCode
@@ -448,6 +450,10 @@ type liveFollowUpAnswer struct {
 	Frame       string
 	Exited      bool
 	AfterPrompt bool
+	// ExpectedTurnID (Muse Code) is the running turn the steer named: a
+	// success counts only when Muse names that turn as the one that absorbed
+	// it (classifyMSPSteerAnswer).
+	ExpectedTurnID string
 }
 
 // acpHandoverAnswer reports an Antigravity prompt answer that hands its turn
@@ -488,6 +494,9 @@ type liveWriteState struct {
 	Closed          bool
 	ApprovalPending bool
 	NoActiveTurn    bool
+	// TurnMismatch (Muse Code): a turn runs, but not the one the attempt's
+	// signed expectedTurnId names.
+	TurnMismatch bool
 }
 
 type grokInterjection struct {
@@ -552,6 +561,9 @@ type liveFollowUpTracker struct {
 	waiterPrompt map[string]*acpTrackedPrompt
 	lateWaiters  map[string]bool
 
+	// Muse Code on its MSP driver only (relay_follow_up_msp.go).
+	msp *mspTrackerState
+
 	// publishMu orders every publish the tracker makes (a released answer, the
 	// cap, the flush at the end) against the reader detaching, which happens
 	// before the session's publish queue is closed. Lock order: publishMu, then mu.
@@ -571,7 +583,7 @@ func newLiveFollowUpTracker(cliAgentID, launchedVersion string) *liveFollowUpTra
 }
 
 func newLiveFollowUpTrackerFor(cliAgentID string) *liveFollowUpTracker {
-	return &liveFollowUpTracker{
+	t := &liveFollowUpTracker{
 		kind:         cliAgentID,
 		waiters:      map[string]chan liveFollowUpAnswer{},
 		open:         map[string]struct{}{},
@@ -580,6 +592,10 @@ func newLiveFollowUpTrackerFor(cliAgentID string) *liveFollowUpTracker {
 		waiterPrompt: map[string]*acpTrackedPrompt{},
 		lateWaiters:  map[string]bool{},
 	}
+	if isMSPDriverKind(cliAgentID) {
+		t.msp = newMSPTrackerState()
+	}
+	return t
 }
 
 // liveFollowUpOutbound is what outbound learned about a frame before it is
@@ -592,6 +608,9 @@ type liveFollowUpOutbound struct {
 	newKey      string
 	setupKey    string
 	initKey     string
+	// Muse Code: a session setup or `turn/start` recorded before the write.
+	mspSetupKey string
+	mspTurnKey  string
 }
 
 // outbound reads a frame about to be written to the child. A client
@@ -613,6 +632,9 @@ func (t *liveFollowUpTracker) outbound(frame string) liveFollowUpOutbound {
 	}
 	if !f.isRequest() {
 		return out
+	}
+	if t.msp != nil {
+		return t.mspOutbound(f, out)
 	}
 	if isACPDriverKind(t.kind) {
 		return t.acpOutbound(f, out)
@@ -667,6 +689,10 @@ func (o liveFollowUpOutbound) done(written bool) {
 		if o.initKey != "" && t.acpInit == o.initKey {
 			t.acpInit = ""
 		}
+		if t.msp != nil {
+			delete(t.msp.setup, o.mspSetupKey)
+			delete(t.msp.turnStarts, o.mspTurnKey)
+		}
 		return
 	}
 	if o.responseKey != "" {
@@ -717,7 +743,12 @@ func (t *liveFollowUpTracker) inboundAnnotated(frame string) (hold bool, ann acp
 				delete(t.waiterPrompt, id)
 				delete(t.lateWaiters, id)
 				trimmed := strings.TrimSpace(frame)
-				ch <- liveFollowUpAnswer{Frame: trimmed, AfterPrompt: prompt != nil && prompt.answered}
+				answer := liveFollowUpAnswer{Frame: trimmed, AfterPrompt: prompt != nil && prompt.answered}
+				if t.msp != nil {
+					answer.ExpectedTurnID = t.msp.expected[id]
+					delete(t.msp.expected, id)
+				}
+				ch <- answer
 				if t.kind == opencodeCliAgentID {
 					ann.steerOutcome = steerOutcomeOf(classifyLiveFollowUpAnswer(t.kind, trimmed), late)
 				}
@@ -727,18 +758,26 @@ func (t *liveFollowUpTracker) inboundAnnotated(frame string) (hold bool, ann acp
 		if t.kind == grokCliAgentID {
 			return t.grokResponseLocked(f, frame), ann
 		}
+		if t.msp != nil {
+			t.mspResponseLocked(f)
+			return false, ann
+		}
 		if isACPDriverKind(t.kind) {
 			return false, t.acpResponseLocked(f, frame)
 		}
 	case f.isRequest():
-		if t.kind == codexCliAgentID || f.Method == acpMethodRequestPermission {
+		if t.msp != nil {
+			t.mspRequestLocked(f)
+		} else if t.kind == codexCliAgentID || f.Method == acpMethodRequestPermission {
 			t.open[f.idKey()] = struct{}{}
 		}
 	case f.Method != "":
-		switch t.kind {
-		case codexCliAgentID:
+		switch {
+		case t.msp != nil:
+			t.mspNotificationLocked(f)
+		case t.kind == codexCliAgentID:
 			t.codexNotificationLocked(f)
-		case grokCliAgentID:
+		case t.kind == grokCliAgentID:
 			t.grokNotificationLocked(f)
 		}
 	}
@@ -1105,7 +1144,7 @@ func (t *liveFollowUpTracker) approvalPending() bool {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return len(t.open) > 0
+	return len(t.open) > 0 || t.mspPendingLocked()
 }
 
 // grokTurnRunning reports whether a client prompt's turn is running (Grok).
@@ -1135,6 +1174,13 @@ func (t *liveFollowUpTracker) acpSession() string {
 // check and the record. Called under the session's stdinMu, right before the
 // write.
 func (t *liveFollowUpTracker) admitLiveWrite(rpcID, attemptID, text string, fence func(liveWriteState) string) (<-chan liveFollowUpAnswer, string) {
+	return t.admitLiveWriteFor(rpcID, attemptID, text, "", fence)
+}
+
+// admitLiveWriteFor is admitLiveWrite with the attempt's signed running turn
+// (expectedTurnID; Codex and Muse Code carry one). Muse Code's is checked here
+// against the turn the host runs, and kept for reading the answer.
+func (t *liveFollowUpTracker) admitLiveWriteFor(rpcID, attemptID, text, expectedTurnID string, fence func(liveWriteState) string) (<-chan liveFollowUpAnswer, string) {
 	if t == nil {
 		return nil, fence(liveWriteState{Closed: true})
 	}
@@ -1151,10 +1197,16 @@ func (t *liveFollowUpTracker) admitLiveWrite(rpcID, attemptID, text string, fenc
 		acpRunning = t.acpRunningPromptLocked()
 		state.NoActiveTurn = acpRunning == nil
 	}
+	if t.msp != nil {
+		t.mspAdmitStateLocked(&state, expectedTurnID)
+	}
 	if reason := fence(state); reason != "" {
 		return nil, reason
 	}
 	ch := make(chan liveFollowUpAnswer, 1)
+	if t.msp != nil {
+		t.msp.expected[rpcID] = expectedTurnID
+	}
 	if acpRunning != nil && t.kind == antigravityCliAgentID {
 		// agy answers the follow-up prompt only when the turn ends: what the
 		// ledger waits for is the RUNNING prompt's answer (acpHandoverAnswer).
@@ -1186,6 +1238,9 @@ func (t *liveFollowUpTracker) forget(rpcID string) {
 	delete(t.waiters, rpcID)
 	delete(t.waiterPrompt, rpcID)
 	delete(t.lateWaiters, rpcID)
+	if t.msp != nil {
+		delete(t.msp.expected, rpcID)
+	}
 	for _, p := range t.acpPrompts {
 		if p.handoverTo == rpcID {
 			p.handoverTo = ""
@@ -1293,6 +1348,12 @@ func (t *liveFollowUpTracker) readerDone(flush bool) {
 		}
 	}
 	t.acpPrompts = nil
+	if t.msp != nil {
+		// The host is gone: no turn runs and nothing it asked is open.
+		t.msp.runningTurnID, t.msp.foregroundDone = "", false
+		t.msp.approvals = map[string]string{}
+		t.msp.userInputs = map[string]string{}
+	}
 	t.mu.Unlock()
 	for _, ch := range waiters {
 		ch <- liveFollowUpAnswer{Exited: true}

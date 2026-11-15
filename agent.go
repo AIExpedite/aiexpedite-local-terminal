@@ -32,7 +32,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.1.39"
+var Version = "v1.1.40"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -368,6 +368,11 @@ func StartAgent(cfg *Config) {
 	go globalOpenCodeACPManager.CleanupStale(acpFamilyMaxLifetime)
 	globalAntigravityACPManager = newACPManager(cfg, antigravityACPProfile)
 	go globalAntigravityACPManager.CleanupStale(acpFamilyMaxLifetime)
+	// Muse Code on `muse serve` (musecode_msp_driver.go): the same family
+	// manager, speaking MSP; started only when capabilities.mspDrivers lists
+	// museCode.
+	globalMuseCodeMSPManager = newACPManager(cfg, museCodeMSPProfile)
+	go globalMuseCodeMSPManager.CleanupStale(acpFamilyMaxLifetime)
 	fmt.Println("[aiexpedite] ACP driver managers ready")
 
 	/* 3b'''. Initialize Claude native manager (stream-json over stdio) ---- */
