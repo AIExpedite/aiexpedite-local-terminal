@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.7';
+  var VERSION = 'aix-1.0.8';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -680,7 +680,7 @@
   // ---------------------------------------------------------------- describing fields
   function selectOptions(el) {
     return Array.prototype.slice.call(el.options, 0, 300).map(function (o) {
-      return { label: norm(o.label || o.text), value: o.value, selected: o.selected, disabled: o.disabled };
+      return { label: norm(o.label || o.text), value: o.value, selected: o.selected, disabled: optionDisabled(o) };
     });
   }
   function rectOf(el) {
@@ -784,6 +784,13 @@
     return g;
   }
 
+  // An option is unavailable when it, or the <optgroup> it sits in, is disabled: the browser
+  // neither lets the person pick it nor submits it.
+  function optionDisabled(o) {
+    if (o.disabled) return true;
+    var p = o.parentElement;
+    return !!(p && p.tagName === 'OPTGROUP' && p.disabled);
+  }
   function scan() {
     var t0 = performance.now();
     var items = [];
@@ -796,7 +803,11 @@
       if (!kind) continue;
       if (kind === 'radio') {
         if (el.closest('[role="radiogroup"]')) continue;
-        var key = (el.form ? refFor(el.form) : 'doc') + '|' + (el.getAttribute('name') || refFor(el));
+        // Same-named radios group only within one form and one tree: a component's own shadow
+        // root is a separate radio group for the browser, so it is one for the kit too.
+        var rr = el.getRootNode ? el.getRootNode() : document;
+        var treeKey = (rr && rr !== document && rr.host) ? refFor(rr.host) : 'doc';
+        var key = (el.form ? refFor(el.form) : treeKey) + '|' + (el.getAttribute('name') || refFor(el));
         var g = nativeGroups.get(key);
         if (!g) { g = { key: key, members: [], index: index }; nativeGroups.set(key, g); }
         g.members.push(el);
@@ -1335,7 +1346,7 @@
         return { done: false, next: 'verify', waitMs: 80, method: 'setter' };
       }
       if (kind === 'select') {
-        var opts2 = Array.prototype.map.call(el.options, function (o) { return { label: norm(o.label || o.text), value: o.value, disabled: o.disabled }; });
+        var opts2 = Array.prototype.map.call(el.options, function (o) { return { label: norm(o.label || o.text), value: o.value, disabled: optionDisabled(o) }; });
         var m = matchOption(opts2, value);
         if (m.ambiguous) return { done: true, outcome: 'ambiguous-option', options: m.ambiguous };
         if (!m.match) {
@@ -1798,7 +1809,7 @@
         return;
       }
       if (tag === 'SELECT') {
-        Array.prototype.forEach.call(el.options, function (o) { if (o.selected && !o.disabled) push(o.value); });
+        Array.prototype.forEach.call(el.options, function (o) { if (o.selected && !optionDisabled(o)) push(o.value); });
         return;
       }
       push(el.value);

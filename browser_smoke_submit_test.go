@@ -25,7 +25,9 @@ package main
 //   - an approved button whose own click handler changes a value it sends is
 //     stopped, while a token written into an empty hidden input is allowed;
 //   - an unapproved click whose handler posts a new form into a hidden iframe
-//     is blocked by the network backstop.
+//     is blocked by the network backstop;
+//   - same-named form-less radios in two shadow roots are two groups;
+//   - an option inside a disabled <optgroup> is never chosen.
 
 import (
 	"context"
@@ -65,6 +67,8 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
 <form id="tamper" method="post" action="/posted9"><label for="io">Iota</label><input id="io" name="iota" value="nine"><input type="hidden" id="amt9" name="amount" value="10.00"><button id="send9" type="submit">Send iota</button></form>
 <form id="token" method="post" action="/posted10"><label for="ka">Kappa</label><input id="ka" name="kappa" value="ten"><input type="hidden" id="tok10" name="captcha" value=""><button id="send10" type="submit">Send kappa</button></form>
 <button id="sneaky" type="button">Show more</button>
+<div id="radios1"></div><div id="radios2"></div>
+<form id="plans"><label for="plan">Plan</label><select id="plan" name="plan"><option value="">Choose</option><optgroup label="Old" disabled><option>Legacy</option></optgroup><option>Basic</option></select></form>
 <div id="shadowhost"></div>
 <div id="shadowform"></div>
 <form id="scripted" method="post" action="/posted5">
@@ -72,6 +76,10 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
   <button id="send5" type="button">Send epsilon</button>
 </form>
 <script>
+[['radios1', 'Newsletter'], ['radios2', 'Terms']].forEach(function (x) {
+  var r = document.getElementById(x[0]).attachShadow({ mode: 'open' });
+  r.innerHTML = '<fieldset><legend>' + x[1] + '</legend><label><input type="radio" name="agree" value="yes"> Yes</label><label><input type="radio" name="agree" value="no"> No</label></fieldset>';
+});
 document.getElementById('send9').addEventListener('click', function () { document.getElementById('amt9').value = '1000.00'; });
 document.getElementById('send10').addEventListener('click', function () { document.getElementById('tok10').value = 'tok-abc'; });
 document.getElementById('sneaky').addEventListener('click', function () {
@@ -189,6 +197,17 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if r, err := run(browserParams{Op: browserOpPrepareSubmit, TabID: tab, Ref: etaForm}); err != nil || r.(browserPrepareResult).SubmitText != "Send eta" {
 		t.Fatalf("prepare by form ref: %v %+v", err, r)
+	}
+	// Same-named radios in two shadow roots are two groups; a disabled
+	// optgroup's option is never chosen.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{
+		{Field: "Newsletter", Value: "Yes"}, {Field: "Terms", Value: "No"}, {Field: "Plan", Value: "Legacy"},
+	}})
+	if err != nil {
+		t.Fatalf("fill radios/plan: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 3 || o[0].Outcome != browserOutcomeFilled || o[1].Outcome != browserOutcomeFilled || o[2].Outcome == browserOutcomeFilled {
+		t.Fatalf("shadow radio groups / disabled optgroup: %+v", o)
 	}
 	_, raw, _ := parseBrowserTabID(tab)
 	pg, err := be.Page(ctx, raw)
