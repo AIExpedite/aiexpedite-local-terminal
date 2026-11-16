@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.0';
+  var VERSION = 'aix-1.0.1';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -50,7 +50,7 @@
     active: false, guardUntil: 0, guardsInstalled: false, teardownTimer: 0,
     stopRequested: false, stopAt: 0, stopTrusted: null,
     lastGestureAt: 0, lastCallAt: 0, watchdog: 0, mode: null, agentActingUntil: 0,
-    allowNavHref: null, approved: null,
+    allowNavHref: null, approved: null, sawInvalid: false,
     blockedSubmits: [], allowedByPerson: [], allowedByAgent: [], requests: [], perf: null,
     retargeted: [],
     host: null, outline: null, msg: null, outlineTarget: null, raf: 0,
@@ -968,6 +968,11 @@
     e.stopImmediatePropagation();
     record('submit-event', { trusted: e.isTrusted, submitter: s ? clip(accName(s) || s.innerText || s.value, 60) : null });
   }
+  // The browser's own validation refused the approved submission: it fires `invalid` on the
+  // offending fields and no submit event. That is the one proof that nothing was sent.
+  function onInvalidCapture() {
+    if (state.mode === 'submit' && state.active) state.sawInvalid = true;
+  }
   // form.submit() and location.assign() fire no submit event; the Navigation API sees both.
   function onNavigate(e) {
     if (approvedNavigation(e)) return;
@@ -1011,6 +1016,7 @@
     if (state.teardownTimer) { clearTimeout(state.teardownTimer); state.teardownTimer = 0; }
     if (state.guardsInstalled) return;
     window.addEventListener('submit', onSubmitCapture, true);
+    window.addEventListener('invalid', onInvalidCapture, true);
     window.addEventListener('pointerdown', onGesture, true);
     window.addEventListener('keydown', onGesture, true);
     if (globalThis.navigation && navigation.addEventListener) navigation.addEventListener('navigate', onNavigate);
@@ -1032,6 +1038,7 @@
     state.teardownTimer = 0;
     if (!state.guardsInstalled) return;
     window.removeEventListener('submit', onSubmitCapture, true);
+    window.removeEventListener('invalid', onInvalidCapture, true);
     window.removeEventListener('pointerdown', onGesture, true);
     window.removeEventListener('keydown', onGesture, true);
     if (globalThis.navigation && navigation.removeEventListener) navigation.removeEventListener('navigate', onNavigate);
@@ -1044,6 +1051,7 @@
     if (!state.watchdog) state.watchdog = setInterval(checkAgent, 2000);
     state.mode = mode; state.active = true; state.guardUntil = 0;
     state.blockedSubmits = []; state.allowedByPerson = []; state.allowedByAgent = []; state.requests = [];
+    state.sawInvalid = false;
     installGuards();
   }
   function closeGuard(graceMs) {
@@ -1662,6 +1670,11 @@
     var el = info.kind === 'radio-group' ? info.members[0] : info.el;
     return !!el && r.container.contains(el);
   }
+  // The absolute URL a form (or a submitter's formaction) posts to; an empty or missing action
+  // posts to the document's own URL.
+  function submitUrl(action) {
+    try { return new URL(action || location.href, document.baseURI).href.split('#')[0]; } catch (e) { return String(action || ''); }
+  }
   // What the digest covers, in DOM order: the page, the form's identity, every field's identity
   // and current value, and the submit control. A sensitive value (a password the person typed)
   // contributes only its length, so its hash never leaves the computer.
@@ -1671,9 +1684,17 @@
     var summary = [];
     var c = r.control;
     var formEl = r.form || r.container;
+    // Where the data goes is part of what the person approved: the form's resolved action,
+    // method and encoding, and the submitter's own formaction / formmethod / formenctype /
+    // formtarget overrides (a trusted click and requestSubmit(c) both honour them). Attributes,
+    // never the form's IDL properties, which a field named "action" or "method" shadows. The
+    // form's target is left out: the guard itself retargets forms to _self while it runs.
     parts.form = fnv([formEl.tagName, r.form ? 'form' : 'virtual', formEl.id || '', formEl.getAttribute('name') || '',
-      r.form ? (r.form.getAttribute('action') || '') : '', r.form ? lower(r.form.method) : ''].join('␟'));
-    parts.submit = fnv([c.tagName, lower(c.type || ''), c.getAttribute('name') || '', c.id || '', controlText(c)].join('␟'));
+      r.form ? (r.form.getAttribute('action') || '') : '', r.form ? lower(r.form.getAttribute('method') || 'get') : '',
+      r.form ? submitUrl(r.form.getAttribute('action')) : '', r.form ? lower(r.form.getAttribute('enctype') || '') : ''].join('␟'));
+    parts.submit = fnv([c.tagName, lower(c.type || ''), c.getAttribute('name') || '', c.id || '', controlText(c),
+      c.hasAttribute('formaction') ? submitUrl(c.getAttribute('formaction')) : '', lower(c.getAttribute('formmethod') || ''),
+      lower(c.getAttribute('formenctype') || ''), c.getAttribute('formtarget') || ''].join('␟'));
     sc.fields.forEach(function (f) {
       var info = fieldFor(f.ref);
       if (!info || !inContainer(info, r)) return;
@@ -1734,10 +1755,14 @@
     }
     return { ok: true, docId: DOC_ID, x: t.x, y: t.y };
   }
+  // used: the approved submission fired its submit event. invalid: the browser's validation
+  // refused it. requests: fetch / XHR the page made meanwhile (a script-driven save sends one).
   function submitEnd() {
     var used = !!(state.approved && state.approved.used);
+    var invalid = state.mode === 'submit' && !!state.sawInvalid;
+    var requests = state.requests.length;
     if (state.mode === 'submit') { state.approved = null; closeGuard(0); }
-    return { ok: true, docId: DOC_ID, used: used, blockedSubmits: state.blockedSubmits.slice() };
+    return { ok: true, docId: DOC_ID, used: used, invalid: invalid, requests: requests, blockedSubmits: state.blockedSubmits.slice() };
   }
 
   var API = {

@@ -350,17 +350,21 @@ func TestBrowserSubmit(t *testing.T) {
 	approved := browserDigest(dp)
 
 	type setup struct {
-		check   any
-		arm     any
-		used    bool
-		trusted bool
+		check    any
+		arm      any
+		used     bool
+		invalid  bool
+		requests int
+		trusted  bool
 	}
 	run := func(s setup, digest string) (*fakePage, any, error) {
 		page := &fakePage{id: "d:T1", trusted: s.trusted, kit: map[string]func([]json.RawMessage) any{
 			"submitCheck": func([]json.RawMessage) any { return s.check },
 			"armSubmit":   func([]json.RawMessage) any { return s.arm },
-			"submitEnd":   func([]json.RawMessage) any { return map[string]any{"ok": true, "used": s.used} },
-			"ping":        pingOK,
+			"submitEnd": func([]json.RawMessage) any {
+				return map[string]any{"ok": true, "used": s.used, "invalid": s.invalid, "requests": s.requests}
+			},
+			"ping": pingOK,
 		}}
 		res, err := newOpRun(page, browserRouteDevTools, browserParams{Op: browserOpSubmit, TabID: "d:T1", SubmitRef: "f3_a",
 			Digest: digest, RequestID: "r1"}).run(context.Background())
@@ -401,10 +405,34 @@ func TestBrowserSubmit(t *testing.T) {
 	if err != nil || len(page.clicks) != 0 || string(page.called("armSubmit")[0].args[2]) != `"requestSubmit"` {
 		t.Fatalf("applescript: %v", err)
 	}
-	// The page refused it (no submit event, nothing navigated).
-	_, _, err = run(setup{check: okCheck, arm: okArm, used: false, trusted: true}, approved)
+	if so := res.(browserClickResult).SubmitObserved; so == nil || !*so {
+		t.Fatalf("an observed submit event must report submitObserved: %+v", res)
+	}
+	// The browser's validation refused it (an invalid event, no submit event,
+	// nothing navigated): the one case that proves nothing was sent.
+	_, _, err = run(setup{check: okCheck, arm: okArm, used: false, invalid: true, trusted: true}, approved)
 	if browserCode(err) != browserErrSubmitFormChanged || !strings.Contains(err.Error(), "validation") {
 		t.Fatalf("refused: %v", err)
+	}
+	// A validation refusal while the page sent a request of its own (a script
+	// that checks validity and saves by fetch anyway) proves nothing either.
+	_, res, err = run(setup{check: okCheck, arm: okArm, used: false, invalid: true, requests: 1, trusted: true}, approved)
+	if err != nil {
+		t.Fatalf("invalid plus a request reported as not submitted: %v", err)
+	}
+	// No submit event, no navigation, no validation refusal: a script-driven
+	// save (a submit-class type=button posting by fetch) looks exactly like
+	// this, so the agent must not claim nothing was sent.
+	_, res, err = run(setup{check: okCheck, arm: okArm, used: false, trusted: true}, approved)
+	if err != nil {
+		t.Fatalf("an unobserved outcome was reported as not submitted: %v", err)
+	}
+	if cr := res.(browserClickResult); cr.SubmitObserved == nil || *cr.SubmitObserved || cr.Navigated {
+		t.Fatalf("unobserved: %+v", cr)
+	}
+	raw, _ = json.Marshal(res)
+	if !strings.Contains(string(raw), `"submitObserved":false`) {
+		t.Fatalf("result %s", raw)
 	}
 }
 

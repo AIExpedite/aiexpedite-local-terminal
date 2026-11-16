@@ -324,6 +324,11 @@ type browserClickResult struct {
 	Title          string `json:"title"`
 	Navigated      bool   `json:"navigated"`
 	BlockedSubmits int    `json:"blockedSubmits,omitempty"`
+	// SubmitObserved (submit only; additive): the browser fired the approved
+	// submission's submit event or the page navigated. false means the agent
+	// saw no proof either way (a script-driven save sends by fetch without a
+	// submit event), so it must never be read as "nothing was sent".
+	SubmitObserved *bool `json:"submitObserved,omitempty"`
 }
 
 type kitClickBegin struct {
@@ -671,20 +676,28 @@ func (r *browserOpRun) submit(ctx context.Context) (any, error) {
 		}
 	}
 	p, navigated := k.settle(ctx, arm.DocID, browserSubmitQuiet, browserLoadWait)
-	out := browserClickResult{TabID: pg.TabID(), URL: p.URL, Title: clipString(p.Title, 300), Navigated: navigated}
+	observed := navigated
+	out := browserClickResult{TabID: pg.TabID(), URL: p.URL, Title: clipString(p.Title, 300), Navigated: navigated, SubmitObserved: &observed}
 	if !navigated && !k.hung {
 		var e struct {
-			Used bool `json:"used"`
+			Used     bool `json:"used"`
+			Invalid  bool `json:"invalid"`
+			Requests int  `json:"requests"`
 		}
 		endCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		_, endErr := k.call(endCtx, "submitEnd", &e)
 		cancel()
-		if endErr == nil && !e.Used && chk.Parts.Kind == "form" {
-			// The browser fired no submit event and nothing navigated: the page
-			// refused it (usually a required field or a validation message).
+		if endErr == nil && !e.Used && e.Invalid && e.Requests == 0 {
+			// The browser's own validation refused it (it fired `invalid`, no
+			// submit event, and the page sent no request of its own meanwhile):
+			// the one outcome that proves nothing was sent.
 			return nil, browserErr(browserErrSubmitFormChanged,
-				"The page did not accept the submission (it may show a validation message). Nothing was submitted.")
+				"The page did not accept the submission (it shows a validation message). Nothing was submitted.")
 		}
+		// No submit event and no navigation is NOT proof that nothing was sent:
+		// a control whose script saves by fetch fires neither. Report the click
+		// as done, with submitObserved false, rather than invite a second send.
+		observed = endErr == nil && e.Used
 	}
 	if out.URL == "" {
 		if info, ierr := r.tabInfo(ctx, pg); ierr == nil {

@@ -15,9 +15,15 @@ type fakeBrowserPoster struct {
 	results []browserResultBody
 	shots   []string
 	shotErr error
+	// gate, when set, holds every PostResult until it is closed (a slow or
+	// retrying delivery).
+	gate chan struct{}
 }
 
 func (f *fakeBrowserPoster) PostResult(ctx context.Context, body browserResultBody) error {
+	if f.gate != nil {
+		<-f.gate
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.results = append(f.results, body)
@@ -126,9 +132,41 @@ func TestBrowserDispatcherRunsAndPosts(t *testing.T) {
 	if !strings.Contains(string(raw), `"tabId":"d:T1"`) {
 		t.Fatalf("result %s", raw)
 	}
-	if h.d.ActiveCount() != 0 {
-		t.Fatal("an op that finished is still counted as active work")
+	waitActiveCount(t, h.d, 0)
+}
+
+// waitActiveCount: the op's goroutine leaves active just after its result
+// posted, so the count settles a moment after the done hook fires.
+func waitActiveCount(t *testing.T, d *browserDispatcher, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for d.ActiveCount() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("ActiveCount = %d, want %d", d.ActiveCount(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// A result still being delivered holds an update's drain: the message was
+// acked, so replacing the agent then would lose it (a submitted form's result
+// among them). Refusals posted from the Pub/Sub callback count too.
+func TestBrowserDispatcherResultDeliveryIsDrainWork(t *testing.T) {
+	h := newDispatcherHarness(t, &fakePage{id: "d:T1"})
+	h.poster.gate = make(chan struct{})
+	h.send(t, map[string]any{"commandId": "c1", "op": "tabs"})
+	h.send(t, map[string]any{"commandId": "c2", "op": "no-such-op"})
+	if n := h.d.ActiveCount(); n < 1 {
+		t.Fatalf("ActiveCount = %d right after dispatch", n)
+	}
+	// The tabs op itself finishes at once; its result is still being posted.
+	time.Sleep(100 * time.Millisecond)
+	if n := h.d.ActiveCount(); n != 2 {
+		t.Fatalf("ActiveCount = %d while two results are undelivered, want 2", n)
+	}
+	close(h.poster.gate)
+	h.wait(t, 2)
+	waitActiveCount(t, h.d, 0)
 }
 
 func TestBrowserDispatcherRedeliveryRunsOnce(t *testing.T) {

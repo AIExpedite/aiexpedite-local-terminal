@@ -28,6 +28,10 @@ type browserDispatcher struct {
 	submits map[string]time.Time // requestId -> first submit
 	active  map[string]*atomic.Bool
 	tabs    map[string]*browserTabLock
+	// posting counts results still being delivered (finish's goroutine). The
+	// Pub/Sub message was acked long before, so an update must not replace the
+	// agent while a result, such as a completed submission's, is in flight.
+	posting int
 
 	poster func() browserPoster
 	route  func(ctx context.Context, tabRoute string) (browserRouteChoice, *browserError)
@@ -85,11 +89,12 @@ func handleBrowserCommand(cmd commandMsg) {
 	globalBrowserDispatcher.handle(cmd)
 }
 
-// ActiveCount is the number of browser ops in flight (drain accounting).
+// ActiveCount is the number of browser ops in flight plus the results still
+// being posted (drain accounting).
 func (d *browserDispatcher) ActiveCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return len(d.active)
+	return len(d.active) + d.posting
 }
 
 func (d *browserDispatcher) handle(cmd commandMsg) {
@@ -271,8 +276,10 @@ func (d *browserDispatcher) posterNow() browserPoster {
 	return nil
 }
 
-// finish posts the command's result (contract 2a), on its own goroutine when
-// called from the Pub/Sub callback.
+// finish posts the command's result (contract 2a) on its own goroutine, so the
+// Pub/Sub callback never waits on terminal-service. The post counts as drain
+// work from before finish returns until it is delivered or given up: an op is
+// removed from active only after finish returned, so there is no gap.
 func (d *browserDispatcher) finish(id string, start time.Time, route string, result any, berr *browserError) {
 	body := browserResultBody{V: browserParamsVersion, CommandID: id, OK: berr == nil, Route: route, Ms: d.now().Sub(start).Milliseconds()}
 	if berr != nil {
@@ -281,6 +288,9 @@ func (d *browserDispatcher) finish(id string, start time.Time, route string, res
 		body.Result = result
 	}
 	body = fitBrowserResult(body)
+	d.mu.Lock()
+	d.posting++
+	d.mu.Unlock()
 	post := func() {
 		code := ""
 		if body.Error != nil {
@@ -298,6 +308,9 @@ func (d *browserDispatcher) finish(id string, start time.Time, route string, res
 			}
 		}
 		logBrowser(id, fmt.Sprintf("route=%s ok=%v%s ms=%d", orDash(route), body.OK, code, body.Ms))
+		d.mu.Lock()
+		d.posting--
+		d.mu.Unlock()
 		if d.done != nil {
 			d.done(id)
 		}
