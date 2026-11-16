@@ -17,13 +17,15 @@ import (
 	"strings"
 )
 
-// processGroupMembers lists the PIDs whose process group is pgid.
-func processGroupMembers(pgid int) ([]int, error) {
+// processGroupMembers lists the processes whose process group is pgid, each
+// marked exited when it is a zombie (or dead): such a member has no
+// environment to read and can neither run nor be signalled.
+func processGroupMembers(pgid int) ([]groupMember, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, err
 	}
-	var out []int
+	var out []groupMember
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil || pid <= 0 {
@@ -33,27 +35,27 @@ func processGroupMembers(pgid int) ([]int, error) {
 		if err != nil {
 			continue // exited meanwhile
 		}
-		if g, ok := pgrpFromStat(raw); ok && g == pgid {
-			out = append(out, pid)
+		if g, state, ok := pgrpFromStat(raw); ok && g == pgid {
+			out = append(out, groupMember{PID: pid, Exited: state == 'Z' || state == 'X' || state == 'x'})
 		}
 	}
 	return out, nil
 }
 
-// pgrpFromStat reads field 5 (pgrp) of /proc/<pid>/stat.
-func pgrpFromStat(raw []byte) (int, bool) {
+// pgrpFromStat reads field 5 (pgrp) and field 3 (state) of /proc/<pid>/stat.
+func pgrpFromStat(raw []byte) (int, byte, bool) {
 	s := string(raw)
 	end := strings.LastIndexByte(s, ')')
 	if end < 0 {
-		return 0, false
+		return 0, 0, false
 	}
 	fields := strings.Fields(s[end+1:])
 	// fields[0] is field 3 (state), [1] ppid, [2] pgrp.
-	if len(fields) < 3 {
-		return 0, false
+	if len(fields) < 3 || len(fields[0]) != 1 {
+		return 0, 0, false
 	}
 	g, err := strconv.Atoi(fields[2])
-	return g, err == nil
+	return g, fields[0][0], err == nil
 }
 
 // processEnviron returns a process's environment.

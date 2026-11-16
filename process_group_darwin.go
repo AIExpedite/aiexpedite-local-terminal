@@ -17,16 +17,21 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// processGroupMembers lists the PIDs whose process group is pgid.
-func processGroupMembers(pgid int) ([]int, error) {
+// processGroupMembers lists the processes whose process group is pgid, each
+// marked exited when it is a zombie: such a member has no environment to read
+// and can neither run nor be signalled.
+func processGroupMembers(pgid int) ([]groupMember, error) {
 	procs, err := unix.SysctlKinfoProcSlice("kern.proc.pgrp", pgid)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]int, 0, len(procs))
+	out := make([]groupMember, 0, len(procs))
 	for _, kp := range procs {
 		if kp.Proc.P_pid > 0 {
-			out = append(out, int(kp.Proc.P_pid))
+			out = append(out, groupMember{
+				PID:    int(kp.Proc.P_pid),
+				Exited: kp.Proc.P_stat == darwinZombieState,
+			})
 		}
 	}
 	return out, nil

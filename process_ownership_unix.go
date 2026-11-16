@@ -133,17 +133,26 @@ func endLeftoverProcessTree(rec ledgerProcess, job uintptr, owner string) bool {
 	if err != nil {
 		return false
 	}
-	if len(members) == 0 {
-		return true
-	}
-	if owner == "" {
-		return false
-	}
-	for _, pid := range members {
-		env, err := processEnviron(pid)
+	live := 0
+	for _, m := range members {
+		// An exited member (a zombie awaiting its parent) cannot run and has
+		// no environment to prove anything with; it is neither a reason to
+		// stop nor something to end. Every LIVE member still has to prove
+		// itself (Codex P2 on #304).
+		if m.Exited {
+			continue
+		}
+		live++
+		if owner == "" {
+			return false
+		}
+		env, err := processEnviron(m.PID)
 		if err != nil || !envHasSessionOwner(env, owner) {
 			return false
 		}
+	}
+	if live == 0 {
+		return true
 	}
 	_ = syscall.Kill(-rec.PGID, syscall.SIGKILL)
 	deadline := time.Now().Add(leftoverWait)
@@ -154,6 +163,13 @@ func endLeftoverProcessTree(rec ledgerProcess, job uintptr, owner string) bool {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return true
+}
+
+// groupMember is one process in a process group.
+type groupMember struct {
+	PID int
+	// Exited: a zombie (or dead) process, awaiting its parent's reap.
+	Exited bool
 }
 
 // pidAlive reports whether any process (zombies included) holds pid.

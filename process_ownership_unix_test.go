@@ -169,6 +169,62 @@ func TestReleaseSession_EndsWhatTheSessionLeftInItsGroup(t *testing.T) {
 	waitForProbe(t, child, processGone, 10*time.Second)
 }
 
+// TestEndLeftoverProcessTree_AZombieDoesNotShieldALiveLeftover is Codex's
+// P2 on #304: an exited, unreaped member has no environment to read, and it
+// made the whole cleanup give up, leaving the live, marked tool running.
+func TestEndLeftoverProcessTree_AZombieDoesNotShieldALiveLeftover(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	owner := sessionOwnerValue("boot", "s-zombie")
+	cmd, stdin := startLedgerChild(t, "ledger-tree-on-stdin",
+		mockSessionKillChildPidEnv, pidFile, sessionOwnerEnvVar, owner)
+	root := recordedProcess(t, cmd.Process)
+	if _, err := stdin.Write([]byte("go\n")); err != nil {
+		t.Fatal(err)
+	}
+	childPID := readPIDFile(t, pidFile)
+	child := recordedProcess(t, proc(childPID))
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+
+	// A member of the same group that exits and is never reaped: a zombie.
+	z := exec.Command("true")
+	z.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: root.PGID}
+	if err := z.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = z.Wait() })
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		members, err := processGroupMembers(root.PGID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		zombie := false
+		for _, m := range members {
+			if m.PID == z.Process.Pid && m.Exited {
+				zombie = true
+			}
+		}
+		if zombie {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("setup: PID %d never showed as an exited group member", z.Process.Pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := syscall.Kill(root.PID, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	waitForProbe(t, root, processGone, 5*time.Second)
+	waitForPIDFree(t, root.PID, 5*time.Second)
+
+	// The zombie keeps the group non-empty until it is reaped, so the call
+	// may report the group not yet empty; what matters is the live tool.
+	_ = endLeftoverProcessTree(root, 0, owner)
+	waitForProbe(t, child, processGone, 10*time.Second)
+}
+
 // TestEndLeftoverProcessTree_NeverTouchesAnUnmarkedGroup: a group whose
 // members do not carry the session's marker is not proven ours, so nothing
 // is signalled, even with the recorded leader gone.

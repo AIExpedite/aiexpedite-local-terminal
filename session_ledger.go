@@ -1089,13 +1089,20 @@ func (l *spawnLedger) AckReaped(sessionIDs []string) {
 
 func beginSessionSpawn(sessionID string, cmd *exec.Cmd) {
 	if cmd != nil {
-		// Everything this CLI starts inherits the marker, which is how the
-		// session's leftovers are proven ours before they are ended.
-		stampSessionOwner(cmd, sessionOwnerValue(globalSpawnLedger.bootID, sessionID))
+		stampSessionSpawnOwner(sessionID, cmd)
 		prepareOwnedStart(cmd)
 	}
 	globalSpawnLedger.BeginSpawn(sessionID)
 	keepAwakeHold(sessionID)
+}
+
+// stampSessionSpawnOwner puts this session's owner marker on a CLI about to
+// start. Everything it starts inherits the marker, which is how the session's
+// leftovers are proven ours before they are ended (session_owner.go). A spawn
+// that skips beginSessionSpawn's cmd (the PTY start, whose pty.Start sets the
+// process group itself) calls this on its own.
+func stampSessionSpawnOwner(sessionID string, cmd *exec.Cmd) {
+	stampSessionOwner(cmd, sessionOwnerValue(globalSpawnLedger.bootID, sessionID))
 }
 
 // abortSessionSpawn undoes a failed start. The keep-awake hold goes only when
