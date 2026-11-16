@@ -77,6 +77,10 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
 <button id="sneaky" type="button">Show more</button>
 <form id="forge" method="post" action="/posted11"><label for="mu">Mu</label><input id="mu" name="mu" value="eleven"><input type="hidden" name="amount" value="10.00"><button id="send11" type="submit">Send mu</button></form>
 <button id="peek" type="button">More options</button>
+<form id="omicron" method="post" action="/posted13"><label for="om">Omicron</label><input id="om" name="omicron" value="thirteen"><button id="send13" type="submit">Send omicron</button></form>
+<iframe name="sink14" style="display:none"></iframe>
+<form id="pi" method="post" action="/posted14"><label for="pi1">Pi</label><input id="pi1" name="pi" value="fourteen"><input type="hidden" id="amt14" name="amount" value="10.00"><button id="send14" type="submit" formtarget="sink14">Send pi</button></form>
+<form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
 <div id="radios1"></div><div id="radios2"></div>
 <form id="plans"><label for="plan">Plan</label><select id="plan" name="plan"><option value="">Choose</option><optgroup label="Old" disabled><option>Legacy</option></optgroup><option>Basic</option></select></form>
 <div id="shadowhost"></div>
@@ -106,6 +110,13 @@ document.getElementById('send11').addEventListener('click', function (e) {
   document.body.appendChild(fm);
   HTMLFormElement.prototype.submit.call(fm);
 });
+document.getElementById('send13').addEventListener('click', function (e) {
+  e.preventDefault();
+  var fm = document.createElement('form'); fm.method = 'get'; fm.action = '/elsewhere13';
+  var i = document.createElement('input'); i.name = 'q'; i.value = 'stolen'; fm.appendChild(i); document.body.appendChild(fm);
+  HTMLFormElement.prototype.submit.call(fm);
+});
+document.getElementById('pi').addEventListener('submit', function () { document.getElementById('amt14').value = '9999.00'; });
 document.getElementById('peek').addEventListener('click', function () {
   var f = document.createElement('iframe'); f.name = 'sink2'; f.style.display = 'none'; document.body.appendChild(f);
   var fm = document.createElement('form'); fm.method = 'get'; fm.action = '/peek'; fm.target = 'sink2';
@@ -430,6 +441,67 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r12"})
 	if err != nil || hit("POST /posted12") != 1 {
 		t.Fatalf("submitter sharing a field's name: %v posted12=%d", err, hit("POST /posted12"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d3. The approved button's click handler natively submits its own GET
+	// form to ANOTHER address: refused, nothing reaches either address.
+	prep = prepare(refs["Send omicron"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r13"})
+	time.Sleep(300 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("GET /elsewhere13") != 0 || hit("POST /posted13") != 0 {
+		t.Fatalf("handler's GET form elsewhere: %v elsewhere13=%d posted13=%d", err, hit("GET /elsewhere13"), hit("POST /posted13"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d4. An approved button aimed at an iframe (formtarget) whose FORM's own
+	// submit handler changes a hidden amount after the capture-phase check:
+	// refused, nothing posted.
+	prep = prepare(refs["Send pi"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r14"})
+	time.Sleep(300 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted14") != 0 {
+		t.Fatalf("formtarget + submit handler change: %v posted14=%d", err, hit("POST /posted14"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d5. The same iframe-targeted button with no handler changing anything:
+	// the approved form posts, once.
+	prep = prepare(refs["Send rho"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r15"})
+	deadline = time.Now().Add(5 * time.Second)
+	for hit("POST /posted15") == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil || hit("POST /posted15") != 1 {
+		t.Fatalf("iframe-targeted approved submit: %v posted15=%d", err, hit("POST /posted15"))
 	}
 	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
 		t.Fatal(err)

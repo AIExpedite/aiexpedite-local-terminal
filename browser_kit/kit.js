@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.11';
+  var VERSION = 'aix-1.0.12';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -970,6 +970,23 @@
     if (a.changed) return false;
     var dest = e.destination && e.destination.url;
     if (!e.formData) {
+      // A form submission that is not the approved form's own is never approved: a click
+      // handler can build a GET form to ANY address and call its native submit(), which fires
+      // no submit event and carries its data in the URL. Chrome does not name the form behind
+      // a native submit() (sourceElement is null), so while an approved FORM submits, a
+      // navigation that carries a query to anywhere but that form's action is refused, and so
+      // is one the browser does attribute to another form. A query-less navigation (a "thank
+      // you" page after a fetch save) still goes; a script-driven (virtual) submit is untouched.
+      if (!a.virtual) {
+        var approvedForm = a.form && a.form.deref();
+        var src = e.sourceElement || null;
+        var srcForm = src && (src.tagName === 'FORM' ? src : src.form);
+        if ((srcForm && srcForm !== approvedForm) || (dest && hasQuery(dest) && !sendsToApprovedAction(a, dest))) {
+          a.changed = true;
+          a.used = false;   // stopped: nothing of the approved submission was sent
+          return false;
+        }
+      }
       // A GET form sends its data in the URL. A navigation to where the approved form sends that
       // carries a query is that form, or a page handler's copy of it: it must carry what was
       // approved. Any other navigation without form data stays allowed (a script that saved by
@@ -977,6 +994,7 @@
       if (!a.virtual && a.payload && dest && sendsToApprovedAction(a, dest) && hasQuery(dest) &&
           !outgoingHolds(a, queryEntries(dest))) {
         a.changed = true;
+        a.used = false;   // stopped: nothing of the approved submission was sent
         return false;
       }
       return true;
@@ -991,6 +1009,7 @@
       if (!dest || a.actions.indexOf(String(dest).split('#')[0]) < 0 || !approvedPayloadHolds(a) ||
           (a.payload && !outgoingHolds(a, formDataEntries(e.formData)))) {
         a.changed = true;
+        a.used = false;   // stopped: nothing of the approved submission was sent
         return false;
       }
       a.used = true;
@@ -1086,15 +1105,20 @@
       var own = form.getAttribute('target');
       var eff = own || baseTarget;
       if (!eff || /^(_self|_top|_parent)$/i.test(eff)) return;
-      state.retargeted.push({ form: new WeakRef(form), had: form.hasAttribute('target'), value: own });
-      form.setAttribute('target', '_self');
+      retargetTo(form, 'target');
     });
+  }
+  // Point one element's target-like attribute at the page itself while guarding; restored
+  // exactly by restoreForms.
+  function retargetTo(el, attr) {
+    state.retargeted.push({ el: new WeakRef(el), attr: attr, had: el.hasAttribute(attr), value: el.getAttribute(attr) });
+    el.setAttribute(attr, '_self');
   }
   function restoreForms() {
     state.retargeted.forEach(function (r) {
-      var f = r.form.deref();
-      if (!f || f.getAttribute('target') !== '_self') return;
-      if (r.had) f.setAttribute('target', r.value); else f.removeAttribute('target');
+      var f = r.el.deref();
+      if (!f || f.getAttribute(r.attr) !== '_self') return;
+      if (r.had) f.setAttribute(r.attr, r.value); else f.removeAttribute(r.attr);
     });
     state.retargeted = [];
   }
@@ -2006,6 +2030,14 @@
     if (t.why) return { ok: false, reason: 'hidden', detail: t.why };
     openGuard('submit');
     guardShadowRoot(r.control.getRootNode ? r.control.getRootNode() : null);
+    // A submitter's formtarget overrides its form's target: an approved button aimed at an
+    // iframe would post there, past the main document's navigation guard, so a submit handler
+    // that changes a value AFTER the capture-phase check would go unseen. For this one click it
+    // posts to the page itself (as retargetForms does for forms), so the outgoing data is checked
+    // after every handler ran. After the digest check above, before the approved reading below,
+    // so both readings agree; restored with the forms when the guard closes.
+    var ft = r.control.getAttribute('formtarget');
+    if (r.form && ft && !/^(_self|_top|_parent)$/i.test(ft)) retargetTo(r.control, 'formtarget');
     state.allowNavHref = null;
     // Where the approved form may post when a script submits it: its own action, or the
     // control's formaction (the digest just confirmed both are the approved ones).
