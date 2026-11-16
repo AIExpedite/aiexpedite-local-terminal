@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.24';
+  var VERSION = 'aix-1.0.25';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -84,6 +84,14 @@
   // Is what the field shows the value we meant? Masks may regroup punctuation, never digits.
   // A minus before the first digit (ASCII or U+2212) is a sign, not formatting.
   function leadingMinus(s) { return /^[^\d]*[-\u2212]/.test(s); }
+  // Which digit runs carry a minus sign: a minus right before a run that does not itself follow a
+  // digit ("1e-3", the second number of "40.7, -74.0"), as opposed to a separator between digits
+  // (555-123-4567, 2026-11-16), which a mask may regroup.
+  function runSigns(s) {
+    var t = String(s).replace(/\u2212/g, '-'), out = [], re = /\d+/g, m;
+    while ((m = re.exec(t))) out.push(t.charAt(m.index - 1) === '-' && !/\d/.test(t.charAt(m.index - 2)) ? '-' : '');
+    return out.join(',');
+  }
   function looksSame(actual, expected) {
     var a = norm(actual), e = norm(expected);
     if (a === e || a.toLowerCase() === e.toLowerCase()) return true;
@@ -93,7 +101,7 @@
     if (nA !== null && nE !== null && nA !== nE) return false;   // 1,234 is not 1.234: punctuation that moves a number's magnitude
     var runsA = (a.match(/\d+/g) || []).join(','), runsE = (e.match(/\d+/g) || []).join(',');
     var restA = a.replace(/[\d\s()+\-.\/,]/g, ''), restE = e.replace(/[\d\s()+\-.\/,]/g, '');
-    if (runsE && runsA === runsE && restA === restE) return true;         // same digit groups, other punctuation
+    if (runsE && runsA === runsE && restA === restE && runSigns(a) === runSigns(e)) return true;   // same digit groups and signs, other punctuation
     if (/^\+?\d{4,}$/.test(e.replace(/\s/g, '')) && /^[\d\s()+\-]+$/.test(a) && digits(a) === digits(e)) return true; // one run into a phone-style mask
     var na = toNumber(a), ne = toNumber(e);
     return na !== null && ne !== null && na === ne;                        // 1,200 vs 1200
@@ -1017,7 +1025,7 @@
       // be what was approved (its method included), as on the POST path below.
       if (!a.virtual && dest && sendsToApprovedAction(a, dest) && hasQuery(dest)) {
         if (a.navUsed) return false;
-        if (a.method === 'get' && a.payload && approvedPayloadHolds(a) && outgoingHolds(a, queryEntries(dest))) {
+        if (a.method === 'get' && a.payload && approvedPayloadHolds(a) && outgoingHolds(a, queryEntries(dest), a.payload.byGet)) {
           a.navUsed = true;
           a.used = true;
           return true;
@@ -2003,7 +2011,8 @@
   // The values one control contributes to a submission, by the form data set's rules: null for a
   // control that contributes nothing (a button, an unnamed or disabled control, the kit's own UI).
   // The ONE reading for submittedData and for the submitter's position (submitterIndex).
-  function controlValues(el) {
+  // get: as a GET query carries it (a file is only its name); otherwise a file is name␟size.
+  function controlValues(el, get) {
     if (inOwnUi(el)) return null;
     var tag = el.tagName, type = lower(el.getAttribute('type') || '');
     if (tag !== 'INPUT' && tag !== 'SELECT' && tag !== 'TEXTAREA') return null;   // buttons: the submitter is in parts.submit
@@ -2015,17 +2024,17 @@
     if (disabled) return null;
     var values = [];
     if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) { if (el.checked) values.push(el.value); }
-    else if (tag === 'INPUT' && type === 'file') Array.prototype.forEach.call(el.files || [], function (f) { values.push(f.name + '\u241f' + f.size); });
+    else if (tag === 'INPUT' && type === 'file') Array.prototype.forEach.call(el.files || [], function (f) { values.push(get ? f.name : f.name + '\u241f' + f.size); });
     else if (tag === 'SELECT') Array.prototype.forEach.call(el.options, function (o) { if (o.selected && !optionDisabled(o)) values.push(o.value); });
     else values.push(el.value);
     return { name: name, type: type, values: values };
   }
-  function submittedData(r, sensitiveEls, raw) {
+  function submittedData(r, sensitiveEls, raw, get) {
     var els = r.form ? Array.prototype.slice.call(FORM_ELEMENTS.call(r.form))
       : Array.prototype.slice.call(r.container.querySelectorAll('input, select, textarea'));
     var out = [];
     els.forEach(function (el) {
-      var cv = controlValues(el);
+      var cv = controlValues(el, get);
       if (!cv) return;
       cv.values.forEach(function (v) {
         v = v == null ? '' : String(v);
@@ -2059,7 +2068,10 @@
       lower(c.getAttribute('formmethod') || ''), lower(c.getAttribute('formenctype') || ''), c.getAttribute('formtarget') || '',
       c.getAttribute('name') || '', c.getAttribute('value') || ''].join('␟') : '';
     submittedData(r, new Set(), true).forEach(function (d) { (by[d.name] = by[d.name] || []).push(d.value); });
-    return { dest: dest, by: by };
+    // byGet: the same data as a GET query carries it, for checking an outgoing query.
+    var byGet = Object.create(null);
+    submittedData(r, new Set(), true, true).forEach(function (d) { (byGet[d.name] = byGet[d.name] || []).push(d.value); });
+    return { dest: dest, by: by, byGet: byGet };
   }
   // Does the submission still carry what the person approved? The destination must be the same,
   // and every name that held a value then must hold exactly the same value(s) now. A name that
@@ -2103,8 +2115,10 @@
   // name=value (approved too: it is part of the destination reading), which may share a name
   // with a field. So either reading holds: exactly the approved fields (a native submit()), or
   // those plus the approved control's own pair (the control's activation).
-  function outgoingHolds(a, now) {
-    if (entriesHold(a.payload.by, now)) return true;
+  // by: the approved data in the outgoing data's own serialization (a.payload.byGet for a query).
+  function outgoingHolds(a, now, by) {
+    by = by || a.payload.by;
+    if (entriesHold(by, now)) return true;
     var c = a.el && a.el.deref && a.el.deref(), name = c && c.getAttribute && c.getAttribute('name');
     if (!name || lower(c.getAttribute('type') || '') === 'image' || !now || !now[name]) return false;
     // The control's own pair sits at the control's place in tree order: take out exactly that
@@ -2115,7 +2129,7 @@
     var without = Object.create(null);
     for (var k in now) without[k] = now[k].slice();
     without[name] = list.slice(0, idx).concat(list.slice(idx + 1));
-    return entriesHold(a.payload.by, without);
+    return entriesHold(by, without);
   }
   // What a navigation's form data carries, as name -> [values]; a file as name␟size, as
   // submittedData reads it. null when it cannot be read (then nothing is allowed).

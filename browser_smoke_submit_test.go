@@ -101,6 +101,8 @@ second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="seats"><fieldset><legend>Seat class</legend><label><input type="radio" name="sc" id="sc1" value="cheap"> Standard</label><label><input type="radio" name="sc" id="sc2" value="expensive"> Standard</label></fieldset></form>
 <form id="omega2" method="post" action="/posted31"><label for="r31">Required thing</label><input id="r31" name="req" required><button type="submit" id="send31">Send required</button></form>
 <span id="cb32l">Attending</span><button type="button" id="cb32" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="lb32" aria-labelledby="cb32l">Choose</button><ul id="lb32" role="listbox" hidden><li role="option">No</li><li role="option">Not sure</li><li role="option">Yes</li></ul>
+<form id="sci"><label for="ex33">Exponent</label><input id="ex33" name="exponent"><label for="co34">Coordinates</label><input id="co34" name="coords"></form>
+<form id="upl35" method="get" action="/got35"><label for="att35">Attachment</label><input type="file" id="att35" name="attachment"><label for="u35">Upsilon three</label><input id="u35" name="ups" value="thirtyfive"><button type="submit">Send upload</button></form>
 <form id="tiers"><label for="tier">Tier</label><select id="tier" name="tier"><option value="">Choose</option><option value="cheap">Standard</option><option value="expensive">Standard</option></select></form>
 <form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
@@ -167,6 +169,8 @@ document.getElementById('send25').addEventListener('click', function (e) {
 document.getElementById('tier2').addEventListener('change', function () { if (this.value === 'cheap') this.selectedOptions[0].value = 'expensive'; });
 ['ce26', 'ce27'].forEach(function (id) { document.getElementById(id).addEventListener('focus', function () { this.setAttribute('aria-label', 'Password'); }); });
 document.getElementById('pc1').addEventListener('change', function () { this.value = 'expensive'; });
+document.getElementById('ex33').addEventListener('blur', function () { this.value = this.value.replace('e-', 'e'); });
+document.getElementById('co34').addEventListener('blur', function () { this.value = this.value.replace(', -', ', '); });
 document.getElementById('sc1').addEventListener('change', function () { var other = document.getElementById('sc2'); this.closest('label').remove(); other.checked = true; });
 document.getElementById('send31').addEventListener('click', function () { fetch('/slowsave', { method: 'POST', body: 'x' }); });
 (function () {
@@ -866,6 +870,43 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r31"})
 	if !isBrowserCode(err, browserErrSubmitFormChanged) || strings.Contains(err.Error(), "Nothing was submitted") || !strings.Contains(err.Error(), "may still have sent") || hit("POST /posted31") != 0 {
 		t.Fatalf("validation refusal with a save in flight: %v posted31=%d", err, hit("POST /posted31"))
+	}
+
+	// 4d33. A page that drops an exponent's minus sign (1e-3 shown as 1e3): mismatch.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Exponent", Value: "1e-3"}}})
+	if err != nil {
+		t.Fatalf("fill exponent: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("1e-3 shown as 1e3 must read as a mismatch: %+v", o)
+	}
+	// 4d34. A page that drops the sign of the second number (40.7, -74.0 shown as 40.7, 74.0).
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Coordinates", Value: "40.7, -74.0"}}})
+	if err != nil {
+		t.Fatalf("fill coordinates: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a dropped sign on the second number must read as a mismatch: %+v", o)
+	}
+	// 4d35. An approved GET form with a chosen file: the query carries only the file's name, and
+	// the unchanged form is submitted, not refused.
+	if _, err := pg.Eval(ctx, `(function () { var dt = new DataTransfer(); dt.items.add(new File(['hello'], 'report.txt', { type: 'text/plain' })); document.getElementById('att35').files = dt.files; return 'ok'; })()`); err != nil {
+		t.Fatalf("choose a file: %v", err)
+	}
+	prep = prepare(refs["Send upload"])
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r35"})
+	if err != nil || hit("GET /got35") != 1 || !res.(browserClickResult).Navigated {
+		t.Fatalf("approved GET form with a file: %v got35=%d %+v", err, hit("GET /got35"), res)
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
 	}
 
 	// 4d23. An approved POST form whose button's click handler switches it to GET and submits
