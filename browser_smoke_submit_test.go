@@ -17,7 +17,9 @@ package main
 //   - an option matched by its value ("DE") verifies against its label;
 //   - a control inside an open shadow root can be clicked;
 //   - an approved control whose onclick calls form.submit() (no submit event)
-//     posts the approved form, once.
+//     posts the approved form, once;
+//   - an approved submit button in a form inside an open shadow root submits
+//     (its click and submit events are retargeted or not composed).
 
 import (
 	"context"
@@ -53,6 +55,7 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
   <label for="country">Country</label><select id="country" name="country"><option value="">Choose</option><option value="DE">Germany</option><option value="FR">France</option></select>
 </form>
 <div id="shadowhost"></div>
+<div id="shadowform"></div>
 <form id="scripted" method="post" action="/posted5">
   <label for="e">Epsilon</label><input id="e" name="e" value="five">
   <button id="send5" type="button">Send epsilon</button>
@@ -60,6 +63,8 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
 <script>
 var sr = document.getElementById('shadowhost').attachShadow({ mode: 'open' });
 sr.innerHTML = '<button id="toggle" type="button">Toggle details</button>';
+var sf = document.getElementById('shadowform').attachShadow({ mode: 'open' });
+sf.innerHTML = '<form method="post" action="/posted7"><label for="z">Zeta</label><input id="z" name="z" value="six"><button type="submit">Send zeta</button></form>';
 sr.getElementById('toggle').addEventListener('click', function () { document.getElementById('shadowhost').setAttribute('data-toggled', 'yes'); });
 document.getElementById('send5').addEventListener('click', function () { document.getElementById('scripted').submit(); });
 document.getElementById('send4').addEventListener('click', function (e) {
@@ -261,6 +266,32 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if cr := res.(browserClickResult); !cr.Navigated || cr.Title != "Posted" || hit("POST /posted5") != 1 {
 		t.Fatalf("scripted submit: %+v posted5=%d", cr, hit("POST /posted5"))
+	}
+
+	// 7. A submit button in a form inside an open shadow root.
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeta := ""
+	for _, b := range res.(browserReadResult).Buttons {
+		if b.Text == "Send zeta" {
+			zeta = b.Ref
+		}
+	}
+	if zeta == "" {
+		t.Fatalf("no shadow-root submit button: %+v", res.(browserReadResult).Buttons)
+	}
+	prep = prepare(zeta)
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r7"})
+	if err != nil {
+		t.Fatalf("shadow-root submit: %v", err)
+	}
+	if cr := res.(browserClickResult); !cr.Navigated || cr.Title != "Posted" || hit("POST /posted7") != 1 {
+		t.Fatalf("shadow-root submit: %+v posted7=%d", cr, hit("POST /posted7"))
 	}
 }
 

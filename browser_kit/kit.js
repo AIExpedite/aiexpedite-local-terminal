@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.3';
+  var VERSION = 'aix-1.0.4';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -50,7 +50,7 @@
     active: false, guardUntil: 0, guardsInstalled: false, teardownTimer: 0,
     stopRequested: false, stopAt: 0, stopTrusted: null,
     lastGestureAt: 0, lastCallAt: 0, watchdog: 0, mode: null, agentActingUntil: 0,
-    allowNavHref: null, approved: null, sawInvalid: false,
+    allowNavHref: null, approved: null, sawInvalid: false, shadowGuards: [],
     blockedSubmits: [], allowedByPerson: [], allowedByAgent: [], requests: [], perf: null,
     retargeted: [],
     host: null, outline: null, msg: null, outlineTarget: null, raf: 0,
@@ -968,7 +968,31 @@
     var a = state.approved;
     if (!a || state.mode !== 'submit' || Date.now() > a.until) return;
     var el = a.el.deref();
-    if (el && e.target && (e.target === el || composedContains(el, e.target))) a.pressed = true;
+    if (!el) return;
+    // A control inside a shadow root reaches this window listener retargeted to its host: read
+    // the composed path, where the control itself (or something inside it) appears.
+    var path = typeof e.composedPath === 'function' ? e.composedPath() : [e.target];
+    for (var i = 0; i < path.length; i++) {
+      var n = path[i];
+      if (n === el) { a.pressed = true; return; }
+      if (n && n.nodeType === 1 && composedContains(el, n)) { a.pressed = true; return; }
+    }
+  }
+  // submit and invalid are not composed: inside a shadow root they never reach the window. While
+  // an approved control in a shadow root is armed, listen on its root as well, so the approved
+  // submission is recognised (and anything else the page submits there is still blocked).
+  function guardShadowRoot(rn) {
+    if (!rn || rn === document || state.shadowGuards.indexOf(rn) >= 0) return;
+    rn.addEventListener('submit', onSubmitCapture, true);
+    rn.addEventListener('invalid', onInvalidCapture, true);
+    state.shadowGuards.push(rn);
+  }
+  function unguardShadowRoots() {
+    state.shadowGuards.forEach(function (rn) {
+      rn.removeEventListener('submit', onSubmitCapture, true);
+      rn.removeEventListener('invalid', onInvalidCapture, true);
+    });
+    state.shadowGuards = [];
   }
   function onSubmitCapture(e) {
     var s = e.submitter;
@@ -1058,6 +1082,7 @@
     window.removeEventListener('submit', onSubmitCapture, true);
     window.removeEventListener('invalid', onInvalidCapture, true);
     window.removeEventListener('click', onClickCapture, true);
+    unguardShadowRoots();
     window.removeEventListener('pointerdown', onGesture, true);
     window.removeEventListener('keydown', onGesture, true);
     if (globalThis.navigation && navigation.removeEventListener) navigation.removeEventListener('navigate', onNavigate);
@@ -1818,6 +1843,7 @@
     var t = clickTarget(r.control);
     if (t.why) return { ok: false, reason: 'hidden', detail: t.why };
     openGuard('submit');
+    guardShadowRoot(r.control.getRootNode ? r.control.getRootNode() : null);
     state.allowNavHref = null;
     // Where the approved form may post when a script submits it: its own action, or the
     // control's formaction (the digest just confirmed both are the approved ones).
