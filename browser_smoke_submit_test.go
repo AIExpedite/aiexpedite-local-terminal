@@ -92,6 +92,9 @@ second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="ups22" method="post" action="/posted22"><label for="k22">Kappa two</label><input id="k22" name="kappa" value="twentytwo"><input type="hidden" id="amt22" name="amount" value="10.00"><button type="submit">Send kappa two</button></form>
 <form id="ups23" method="post" action="/posted23"><label for="k23">Kappa three</label><input id="k23" name="kappa" value="twentythree"><button type="submit">Send kappa three</button></form>
 <form id="cities"><label for="cb24">Shipping city</label><input id="cb24" name="shipcity" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="lb24"><ul id="lb24" role="listbox" style="display:none"><li role="option">Boston</li><li role="option">Denver</li></ul></form>
+<form id="phi2" method="post" action="/posted24"><label for="p24">Phi two</label><input id="p24" name="phi" value="twentyfour"><button type="submit" id="send24">Send phi two</button></form>
+<form id="phi3" method="post" action="/posted25"><label for="p25">Phi three</label><input id="p25" name="phi" value="twentyfive"><button type="submit" id="send25">Send phi three</button></form>
+<form id="tiers2"><label for="tier2">Tier two</label><select id="tier2" name="tier2"><option value="">Choose</option><option value="cheap">Standard</option><option value="premium">Premium</option></select></form>
 <form id="tiers"><label for="tier">Tier</label><select id="tier" name="tier"><option value="">Choose</option><option value="cheap">Standard</option><option value="expensive">Standard</option></select></form>
 <form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
@@ -144,6 +147,18 @@ document.getElementById('ansNo').addEventListener('change', function () { docume
 document.getElementById('ups23').addEventListener('submit', function (e) { if (e.submitter) e.submitter.setAttribute('formtarget', 'sink21'); e.stopImmediatePropagation(); });
 document.getElementById('tier').addEventListener('change', function () { if (this.value === 'cheap') this.value = 'expensive'; });
 document.getElementById('cb24').addEventListener('focus', function () { this.type = 'password'; });
+document.getElementById('send24').addEventListener('click', function (e) {
+  e.preventDefault();
+  var f = document.getElementById('phi2'); f.method = 'get';
+  HTMLFormElement.prototype.submit.call(f);
+});
+document.getElementById('send25').addEventListener('click', function (e) {
+  e.preventDefault();
+  var fm = document.createElement('form'); fm.method = 'get'; fm.action = '/posted25';
+  var i = document.createElement('input'); i.name = 'phi'; i.value = 'twentyfive'; fm.appendChild(i); document.body.appendChild(fm);
+  HTMLFormElement.prototype.submit.call(fm);
+});
+document.getElementById('tier2').addEventListener('change', function () { if (this.value === 'cheap') this.selectedOptions[0].value = 'expensive'; });
 document.getElementById('send20').addEventListener('click', function () {
   var f = document.getElementById('psi');
   HTMLFormElement.prototype.submit.call(f);
@@ -740,6 +755,31 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
 		t.Fatalf("a select switched to another option with the same label must read as a mismatch: %+v", o)
+	}
+
+	// 4d25. The page rewrites the chosen option's own value: mismatch, not filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Tier two", Value: "cheap"}}})
+	if err != nil {
+		t.Fatalf("fill tier two: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a chosen option whose value the page rewrote must read as a mismatch: %+v", o)
+	}
+
+	// 4d23. An approved POST form whose button's click handler switches it to GET and submits
+	// it natively (no submit event): the fields would land in the URL. Refused, nothing sent.
+	prep = prepare(refs["Send phi two"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r24"})
+	time.Sleep(800 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("GET /posted24") != 0 || hit("POST /posted24") != 0 {
+		t.Fatalf("approved POST switched to GET: %v get=%d post=%d", err, hit("GET /posted24"), hit("POST /posted24"))
+	}
+	// 4d24. Its handler builds a GET copy of the approved POST form, same action and values.
+	prep = prepare(refs["Send phi three"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r25"})
+	time.Sleep(800 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("GET /posted25") != 0 {
+		t.Fatalf("GET copy of an approved POST form: %v get=%d", err, hit("GET /posted25"))
 	}
 
 	// 4d19. The approved form's own submit handler, after the capture-phase check, aims the

@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.20';
+  var VERSION = 'aix-1.0.21';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1010,16 +1010,18 @@
       // fetch and then shows its confirmation page).
       // The approved form's own GET submission is used once, like a POST: a handler that calls
       // its native submit() again (an endpoint answering 204 leaves the page in place) is refused.
+      //
+      // Only an approved GET submission carries its data in the URL: a handler that switches an
+      // approved POST form to GET (or builds a GET copy of it) and calls its native submit() would
+      // put fields approved for a POST into the address. And the approved form itself must still
+      // be what was approved (its method included), as on the POST path below.
       if (!a.virtual && dest && sendsToApprovedAction(a, dest) && hasQuery(dest)) {
         if (a.navUsed) return false;
-        if (a.payload && outgoingHolds(a, queryEntries(dest))) {
+        if (a.method === 'get' && a.payload && approvedPayloadHolds(a) && outgoingHolds(a, queryEntries(dest))) {
           a.navUsed = true;
           a.used = true;
           return true;
         }
-      }
-      if (!a.virtual && a.payload && dest && sendsToApprovedAction(a, dest) && hasQuery(dest) &&
-          !outgoingHolds(a, queryEntries(dest))) {
         a.changed = true;
         a.used = false;   // stopped: nothing of the approved submission was sent
         return false;
@@ -1135,6 +1137,12 @@
       if (!eff || /^(_self|_top|_parent)$/i.test(eff)) return;
       retargetTo(form, 'target');
     });
+  }
+  // The method a submission by this control would use: the button's formmethod overrides its
+  // form's method; anything but post or dialog is get.
+  function effectiveMethod(c, form) {
+    var m = lower((nativeSubmitter(c) && c.getAttribute('formmethod')) || (form && form.getAttribute('method')) || 'get');
+    return m === 'post' || m === 'dialog' ? m : 'get';
   }
   function nativeSubmitter(el) {
     return !!el && ((el.tagName === 'BUTTON' && el.type === 'submit') || (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'image')));
@@ -1626,7 +1634,8 @@
         // differ by value, so a handler that switches between them must not pass a label test.
         var cur = el.selectedOptions && el.selectedOptions[0];
         var po = pend.chosenOption && pend.chosenOption.deref();
-        if (po && po.isConnected) ok = !!cur && cur === po;
+        // Identity AND what it submits: a handler may also rewrite the chosen option itself.
+        if (po && po.isConnected) ok = !!cur && cur === po && cur.value === pend.chosenValue && lower(shown) === lower(chosen);
         else if (pend.chosenValue != null) ok = !!cur && cur.value === pend.chosenValue && lower(shown) === lower(chosen);
         else ok = chosen ? lower(shown) === lower(chosen) : lower(shown).indexOf(lower(value)) >= 0;
       }
@@ -2205,7 +2214,8 @@
     }
     state.approved = { el: new WeakRef(r.control), form: r.form ? new WeakRef(r.form) : null, virtual: !r.form,
       until: Date.now() + APPROVED_MS, used: false, navUsed: false, pressed: false, actions: actions,
-      ref: ref, payload: payloadOf(r), changed: false, event: null, lateSeen: false, retargetSeen: false };
+      ref: ref, payload: payloadOf(r), method: r.form ? effectiveMethod(r.control, r.form) : null,
+      changed: false, event: null, lateSeen: false, retargetSeen: false };
     pinApproved();
     state.agentActingUntil = Date.now() + AGENT_ACT_MS;
     if (how === 'scriptClick') {
