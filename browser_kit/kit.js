@@ -1147,6 +1147,15 @@
   function nativeSubmitter(el) {
     return !!el && ((el.tagName === 'BUTTON' && el.type === 'submit') || (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'image')));
   }
+  // The boundary of the approval: what is checked is the APPROVED form's own submission (pinned
+  // to the page itself, its outgoing data checked at the navigation). Data the page's own scripts
+  // send meanwhile (fetch, XHR, sendBeacon, or a form of their own posted into a frame) is not the
+  // approved submission and cannot be stopped from inside the page; closing one channel would only
+  // move a hostile page to another. The DevTools network layer is not used to fail frame posts
+  // here, unlike during a plain click: right after an approved "Pay" a payment challenge
+  // (3-D Secure) legitimately loads and posts in frames. So once the approved control was activated,
+  // a result never claims nothing was sent (stoppedAfterClick, submitObserved).
+  //
   // While the approved submission is armed it stays aimed at the page itself. A trusted click
   // dispatches natively, so this observer runs after each of the page's submit handlers returns,
   // before the browser plans the submission: a handler that re-aims the button or the form at a
