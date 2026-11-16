@@ -78,7 +78,11 @@ const mspApprovalRequest = `{"jsonrpc":"2.0","id":7,"method":"approval/request",
 	`{"choiceId":"c-once","decision":"approved","scope":"once","label":"Allow once"},` +
 	`{"choiceId":"c-session","decision":"approvedForSession","scope":"session","label":"Allow for this session"},` +
 	`{"choiceId":"c-always","decision":"approved","scope":"localPersistent","label":"Always allow"},` +
-	`{"choiceId":"c-deny","decision":"denied","scope":"once","label":"Deny"}]}}`
+	`{"choiceId":"c-deny","decision":"denied","scope":"once","label":"Deny"},` +
+	`{"choiceId":"c-reject","decision":"abort","scope":"once","label":"Reject","acceptsFeedback":true},` +
+	`{"choiceId":"c-reject-always","decision":"abort","scope":"localPersistent","label":"Always reject"},` +
+	`{"choiceId":"c-deny-rule","decision":"deniedPolicyAmendment","scope":"once","label":"Deny and save a rule"},` +
+	`{"choiceId":"c-allow-rule","decision":"approvedPolicyAmendment","scope":"once","label":"Allow and save a rule"}]}}`
 
 func mspDecide(choiceID string) string {
 	return `{"jsonrpc":"2.0","id":"aix-msp-decide-` + mspFenceCmd2 + `","method":"approval/decide","params":{"commandId":"` + mspFenceCmd2 +
@@ -109,7 +113,7 @@ func TestTheMSPFenceLetsThroughWhatTerminalServiceSends(t *testing.T) {
 	if err := mspSend(f, `{"jsonrpc":"2.0","id":7,"result":{}}`, root); err != nil {
 		t.Fatalf("receipt: %v", err)
 	}
-	for _, choice := range []string{"c-once", "c-deny"} {
+	for _, choice := range []string{"c-once", "c-deny", "c-reject"} {
 		if err := mspSend(f, mspDecide(choice), root); err != nil {
 			t.Errorf("decide %s: %v", choice, err)
 		}
@@ -139,6 +143,10 @@ func TestTheMSPFenceRefusesWhatWouldLoosenTheSession(t *testing.T) {
 		"turn/start on another session":  `{"jsonrpc":"2.0","id":"x","method":"turn/start","params":{"commandId":"` + mspFenceCmd2 + `","sessionId":"01a1dc92-aaaa-7450-a3d3-88e5dcc52575","input":[]}}`,
 		"a localPersistent choice":       mspDecide("c-always"),
 		"a session-scoped choice":        mspDecide("c-session"),
+		"a persistent reject":            mspDecide("c-reject-always"),
+		"a deny that saves a rule":       mspDecide("c-deny-rule"),
+		"an allow that saves a rule":     mspDecide("c-allow-rule"),
+		"a reject with feedback":         strings.Replace(mspDecide("c-reject"), `"requirementId"`, `"feedback":"x","requirementId"`, 1),
 		"a choice never offered":         mspDecide("c-made-up"),
 		"a decide with feedback":         strings.Replace(mspDecide("c-once"), `"requirementId"`, `"feedback":"x","requirementId"`, 1),
 		"a decide for another approval":  strings.Replace(mspDecide("c-once"), `"apr-1"`, `"apr-2"`, 1),
@@ -447,5 +455,45 @@ func TestTheMSPFenceDecidesAgainAtTheWrite(t *testing.T) {
 	h.written(i1)
 	if err := h.admit(i2); acpTypedErrorCode(err) != acpErrorCodeFrameRefused {
 		t.Fatalf("a second, different initialize admitted: %v", err)
+	}
+}
+
+// Muse Code 1.4.20's real command approvals (a dev session, 2026-11-16) offer
+// no `denied` choice: Deny is the once-scoped `abort` ("Reject"). It passes on
+// every stage of a pipeline Muse asks about stage by stage under one
+// approvalId, while the saved-rule choice beside it never does.
+func TestTheMSPFencePassesMuseRejectOnEveryStage(t *testing.T) {
+	f, root := establishMSPSession(t)
+	request := func(id int, sourceIndex int, choices string) string {
+		return `{"jsonrpc":"2.0","id":` + strconv.Itoa(id) + `,"method":"approval/request","params":{"sessionId":"` + mspFenceSession +
+			`","approvalId":"01a1e1ef-b529-75d1-b7bf-2bc6d84dd433","turnId":"01a1e1ef-a96e-7998-9089-c4c92f55e716","toolName":"powershell",` +
+			`"subject":{"kind":"shell","command":"1..12 | ForEach-Object { $_; Start-Sleep -Seconds 2 }"},` +
+			`"currentRequirementId":{"approvalId":"01a1e1ef-b529-75d1-b7bf-2bc6d84dd433","sourceIndex":` + strconv.Itoa(sourceIndex) + `},` +
+			`"availableChoices":[` + choices + `],"protectedWrite":false,"judgeEscalated":false}}`
+	}
+	decide := func(choiceID string, sourceIndex int) string {
+		return `{"jsonrpc":"2.0","id":"aix-msp-decide-` + mspFenceCmd2 + `","method":"approval/decide","params":{"commandId":"` + mspFenceCmd2 +
+			`","sessionId":"` + mspFenceSession + `","approvalId":"01a1e1ef-b529-75d1-b7bf-2bc6d84dd433","choiceId":"` + choiceID +
+			`","requirementId":{"approvalId":"01a1e1ef-b529-75d1-b7bf-2bc6d84dd433","sourceIndex":` + strconv.Itoa(sourceIndex) + `}}}`
+	}
+	const allowOnce = `{"choiceId":"allow_once","label":"Allow once","decision":"approved","scope":"once"}`
+	const reject = `{"choiceId":"abort","label":"Reject","decision":"abort","scope":"once","acceptsFeedback":true}`
+	const savedRule = `{"choiceId":"allow_local_prefix","label":"Always allow in this workspace: 1..12 ...","decision":"approvedPolicyAmendment","scope":"localPersistent"}`
+
+	if err := f.inboundFrame(request(2, 0, allowOnce+","+savedRule+","+reject), root); err != nil {
+		t.Fatal(err)
+	}
+	if err := mspSend(f, decide("allow_local_prefix", 0), root); acpTypedErrorCode(err) != acpErrorCodeFrameRefused {
+		t.Fatalf("the saved-rule choice was not refused: %v", err)
+	}
+	if err := mspSend(f, decide("allow_once", 0), root); err != nil {
+		t.Fatalf("stage 1 allow: %v", err)
+	}
+	// The next stage is a new request for the same approval; Reject answers it.
+	if err := f.inboundFrame(request(3, 1, allowOnce+","+reject), root); err != nil {
+		t.Fatal(err)
+	}
+	if err := mspSend(f, decide("abort", 1), root); err != nil {
+		t.Fatalf("stage 2 reject: %v", err)
 	}
 }
