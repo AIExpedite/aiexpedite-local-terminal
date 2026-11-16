@@ -52,10 +52,14 @@ import (
 //     a steer written there anyway (the device's race) is recorded, and the
 //     device's reading of Muse's answer must never be "written" for a steer
 //     no turn acted on (S10's real-model twin).
-//  6. approvals: in `promptUnmatched` Muse asks before a file write and a
-//     command; a follow-up beside an open approval is refused
-//     (approvalPending); a once-scoped deny holds. Decides the approval
-//     model, never live follow-ups.
+//  6. approvals: in `promptUnmatched` every request Muse raises reaches the
+//     client and is answered once-scoped (Muse's own Reject, `abort`, for a
+//     deny); a denied action never runs; a follow-up beside an open approval
+//     is refused (approvalPending). What the person's own Muse permission
+//     profile allows without asking is RECORDED, never failed (L5 spec O2:
+//     the person's own consent; `:unrestricted` writes files unasked). At
+//     least one request must be raised, or the channel was not exercised.
+//     Decides the approval model, never live follow-ups.
 //  7. resume: a second host resumes the exact conversation (same session,
 //     mode replayed, context kept); a gone one is the typed -32020; the
 //     one-shot driver's v4 id is recorded (S18).
@@ -1020,10 +1024,41 @@ func TestMuseCodeLiveFollowUpCertification(t *testing.T) {
 			}
 		}
 		if !asked {
-			t.Errorf("Muse wrote a file and ran a command without asking in %s (%s)", museMSPChatApprovalMode, museCertSettings())
+			t.Errorf("Muse raised no approval request in %s (%s): the approval channel was not exercised", museMSPChatApprovalMode, museCertSettings())
 		}
-		if statErr == nil {
-			t.Error("a denied edit was written")
+		// Each tool call is the item its approval names (itemId == approvalId).
+		requested := map[string]bool{}
+		deniedIDs := map[string]string{}
+		for _, line := range c.client.snapshot()[mark:] {
+			f, ok := parseJSONRPCFrame(line)
+			if !ok {
+				continue
+			}
+			switch {
+			case f.isRequest() && f.Method == mspServerRequestApproval:
+				requested[paramString(f, "approvalId")] = true
+			case f.Method == mspNotifyApprovalResolved:
+				if d := paramString(f, "decision"); d == mspApprovalDenied || d == mspApprovalAbort {
+					deniedIDs[paramString(f, "approvalId")] = d
+				}
+			}
+		}
+		for _, it := range c.completedItems(mark, c.frames()) {
+			if it.Kind != "toolCall" || it.TurnID != turn {
+				continue
+			}
+			if d, denied := deniedIDs[it.ItemID]; denied && it.Status == "completed" {
+				t.Errorf("a tool call the person denied (%s) ran: %+v", d, it)
+			}
+			if !requested[it.ItemID] {
+				t.Logf("recorded (O2): tool call %s ran without asking, %s by the person's Muse profile (%s)", it.ItemID, it.Status, museCertSettings())
+			}
+		}
+		if len(deniedIDs) == 0 && asked {
+			t.Errorf("no request was denied: the deny path was not exercised (resolved %v)", resolved)
+		}
+		if statErr == nil && len(requested) > 0 {
+			t.Logf("recorded (O2): cert.txt was written; it was asked for only if its tool call is among the requests above")
 		}
 	})
 
