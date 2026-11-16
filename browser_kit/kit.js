@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.22';
+  var VERSION = 'aix-1.0.23';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1664,7 +1664,7 @@
         var picked = pend.chosenMember && pend.chosenMember.deref();
         // Identity AND what it submits: a handler may also rewrite the chosen radio itself.
         if (picked && picked.isConnected) ok = !!sel && sel === picked && sel.value === pend.chosenValue && lower(shown) === lower(pend.chosenFull);
-        else if (pend.chosenFull) ok = !!sel && lower(shown) === lower(pend.chosenFull);
+        else if (pend.chosenFull) ok = !!sel && lower(shown) === lower(pend.chosenFull) && (pend.chosenValue == null || sel.value === pend.chosenValue);
         else if (chosen) ok = !!sel && lower(clip(shown, 80)) === lower(chosen);
         else ok = !!sel && (lower(shown) === want2 || lower(shown).indexOf(lower(value)) >= 0);
       }

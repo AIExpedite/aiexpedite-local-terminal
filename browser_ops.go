@@ -750,11 +750,13 @@ func (r *browserOpRun) submit(ctx context.Context) (any, error) {
 				"The page redirected the submission into another part of the page after you approved it, so what it sent could not be checked, and it may have been sent. Check the page in Chrome before you prepare it again.")
 		}
 		if endErr == nil && !e.Used && e.Invalid && e.Requests == 0 {
-			// The browser's own validation refused it (it fired `invalid`, no
-			// submit event, and the page sent no request of its own meanwhile):
-			// the one outcome that proves nothing was sent.
+			// The browser's own validation refused the form (it fired `invalid`
+			// and no submit event), so the form itself was not sent. That does
+			// not prove the page sent nothing: a click handler's own fetch is
+			// seen only once it completes, so one still in flight is invisible
+			// here. Say both, so nobody retries a save that already happened.
 			return nil, browserErr(browserErrSubmitFormChanged,
-				"The page did not accept the submission (it shows a validation message). Nothing was submitted.")
+				"The page showed a validation message instead of submitting the form, so the form itself was not sent. A script on the page may still have sent something on its own: check the page in Chrome before you prepare it again.")
 		}
 		// No submit event and no navigation is NOT proof that nothing was sent:
 		// a control whose script saves by fetch fires neither. Report the click

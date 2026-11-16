@@ -98,6 +98,8 @@ second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <div id="ce26" contenteditable="true" role="textbox" aria-label="Notes one" style="min-height:24px;border:1px solid #888"></div>
 <div id="ce27" contenteditable="true" role="textbox" aria-label="Notes two" style="min-height:24px;border:1px solid #888"></div>
 <form id="plans2"><fieldset><legend>Plan choice</legend><label><input type="radio" name="pc" id="pc1" value="cheap"> Standard</label><label><input type="radio" name="pc" value="premium"> Premium</label></fieldset><label><input type="checkbox" id="cb28" name="extras" value="none"> Add extras</label><label for="t29">Delivery note</label><input id="t29" name="dnote"></form>
+<form id="seats"><fieldset><legend>Seat class</legend><label><input type="radio" name="sc" id="sc1" value="cheap"> Standard</label><label><input type="radio" name="sc" id="sc2" value="expensive"> Standard</label></fieldset></form>
+<form id="omega2" method="post" action="/posted31"><label for="r31">Required thing</label><input id="r31" name="req" required><button type="submit" id="send31">Send required</button></form>
 <form id="tiers"><label for="tier">Tier</label><select id="tier" name="tier"><option value="">Choose</option><option value="cheap">Standard</option><option value="expensive">Standard</option></select></form>
 <form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
@@ -164,6 +166,8 @@ document.getElementById('send25').addEventListener('click', function (e) {
 document.getElementById('tier2').addEventListener('change', function () { if (this.value === 'cheap') this.selectedOptions[0].value = 'expensive'; });
 ['ce26', 'ce27'].forEach(function (id) { document.getElementById(id).addEventListener('focus', function () { this.setAttribute('aria-label', 'Password'); }); });
 document.getElementById('pc1').addEventListener('change', function () { this.value = 'expensive'; });
+document.getElementById('sc1').addEventListener('change', function () { var other = document.getElementById('sc2'); this.closest('label').remove(); other.checked = true; });
+document.getElementById('send31').addEventListener('click', function () { fetch('/slowsave', { method: 'POST', body: 'x' }); });
 document.getElementById('cb28').addEventListener('change', function () { this.value = 'all'; });
 document.getElementById('t29').addEventListener('focus', function () { var el = this; setTimeout(function () { el.type = 'password'; }, 0); });
 document.getElementById('send20').addEventListener('click', function () {
@@ -213,6 +217,9 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 			fmt.Fprint(w, "saved")
 		case "/got20":
 			w.WriteHeader(http.StatusNoContent)
+		case "/slowsave":
+			time.Sleep(4 * time.Second)
+			fmt.Fprint(w, "saved")
 		default:
 			fmt.Fprint(w, `<!doctype html><html><head><title>Posted</title></head><body>ok</body></html>`)
 		}
@@ -225,7 +232,7 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 
 	launchSmokeChrome(t, chromePath)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	choice, berr := chooseBrowserRoute(ctx, "darwin", "", discoverChromeDevTools)
 	if berr != nil || choice.Route != browserRouteDevTools {
@@ -817,6 +824,24 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('t29').value)`); err != nil || v != `""` {
 		t.Fatalf("the refused field was written: %q %v", v, err)
+	}
+
+	// 4d30. A radio whose change handler removes the clicked option and selects another with
+	// the same label but another value: mismatch, not filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Seat class", Value: "cheap"}}})
+	if err != nil {
+		t.Fatalf("fill seat class: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a removed radio replaced by another with the same label must read as a mismatch: %+v", o)
+	}
+	// 4d31. The approved button's click handler starts a slow save of its own, then the
+	// browser's validation refuses the form: the form was not sent, but the result must not
+	// claim nothing was (the save is still in flight past the settle window).
+	prep = prepare(refs["Send required"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r31"})
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || strings.Contains(err.Error(), "Nothing was submitted") || !strings.Contains(err.Error(), "may still have sent") || hit("POST /posted31") != 0 {
+		t.Fatalf("validation refusal with a save in flight: %v posted31=%d", err, hit("POST /posted31"))
 	}
 
 	// 4d23. An approved POST form whose button's click handler switches it to GET and submits
