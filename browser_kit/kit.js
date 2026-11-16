@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.12';
+  var VERSION = 'aix-1.0.13';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1900,12 +1900,15 @@
     for (var name in was) {
       var w = was[name];
       if (!w.some(function (v) { return v !== ''; })) continue;
-      var n = (now[name] || []).slice().sort(), ws = w.slice().sort();
+      var n = (now[name] || []).map(eol).sort(), ws = w.map(eol).sort();
       if (n.length !== ws.length) return false;
       for (var i = 0; i < n.length; i++) if (n[i] !== ws[i]) return false;
     }
     return true;
   }
+  // A submission normalises a textarea's line endings to CRLF while the DOM reads LF: compare
+  // values with line endings normalised, so an unchanged multiline value is not a change.
+  function eol(v) { return String(v).replace(/\r\n?/g, '\n'); }
   // Does the data actually leaving carry what was approved? The approved reading excludes the
   // submit control, but a submission the control triggers also sends the control's own
   // name=value (approved too: it is part of the destination reading), which may share a name
@@ -2038,6 +2041,14 @@
     // so both readings agree; restored with the forms when the guard closes.
     var ft = r.control.getAttribute('formtarget');
     if (r.form && ft && !/^(_self|_top|_parent)$/i.test(ft)) retargetTo(r.control, 'formtarget');
+    // The approved form itself may sit in a shadow root, where document.forms never lists it, so
+    // retargetForms left its target (or the page's <base target>) alone: an iframe target would
+    // take the post past the navigation guard the same way. Point it at the page for this submit.
+    if (r.form && r.form.getAttribute('target') !== '_self') {
+      var baseT = (document.querySelector('base[target]') || {}).target || '';
+      var effT = r.form.getAttribute('target') || baseT;
+      if (effT && !/^(_self|_top|_parent)$/i.test(effT)) retargetTo(r.form, 'target');
+    }
     state.allowNavHref = null;
     // Where the approved form may post when a script submits it: its own action, or the
     // control's formaction (the digest just confirmed both are the approved ones).
