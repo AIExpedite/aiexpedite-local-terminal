@@ -2342,7 +2342,9 @@ func runPubSubConnection(cfg *Config) error {
 		// none, so a limiter exhausted by other traffic could leave an attempt
 		// unsettled until it expires. They are bounded at the source (at most
 		// a handful pending per session) and still face the signature check.
-		if !isInternalDemandCommand(cmd.Command) && !isFollowUpProtocolCommand(cmd) && !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
+		// A browser `stop` is exempt too: a person must always be able to halt
+		// the agent in their Chrome, however busy the limiter is.
+		if !isInternalDemandCommand(cmd.Command) && !isFollowUpProtocolCommand(cmd) && !isBrowserStopCommand(cmd) && !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
 			fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)
 
 			// Send rate_limited response back to user for immediate feedback
@@ -2508,6 +2510,10 @@ func runPubSubConnection(cfg *Config) error {
 			defer releaseWork()
 			fmt.Printf("%s[pubsub] Draining for update — refusing new work start %q (type=%q, id=%s)%s\n",
 				colorYellow, cmd.Command, cmd.Type, cmd.ID, colorReset)
+			if cmd.Command == browserDeviceCommand && cfg.CommandSecret != "" {
+				// The browser front door waits on its own result, not the topic.
+				globalBrowserDispatcher.refuseWhileDraining(cmd)
+			}
 			res := makeRejectionResult(
 				cmd,
 				cfg.AgentID,
@@ -2581,6 +2587,23 @@ func runPubSubConnection(cfg *Config) error {
 			} else {
 				m.Nack()
 			}
+			return
+		}
+
+		if cmd.Command == browserDeviceCommand {
+			// Browser control (browser_commands.go): the AI working in the
+			// person's own Chrome. Signed like every command and refused when
+			// this agent holds no command secret (its result could not be
+			// signed). The op runs on its own goroutine and reports over POST
+			// /device/:agentId/browser/result, so nothing is published here and
+			// the message is acked at once; a redelivery is recognised by its
+			// commandId and ignored.
+			if cfg.CommandSecret == "" {
+				fmt.Printf("%s[browser] refused: this agent has no command secret%s\n", colorYellow, colorReset)
+			} else {
+				handleBrowserCommand(cmd)
+			}
+			m.Ack()
 			return
 		}
 

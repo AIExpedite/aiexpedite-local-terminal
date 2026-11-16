@@ -32,7 +32,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.1.41"
+var Version = "v1.1.42"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -504,6 +504,13 @@ func StartAgent(cfg *Config) {
 	// user is disconnected from cloud it starts paused (nothing connects or
 	// uploads); the tray reconnect resumes it.
 	startWhatsAppSupervisor(cfg)
+
+	// Browser control (browser_*.go): results go back over the body-signed
+	// device front door with the live credentials. A browser op in flight holds
+	// an update's drain open (each is bounded by its command's deadline).
+	browserResultPoster := newHTTPBrowserPoster(cfg)
+	browserPosterFor = func() browserPoster { return browserResultPoster }
+	registerDrainWorkSource(globalBrowserDispatcher.ActiveCount)
 
 	// If the user disconnected from cloud in a previous session, skip the
 	// Pub/Sub loop entirely on boot. The tray "Reconnect to cloud" handler

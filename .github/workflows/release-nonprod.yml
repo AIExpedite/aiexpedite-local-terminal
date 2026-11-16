@@ -406,6 +406,8 @@ jobs:
             <true/>
             <key>NSHighResolutionCapable</key>
             <true/>
+            <key>NSAppleEventsUsageDescription</key>
+            <string>AI Expedite controls apps you ask it to, such as Chrome for filling forms and Terminal for signing in. It never submits a form without your approval.</string>
           </dict>
           </plist>
           PLIST
