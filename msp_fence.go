@@ -510,8 +510,11 @@ func (f *acpClientFence) recordMSPApprovalLocked(params json.RawMessage) {
 }
 
 // checkMSPWorkspaceRoot requires path to resolve inside root, the session's
-// own start folder (the check ACP setup frames get, checkACPSetupCwd).
+// own start folder (the check ACP setup frames get, checkACPSetupCwd). A
+// Windows extended-length path to a local drive (`\\?\C:\...`) is the same
+// folder as its plain form (localExtendedLengthPath).
 func checkMSPWorkspaceRoot(what, path, root string) error {
+	path = localExtendedLengthPath(path)
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("%s %q is not an absolute path", what, path)
 	}
@@ -523,6 +526,34 @@ func checkMSPWorkspaceRoot(what, path, root string) error {
 		return fmt.Errorf("%s %q is outside the session's folder %q (the directory the session was started in)", what, resolved, root)
 	}
 	return nil
+}
+
+// localExtendedLengthPath is path without its Windows extended-length prefix
+// when it names a folder on a local drive (`\\?\C:\dir` → `C:\dir`), and path
+// unchanged otherwise. Muse 1.4.20 reports the workspace folder of a
+// conversation `muse exec` started in that form (2026-11-16, S18), so the
+// fence read the session's own folder as another one and ended the host.
+// Windows does not normalise a path behind the prefix, so one whose plain form
+// would differ once cleaned (`.` or `..` components, doubled separators) is
+// left as it is and refused.
+func localExtendedLengthPath(path string) string {
+	const prefix = `\\?\`
+	rest, ok := strings.CutPrefix(path, prefix)
+	if !ok || len(rest) < 3 || rest[1] != ':' || rest[2] != '\\' {
+		return path
+	}
+	if d := rest[0] | 0x20; d < 'a' || d > 'z' {
+		return path
+	}
+	if strings.Contains(rest, `\\`) || strings.Contains(rest, "/") {
+		return path
+	}
+	for _, part := range strings.Split(rest[3:], `\`) {
+		if part == "." || part == ".." {
+			return path
+		}
+	}
+	return rest
 }
 
 // mspParamsEmpty: absent, null or an empty object.

@@ -7,14 +7,29 @@
 // (relay_follow_up_ledger.go), and the attempt is settled from Muse's own
 // answer.
 //
-// DARK: Muse Code is not in liveFollowUpCertified, so no session gets the
-// tracker below (newLiveFollowUpTracker), `relayFollowUps.liveAgents` never
-// lists it, and every follow-up to Muse is queued as the next turn. The
-// certification run (relay_follow_up_musecode_certification_test.go,
-// `muselive`) decides whether it ever is (O5).
+// Muse's ANSWER to a steer does not say where the message goes. Certification
+// on Muse 1.4.20 (2026-11-16) recorded both of these:
+//
+//   - a steer acked `accepted` naming the running turn, which that turn
+//     then finished without, and which Muse ran as the NEXT turn under the
+//     steer's own commandId: every steer sent at a turn's start that used no
+//     tool, and every one sent while the final answer streamed (7 of 7);
+//   - a steer acked `accepted` under its own commandId and then DROPPED:
+//     every one Muse read after the turn's final answer had completed (the
+//     ~50 ms before `turn/foregroundCompleted`, 4 of 10, and after it).
+//
+// So the device judges from what Muse then DOES (mspPlacement): `current`
+// only once the steer's own `userMessage` item is seen in the turn it named;
+// `next` once Muse runs it as a turn of its own (that turn's `turn/started`,
+// or the `userMessage` in another turn), with that turn's id on the ack
+// (`followUpMspTurnId`) so terminal-service binds the follow-up's turn to it;
+// `unknown` (unplaced) when neither is seen. And it never writes into the
+// window where Muse drops a steer: from the final answer's `item/completed`
+// on, a follow-up is refused noActiveTurn and the broker sends it as the
+// next turn.
 //
 // What the device knows of MSP for this is limited to the JSON-RPC ids it
-// chose, request/response pairing, and five facts per host, read from the
+// chose, request/response pairing, and these facts per host, read from the
 // frames going both ways:
 //
 //   - the session the host serves (the answer to `session/start` or
@@ -22,10 +37,15 @@
 //   - the running turn (a `turn/start` ack with disposition "started", or
 //     `turn/started`), cleared by its own `turn/completed`; the signed
 //     `expectedTurnId` must name it (else turnMismatch);
-//   - whether that turn's foreground is done (`turn/foregroundCompleted`):
-//     Muse dropped a steer admitted after it (2026-11-13, S10), so from then
-//     on the device refuses noActiveTurn and the broker sends the message as
-//     the next turn;
+//   - whether that turn's final answer has completed (an `agentMessage`
+//     item in phase `finalAnswer`) or its foreground is done
+//     (`turn/foregroundCompleted`): Muse dropped steers it read after
+//     either (2026-11-13 S10; 2026-11-16), so from then on the device
+//     refuses noActiveTurn and the broker sends the message as the next
+//     turn;
+//   - where each steer it wrote ran: its `userMessage` item (by the
+//     steer's commandId) in the named turn or another one, a turn started
+//     under its commandId, or the named turn ending without it;
 //   - the approvals the host is waiting on (`approval/request` until
 //     `approval/resolved`, a newer request for the same approval, or the end
 //     of its turn), and its open `userInput/request`s: nothing is written
@@ -43,6 +63,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"time"
 )
 
 // Wire values mirrored from shared-constants 3.23.580 (museCode.js
@@ -68,6 +89,8 @@ const (
 	mspMethodUsageRead              = "usage/read"
 
 	mspNotifyTurnStarted             = "turn/started"
+	mspNotifyItemStarted             = "item/started"
+	mspNotifyItemCompleted           = "item/completed"
 	mspNotifyTurnForegroundCompleted = "turn/foregroundCompleted"
 	mspNotifyTurnCompleted           = "turn/completed"
 	mspNotifyApprovalResolved        = "approval/resolved"
@@ -106,7 +129,18 @@ const (
 	// turn/start ack dispositions; "accepted" is a steer's admission status.
 	mspDispositionStarted = "started"
 	mspStatusAccepted     = "accepted"
+
+	// MUSE_MSP_ITEM_KINDS / MUSE_MSP_MESSAGE_PHASES (shared-constants 3.23.594).
+	mspItemUserMessage  = "userMessage"
+	mspItemAgentMessage = "agentMessage"
+	mspPhaseFinalAnswer = "finalAnswer"
 )
+
+// mspAfterTurnWait is how long, after the turn a steer named has ended
+// without it, the device waits for Muse to start the steer's own turn. Muse
+// started it 49-76 ms after the turn's `turn/completed` on every run
+// (2026-11-16). A var so tests can shorten it.
+var mspAfterTurnWait = 5 * time.Second
 
 // isMSPDriverKind reports the agent whose live follow-up rides the MSP driver.
 func isMSPDriverKind(kind string) bool { return kind == museCodeCliAgentID }
@@ -168,10 +202,13 @@ func mspSteerFrame(rpcID, sessionID, expectedTurnID, commandID, text string) (st
    -------------------------------------------------------------------------- */
 
 // classifyMSPSteerAnswer maps Muse's answer to a `turn/steer` onto the ledger.
-// Written only when Muse says the RUNNING turn named by the signed
-// expectedTurnId absorbed it: an accepted steer whose ack names any other
-// turn was never delivered (S10), so it is unknown. A refusal is notWritten
-// only where nothing can have reached the conversation.
+// Written only when Muse says it took the steer for the RUNNING turn named by
+// the signed expectedTurnId; even then WHERE it runs is not known from the
+// answer (Muse ran such steers as the next turn too), so the caller settles
+// the attempt from Muse's frames (awaitMSPPlacement). An accepted steer whose
+// ack names any other turn was dropped every time it was seen (S10;
+// 2026-11-16), so it is unknown. A refusal is notWritten only where nothing
+// can have reached the conversation.
 func classifyMSPSteerAnswer(frame, expectedTurnID string) liveFollowUpVerdict {
 	var answer struct {
 		Result json.RawMessage `json:"result"`
@@ -241,15 +278,42 @@ type mspTrackerState struct {
 	// sessionID is the session the host serves.
 	sessionID string
 	// runningTurnID is the turn running now ("" when none);
-	// foregroundDone: its `turn/foregroundCompleted` has been read.
+	// foregroundDone: its `turn/foregroundCompleted` has been read;
+	// answerDone: its final answer (an agentMessage in phase finalAnswer)
+	// has completed. Either one closes the turn to live writes.
 	runningTurnID  string
 	foregroundDone bool
+	answerDone     bool
 	// approvals / userInputs: the host's open requests, by approvalId /
 	// userInputId, each with the turn it was asked under ("" when unnamed).
 	approvals  map[string]string
 	userInputs map[string]string
 	// expected is the running turn each live waiter's steer named.
 	expected map[string]string
+	// watches are the steers the device wrote, by JSON-RPC id, until their
+	// attempt settles: where each one ran (mspPlaceLocked).
+	watches map[string]*mspSteerWatch
+}
+
+// mspPlacement is where Muse ran a steer: in the turn it named (`current`),
+// or as a turn of its own (`next`); turnID is that turn. exited: the host
+// went away before either was seen.
+type mspPlacement struct {
+	processedIn string
+	turnID      string
+	exited      bool
+}
+
+// mspSteerWatch follows one written steer until Muse is seen running it.
+type mspSteerWatch struct {
+	commandID string
+	expected  string
+	// placed receives the placement once (cap 1); sent says it has.
+	placed chan mspPlacement
+	sent   bool
+	// ended is closed when the named turn ended without the steer.
+	ended  chan struct{}
+	closed bool
 }
 
 func newMSPTrackerState() *mspTrackerState {
@@ -259,6 +323,7 @@ func newMSPTrackerState() *mspTrackerState {
 		approvals:  map[string]string{},
 		userInputs: map[string]string{},
 		expected:   map[string]string{},
+		watches:    map[string]*mspSteerWatch{},
 	}
 }
 
@@ -315,6 +380,7 @@ func (t *liveFollowUpTracker) mspTurnStartedLocked(turnID string) {
 	}
 	t.msp.runningTurnID = turnID
 	t.msp.foregroundDone = false
+	t.msp.answerDone = false
 }
 
 // mspRequestLocked reads a request the host makes of the client.
@@ -356,6 +422,34 @@ func (t *liveFollowUpTracker) mspNotificationLocked(f jsonRPCFrame) {
 	case mspNotifyTurnStarted:
 		if p.TurnID != "" {
 			t.mspTurnStartedLocked(p.TurnID)
+			// A turn started under a steer's own commandId is that steer,
+			// run as a turn of its own.
+			t.mspPlaceLocked(p.TurnID, p.TurnID)
+		}
+	case mspNotifyItemStarted, mspNotifyItemCompleted:
+		var ip struct {
+			Item struct {
+				Kind         string `json:"kind"`
+				TurnID       string `json:"turnId"`
+				CommandID    string `json:"commandId"`
+				MessagePhase string `json:"messagePhase"`
+			} `json:"item"`
+		}
+		if json.Unmarshal(f.Params, &ip) != nil {
+			return
+		}
+		item := ip.Item
+		turn := item.TurnID
+		if turn == "" {
+			turn = st.runningTurnID
+		}
+		switch {
+		case item.Kind == mspItemUserMessage && item.CommandID != "":
+			// A steer's own message, in the turn that took it.
+			t.mspPlaceLocked(item.CommandID, turn)
+		case f.Method == mspNotifyItemCompleted && item.Kind == mspItemAgentMessage &&
+			item.MessagePhase == mspPhaseFinalAnswer && turn != "" && turn == st.runningTurnID:
+			st.answerDone = true
 		}
 	case mspNotifyTurnForegroundCompleted:
 		if p.TurnID != "" && p.TurnID == st.runningTurnID {
@@ -367,7 +461,15 @@ func (t *liveFollowUpTracker) mspNotificationLocked(f jsonRPCFrame) {
 			ended = st.runningTurnID
 		}
 		if ended == st.runningTurnID {
-			st.runningTurnID, st.foregroundDone = "", false
+			st.runningTurnID, st.foregroundDone, st.answerDone = "", false, false
+		}
+		// A steer that named this turn and was not seen in it: Muse either
+		// runs it as a turn of its own next, or never does.
+		for _, w := range st.watches {
+			if ended != "" && w.expected == ended && !w.sent && !w.closed {
+				w.closed = true
+				close(w.ended)
+			}
 		}
 		// The turn's requests end with it; one that named no turn ends with
 		// the turn that was running. Another turn's stay open (fail safe:
@@ -387,12 +489,97 @@ func (t *liveFollowUpTracker) mspNotificationLocked(f jsonRPCFrame) {
 }
 
 // mspAdmitStateLocked is the MSP part of the stdin-boundary fence: an open
-// request, no running turn (or only its background checks), another turn.
+// request, no running turn (or one whose final answer is done, or only its
+// background checks), another turn.
 func (t *liveFollowUpTracker) mspAdmitStateLocked(state *liveWriteState, expectedTurnID string) {
 	st := t.msp
 	state.ApprovalPending = state.ApprovalPending || len(st.approvals) > 0 || len(st.userInputs) > 0
-	state.NoActiveTurn = st.runningTurnID == "" || st.foregroundDone
+	state.NoActiveTurn = st.runningTurnID == "" || st.foregroundDone || st.answerDone
 	state.TurnMismatch = !state.NoActiveTurn && st.runningTurnID != expectedTurnID
+}
+
+// mspPlaceLocked records where the steer whose commandId is commandID ran:
+// in the turn it named, or (any other turn) as a turn of its own.
+func (t *liveFollowUpTracker) mspPlaceLocked(commandID, turnID string) {
+	if commandID == "" || turnID == "" {
+		return
+	}
+	for _, w := range t.msp.watches {
+		if w.commandID != commandID || w.sent {
+			continue
+		}
+		p := mspPlacement{processedIn: followUpProcessedInNext, turnID: turnID}
+		if turnID == w.expected {
+			p.processedIn = followUpProcessedInCurrent
+		}
+		w.sent = true
+		w.placed <- p
+	}
+}
+
+// mspWatchSteer follows the steer about to be written under rpcID until its
+// attempt settles. Called under the session's stdinMu, after the fence
+// admitted it and before the write, so no frame about it can come first.
+func (t *liveFollowUpTracker) mspWatchSteer(rpcID, commandID, expectedTurnID string) {
+	if t == nil || t.msp == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.msp.watches[rpcID] = &mspSteerWatch{
+		commandID: commandID,
+		expected:  expectedTurnID,
+		placed:    make(chan mspPlacement, 1),
+		ended:     make(chan struct{}),
+	}
+}
+
+// awaitMSPPlacement waits for where Muse ran the steer written under rpcID,
+// until deadline. With afterTurn, it also gives up mspAfterTurnWait after the
+// turn the steer named ended without it and no turn of its own started.
+// ok=false: not seen.
+func (t *liveFollowUpTracker) awaitMSPPlacement(rpcID string, deadline time.Time, afterTurn bool) (mspPlacement, bool) {
+	if t == nil || t.msp == nil {
+		return mspPlacement{}, false
+	}
+	t.mu.Lock()
+	w := t.msp.watches[rpcID]
+	t.mu.Unlock()
+	if w == nil {
+		return mspPlacement{}, false
+	}
+	wait := time.Until(deadline)
+	if wait < 0 {
+		wait = 0
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	var ended <-chan struct{}
+	if afterTurn {
+		ended = w.ended
+	}
+	var grace <-chan time.Time
+	for {
+		select {
+		case p := <-w.placed:
+			return p, true
+		case <-ended:
+			ended = nil
+			g := time.NewTimer(mspAfterTurnWait)
+			defer g.Stop()
+			grace = g.C
+		case <-grace:
+			return mspPlacement{}, false
+		case <-timer.C:
+			// A placement read in the same instant still counts.
+			select {
+			case p := <-w.placed:
+				return p, true
+			default:
+			}
+			return mspPlacement{}, false
+		}
+	}
 }
 
 // mspSession is the session the Muse host serves ("" before one is known).
@@ -405,15 +592,15 @@ func (t *liveFollowUpTracker) mspSession() string {
 	return t.msp.sessionID
 }
 
-// mspTurn is the turn running on the Muse host and whether its foreground is
-// done.
-func (t *liveFollowUpTracker) mspTurn() (turnID string, foregroundDone bool) {
+// mspTurn is the turn running on the Muse host and whether it is closed to
+// live writes: its final answer has completed or its foreground is done.
+func (t *liveFollowUpTracker) mspTurn() (turnID string, closing bool) {
 	if t == nil || t.msp == nil {
 		return "", false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.msp.runningTurnID, t.msp.foregroundDone
+	return t.msp.runningTurnID, t.msp.foregroundDone || t.msp.answerDone
 }
 
 // mspPendingLocked reports an open approval or user-input request.

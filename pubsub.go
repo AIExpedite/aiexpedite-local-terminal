@@ -1453,6 +1453,10 @@ type resultMsg struct {
 	FollowUpReason      string `json:"reason,omitempty"`
 	FollowUpProcessedIn string `json:"processedIn,omitempty"`
 	FollowUpLedgerID    string `json:"ledgerId,omitempty"`
+	// FollowUpMSPTurnID (Muse Code on MSP): the MSP turn a written steer was
+	// seen running in. With processedIn `next` it is the turn Muse ran it
+	// as, which terminal-service binds as the follow-up's turn.
+	FollowUpMSPTurnID string `json:"followUpMspTurnId,omitempty"`
 }
 
 /*
