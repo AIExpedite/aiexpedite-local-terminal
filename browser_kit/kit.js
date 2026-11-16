@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.15';
+  var VERSION = 'aix-1.0.16';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -80,6 +80,8 @@
     if (a === e || a.toLowerCase() === e.toLowerCase()) return true;
     if (!a || !e) return false;
     if (leadingMinus(a) !== leadingMinus(e)) return false;   // -10 is not 10, whatever the page's mask did
+    var nA = toNumber(a), nE = toNumber(e);
+    if (nA !== null && nE !== null && nA !== nE) return false;   // 1,234 is not 1.234: punctuation that moves a number's magnitude
     var runsA = (a.match(/\d+/g) || []).join(','), runsE = (e.match(/\d+/g) || []).join(',');
     var restA = a.replace(/[\d\s()+\-.\/,]/g, ''), restE = e.replace(/[\d\s()+\-.\/,]/g, '');
     if (runsE && runsA === runsE && restA === restE) return true;         // same digit groups, other punctuation
@@ -994,6 +996,16 @@
       // carries a query is that form, or a page handler's copy of it: it must carry what was
       // approved. Any other navigation without form data stays allowed (a script that saved by
       // fetch and then shows its confirmation page).
+      // The approved form's own GET submission is used once, like a POST: a handler that calls
+      // its native submit() again (an endpoint answering 204 leaves the page in place) is refused.
+      if (!a.virtual && dest && sendsToApprovedAction(a, dest) && hasQuery(dest)) {
+        if (a.navUsed) return false;
+        if (a.payload && outgoingHolds(a, queryEntries(dest))) {
+          a.navUsed = true;
+          a.used = true;
+          return true;
+        }
+      }
       if (!a.virtual && a.payload && dest && sendsToApprovedAction(a, dest) && hasQuery(dest) &&
           !outgoingHolds(a, queryEntries(dest))) {
         a.changed = true;

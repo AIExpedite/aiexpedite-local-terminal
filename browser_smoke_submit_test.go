@@ -85,7 +85,8 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
 second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="upsilon" method="post" action="/posted18"><label for="up">Upsilon</label><input id="up" name="upsilon" value="eighteen"><input type="hidden" name="item[]" value="A"><input type="hidden" id="q18a" name="qty[]" value="1"><input type="hidden" name="item[]" value="B"><input type="hidden" id="q18b" name="qty[]" value="2"><button id="send18" type="submit">Send upsilon</button></form>
 <form id="chi" method="post" action="/posted19"><label for="c1x">Chi first</label><input id="c1x" name="action" value="save"><label for="c2x">Chi second</label><input id="c2x" name="action" value="edit"><button type="submit" name="action" value="save">Save chi</button></form>
-<form id="phi"><label for="sa">Signed amount</label><input id="sa" name="signed"></form>
+<form id="phi"><label for="sa">Signed amount</label><input id="sa" name="signed"><label for="da">Decimal amount</label><input id="da" name="decimal"></form>
+<form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
 <div id="radios1"></div><div id="radios2"></div>
 <form id="plans"><label for="plan">Plan</label><select id="plan" name="plan"><option value="">Choose</option><optgroup label="Old" disabled><option>Legacy</option></optgroup><option>Basic</option></select></form>
@@ -125,6 +126,12 @@ document.getElementById('send13').addEventListener('click', function (e) {
 document.getElementById('pi').addEventListener('submit', function () { document.getElementById('amt14').value = '9999.00'; });
 document.getElementById('send18').addEventListener('click', function () { var a = document.getElementById('q18a'), b = document.getElementById('q18b'), t = a.value; a.value = b.value; b.value = t; });
 document.getElementById('sa').addEventListener('blur', function () { this.value = this.value.replace('-', ''); });
+document.getElementById('da').addEventListener('blur', function () { this.value = this.value.replace('.', ','); });
+document.getElementById('send20').addEventListener('click', function () {
+  var f = document.getElementById('psi');
+  HTMLFormElement.prototype.submit.call(f);
+  setTimeout(function () { HTMLFormElement.prototype.submit.call(f); }, 400);
+});
 var sf2 = document.getElementById('shadowform2').attachShadow({ mode: 'open' });
 sf2.innerHTML = '<form method="post" action="/posted17" target="sink14"><label for="sg">Sigma</label><input id="sg" name="sigma" value="seventeen"><input type="hidden" id="amt17" name="amount" value="10.00"><button type="submit">Send sigma</button></form>';
 sf2.querySelector('form').addEventListener('submit', function () { sf2.getElementById('amt17').value = '9999.00'; });
@@ -165,6 +172,8 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 			fmt.Fprint(w, smokeSubmitPage)
 		case "/save":
 			fmt.Fprint(w, "saved")
+		case "/got20":
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			fmt.Fprint(w, `<!doctype html><html><head><title>Posted</title></head><body>ok</body></html>`)
 		}
@@ -597,6 +606,33 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
 		t.Fatal(err)
+	}
+
+	// 4d11. The approved GET form's handler submits it natively twice against an
+	// endpoint answering 204 (the page stays): only the first one goes.
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+	prep = prepare(refs["Send psi"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r20"})
+	time.Sleep(1500 * time.Millisecond)
+	if err != nil || hit("GET /got20") != 1 {
+		t.Fatalf("approved GET form submitted twice: %v got20=%d", err, hit("GET /got20"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	// 4d12. A page that turns a decimal point into a thousands separator: mismatch.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Decimal amount", Value: "1.234"}}})
+	if err != nil {
+		t.Fatalf("fill decimal amount: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("1.234 shown as 1,234 must read as a mismatch: %+v", o)
 	}
 
 	// 4d9. A page that strips the minus sign of a filled amount: mismatch, not filled.
