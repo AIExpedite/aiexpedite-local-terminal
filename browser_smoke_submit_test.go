@@ -84,6 +84,7 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
 <form id="tau" method="get" action="/got16"><label for="tx">Tau notes</label><textarea id="tx" name="tau">first line
 second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="upsilon" method="post" action="/posted18"><label for="up">Upsilon</label><input id="up" name="upsilon" value="eighteen"><input type="hidden" name="item[]" value="A"><input type="hidden" id="q18a" name="qty[]" value="1"><input type="hidden" name="item[]" value="B"><input type="hidden" id="q18b" name="qty[]" value="2"><button id="send18" type="submit">Send upsilon</button></form>
+<form id="chi" method="post" action="/posted19"><label for="c1x">Chi first</label><input id="c1x" name="action" value="save"><label for="c2x">Chi second</label><input id="c2x" name="action" value="edit"><button type="submit" name="action" value="save">Save chi</button></form>
 <form id="phi"><label for="sa">Signed amount</label><input id="sa" name="signed"></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
 <div id="radios1"></div><div id="radios2"></div>
@@ -576,6 +577,28 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
 		t.Fatal(err)
 	}
+	// 4d10. Repeated fields whose values include the button's own (action=save,
+	// action=edit, then a button action=save): the unchanged form submits once.
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+	prep = prepare(refs["Save chi"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r19"})
+	deadline = time.Now().Add(5 * time.Second)
+	for hit("POST /posted19") == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil || hit("POST /posted19") != 1 {
+		t.Fatalf("button value among repeated values: %v posted19=%d", err, hit("POST /posted19"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+
 	// 4d9. A page that strips the minus sign of a filled amount: mismatch, not filled.
 	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Signed amount", Value: "-10"}}})
 	if err != nil {

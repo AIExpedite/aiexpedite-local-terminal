@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.14';
+  var VERSION = 'aix-1.0.15';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1834,37 +1834,54 @@
   // the property) or, for a control outside any form, from its container.
   var FORM_ELEMENTS = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'elements').get;
   // raw: keep sensitive values too (only for comparisons that never leave the page).
+  // The values one control contributes to a submission, by the form data set's rules: null for a
+  // control that contributes nothing (a button, an unnamed or disabled control, the kit's own UI).
+  // The ONE reading for submittedData and for the submitter's position (submitterIndex).
+  function controlValues(el) {
+    if (inOwnUi(el)) return null;
+    var tag = el.tagName, type = lower(el.getAttribute('type') || '');
+    if (tag !== 'INPUT' && tag !== 'SELECT' && tag !== 'TEXTAREA') return null;   // buttons: the submitter is in parts.submit
+    if (tag === 'INPUT' && /^(submit|image|reset|button)$/.test(type)) return null;
+    var name = el.getAttribute('name') || '';
+    if (!name) return null;
+    var disabled = false;
+    try { disabled = el.matches(':disabled'); } catch (e) { disabled = !!el.disabled; }
+    if (disabled) return null;
+    var values = [];
+    if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) { if (el.checked) values.push(el.value); }
+    else if (tag === 'INPUT' && type === 'file') Array.prototype.forEach.call(el.files || [], function (f) { values.push(f.name + '\u241f' + f.size); });
+    else if (tag === 'SELECT') Array.prototype.forEach.call(el.options, function (o) { if (o.selected && !optionDisabled(o)) values.push(o.value); });
+    else values.push(el.value);
+    return { name: name, type: type, values: values };
+  }
   function submittedData(r, sensitiveEls, raw) {
     var els = r.form ? Array.prototype.slice.call(FORM_ELEMENTS.call(r.form))
       : Array.prototype.slice.call(r.container.querySelectorAll('input, select, textarea'));
     var out = [];
     els.forEach(function (el) {
-      if (inOwnUi(el)) return;
-      var tag = el.tagName, type = lower(el.getAttribute('type') || '');
-      if (tag !== 'INPUT' && tag !== 'SELECT' && tag !== 'TEXTAREA') return;   // buttons: the submitter is in parts.submit
-      if (tag === 'INPUT' && /^(submit|image|reset|button)$/.test(type)) return;
-      var name = el.getAttribute('name') || '';
-      if (!name) return;
-      var disabled = false;
-      try { disabled = el.matches(':disabled'); } catch (e) { disabled = !!el.disabled; }
-      if (disabled) return;
-      var push = function (v) {
+      var cv = controlValues(el);
+      if (!cv) return;
+      cv.values.forEach(function (v) {
         v = v == null ? '' : String(v);
-        var sens = !raw && (sensitiveEls.has(el) || type === 'password');
-        out.push({ name: name, value: sens ? '' : v, len: sens ? v.length : 0, sensitive: sens });
-      };
-      if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) { if (el.checked) push(el.value); return; }
-      if (tag === 'INPUT' && type === 'file') {
-        Array.prototype.forEach.call(el.files || [], function (f) { push(f.name + '␟' + f.size); });
-        return;
-      }
-      if (tag === 'SELECT') {
-        Array.prototype.forEach.call(el.options, function (o) { if (o.selected && !optionDisabled(o)) push(o.value); });
-        return;
-      }
-      push(el.value);
+        var sens = !raw && (sensitiveEls.has(el) || cv.type === 'password');
+        out.push({ name: cv.name, value: sens ? '' : v, len: sens ? v.length : 0, sensitive: sens });
+      });
     });
     return out;
+  }
+  // Where the approved control's own pair sits among its name's values in the submission: how many
+  // values of that name come before the control in tree order, read from the LIVE page at the
+  // moment of submission (a handler may have moved the control). -1 when it cannot be read.
+  function submitterIndex(a, name) {
+    var c = a.el && a.el.deref(), form = a.form && a.form.deref();
+    if (!c || !form) return -1;
+    var els = FORM_ELEMENTS.call(form), count = 0;
+    for (var i = 0; i < els.length; i++) {
+      if (els[i] === c) return count;
+      var cv = controlValues(els[i]);
+      if (cv && cv.name === name) count += cv.values.length;
+    }
+    return -1;
   }
   // What the submission itself carries, read again at the moment it happens: the click handlers
   // of the approved control run AFTER armSubmit compared the digest, and could change the data
@@ -1924,13 +1941,14 @@
     if (entriesHold(a.payload.by, now)) return true;
     var c = a.el && a.el.deref && a.el.deref(), name = c && c.getAttribute && c.getAttribute('name');
     if (!name || lower(c.getAttribute('type') || '') === 'image' || !now || !now[name]) return false;
-    // The control's own pair sits at the control's place in tree order, which the approved
-    // reading cannot know: take exactly one occurrence of its value out, keep the rest in order.
+    // The control's own pair sits at the control's place in tree order: take out exactly that
+    // entry (never just the first equal value: with action=save, action=edit and a button
+    // action=save, that would reorder an unchanged form), keep the rest in order.
+    var idx = submitterIndex(a, name), list = now[name];
+    if (idx < 0 || idx >= list.length || eol(list[idx]) !== eol(c.getAttribute('value') || '')) return false;
     var without = Object.create(null);
     for (var k in now) without[k] = now[k].slice();
-    var i = without[name].map(eol).indexOf(eol(c.getAttribute('value') || ''));
-    if (i < 0) return false;
-    without[name].splice(i, 1);
+    without[name] = list.slice(0, idx).concat(list.slice(idx + 1));
     return entriesHold(a.payload.by, without);
   }
   // What a navigation's form data carries, as name -> [values]; a file as name␟size, as
