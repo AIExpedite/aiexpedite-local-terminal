@@ -103,6 +103,84 @@ func processGroupEmpty(rec ledgerProcess) bool {
 	return errors.Is(err, syscall.ESRCH)
 }
 
+// leftoverWait bounds how long ending a session's leftovers waits for them
+// to go (killed members linger as zombies until reaped).
+var leftoverWait = 3 * time.Second
+
+// endLeftoverProcessTree SIGKILLs what a session left in the process group its
+// recorded leader led, ONLY with proof that every member is the session's own:
+//
+//   - the recorded leader is gone, and no live process holds its PID: a live
+//     holder means the PID (and with it the group id) was reused by an
+//     unrelated program, which must never be signalled;
+//   - every member of the group carries this session's owner marker
+//     (session_owner.go). A group id alone proves nothing once the group has
+//     been empty, because the kernel may hand it to an unrelated group (Codex
+//     P1 on #304); a member we cannot read, or one without the marker, means
+//     nothing is signalled at all.
+//
+// A descendant that left the group (setsid / setpgid) is out of reach: the
+// agent does not enumerate process trees (see probeRecordedDescendants).
+// Reports whether the group is empty afterwards.
+func endLeftoverProcessTree(rec ledgerProcess, job uintptr, owner string) bool {
+	if rec.PGID <= 0 || rec.PGID != rec.PID {
+		return processGroupEmpty(rec)
+	}
+	if probeRecordedProcess(rec) != processGone || pidAlive(rec.PID) {
+		return false
+	}
+	members, err := processGroupMembers(rec.PGID)
+	if err != nil {
+		return false
+	}
+	live := 0
+	for _, m := range members {
+		// An exited member (a zombie awaiting its parent) cannot run and has
+		// no environment to prove anything with; it is neither a reason to
+		// stop nor something to end. Every LIVE member still has to prove
+		// itself (Codex P2 on #304).
+		if m.Exited {
+			continue
+		}
+		live++
+		if owner == "" {
+			return false
+		}
+		env, err := processEnviron(m.PID)
+		if err != nil || !envHasSessionOwner(env, owner) {
+			return false
+		}
+	}
+	if live == 0 {
+		return true
+	}
+	_ = syscall.Kill(-rec.PGID, syscall.SIGKILL)
+	deadline := time.Now().Add(leftoverWait)
+	for !processGroupEmpty(rec) {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return true
+}
+
+// groupMember is one process in a process group.
+type groupMember struct {
+	PID int
+	// Exited: a zombie (or dead) process, awaiting its parent's reap.
+	Exited bool
+}
+
+// pidAlive reports whether any process (zombies included) holds pid.
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
 // processTreeGone: an exited per-turn leader's process group is empty.
 func processTreeGone(p ledgerProcess, job uintptr) bool {
 	return processGroupEmpty(p)

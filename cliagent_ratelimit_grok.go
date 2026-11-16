@@ -603,6 +603,7 @@ var (
 	// recognises verbatim.
 	grokAttributionKeeperAccounts = map[string]grokAttributionKeeperAccount{}
 	grokAttributionKeeperStop     chan struct{}
+	grokAttributionKeeperDone     chan struct{}
 )
 
 // grokAttributionKeeperAccount is one case-folded account bucket: how many live
@@ -678,7 +679,8 @@ func startGrokBillingAttributionKeeper(identity string) (finish func()) {
 	}
 	if grokAttributionKeeperRefs == 1 {
 		grokAttributionKeeperStop = make(chan struct{})
-		go runGrokBillingAttributionKeeper(grokAttributionKeeperStop)
+		grokAttributionKeeperDone = make(chan struct{})
+		go runGrokBillingAttributionKeeper(grokAttributionKeeperStop, grokAttributionKeeperDone)
 	}
 	grokAttributionKeeperMu.Unlock()
 
@@ -686,7 +688,7 @@ func startGrokBillingAttributionKeeper(identity string) (finish func()) {
 	return func() {
 		once.Do(func() {
 			grokAttributionKeeperMu.Lock()
-			var stop chan struct{}
+			var stop, done chan struct{}
 			grokAttributionKeeperRefs--
 			if identity != "" {
 				key := grokIdentityFoldKey(identity)
@@ -700,10 +702,15 @@ func startGrokBillingAttributionKeeper(identity string) (finish func()) {
 			if grokAttributionKeeperRefs <= 0 {
 				grokAttributionKeeperRefs = 0
 				stop, grokAttributionKeeperStop = grokAttributionKeeperStop, nil
+				done, grokAttributionKeeperDone = grokAttributionKeeperDone, nil
 			}
 			grokAttributionKeeperMu.Unlock()
 			if stop != nil {
 				close(stop)
+				// A stop signal alone leaves an in-flight tick free to write
+				// after release returns (including during test home cleanup).
+				// Join this generation outside the mutex the tick itself needs.
+				<-done
 				// The LAST instrumented run is gone, so our marker must stop
 				// vouching for whatever is written next. See
 				// sealGrokDirectAttribution.
@@ -868,7 +875,8 @@ func sealGrokBillingAttributionLocked(base string) {
 
 // runGrokBillingAttributionKeeper re-asserts attribution until the last armed
 // session releases. Best-effort and silent, like every other path in this file.
-func runGrokBillingAttributionKeeper(stop <-chan struct{}) {
+func runGrokBillingAttributionKeeper(stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
 	ticker := time.NewTicker(grokBillingAttributionKeeperIntervalValue())
 	defer ticker.Stop()
 	for {

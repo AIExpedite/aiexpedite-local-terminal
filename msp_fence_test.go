@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -330,6 +331,62 @@ func TestTheMSPFenceHoldsAResumedConversationToTheFolder(t *testing.T) {
 	}
 	if err := f.inboundFrame(answer(strconv.Quote(inside)), root); err != nil || f.mspHostSession() != mspFenceSession {
 		t.Fatalf("a resume inside the folder: %v", err)
+	}
+}
+
+// Muse 1.4.20 reports the folder of a conversation `muse exec` started as a
+// Windows extended-length path (`\\?\C:\...`, S18, certification 2026-11-16):
+// the session's own folder, so the resume is taken, not refused.
+func TestTheMSPFenceTakesAResumedFolderInItsExtendedLengthForm(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("extended-length paths are a Windows form")
+	}
+	resume := `{"jsonrpc":"2.0","id":"relay-msp-resume","method":"session/resume","params":{"commandId":"` + mspFenceCmd1 + `","sessionId":"` + mspFenceSession + `","excludeItems":true}}`
+	answer := func(workspaceRoot string) string {
+		return `{"jsonrpc":"2.0","id":"relay-msp-resume","result":{"session":{"sessionId":"` + mspFenceSession + `","workspaceRoot":` + strconv.Quote(workspaceRoot) + `},"history":{"mode":"none"},"pendingRequests":[]}}`
+	}
+	f, root := newTestMSPFence(t)
+	if err := mspSend(f, resume, root); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.inboundFrame(answer(`\\?\`+root), root); err != nil || f.mspHostSession() != mspFenceSession {
+		t.Fatalf("the session's own folder, extended-length: %v", err)
+	}
+	// Behind the prefix nothing is normalised: a path that would only be
+	// inside once cleaned is still refused, and so is another folder.
+	for name, ws := range map[string]string{
+		"another folder": `\\?\` + filepath.Dir(root),
+		"climbing out":   `\\?\` + root + `\..\..`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, root := newTestMSPFence(t)
+			if err := mspSend(f, resume, root); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.inboundFrame(answer(ws), root); acpTypedErrorCode(err) != acpErrorCodeFrameRefused {
+				t.Fatalf("refusal = %v", err)
+			}
+		})
+	}
+}
+
+func TestLocalExtendedLengthPath(t *testing.T) {
+	for in, want := range map[string]string{
+		`\\?\C:\Users\me\repo`:   `C:\Users\me\repo`,
+		`\\?\d:\x`:               `d:\x`,
+		`C:\Users\me`:            `C:\Users\me`,
+		`\\?\UNC\server\share\x`: `\\?\UNC\server\share\x`,
+		`\\?\C:\a\..\b`:          `\\?\C:\a\..\b`,
+		`\\?\C:\a\.\b`:           `\\?\C:\a\.\b`,
+		`\\?\C:\a\\b`:            `\\?\C:\a\\b`,
+		`\\?\C:\a/b`:             `\\?\C:\a/b`,
+		`\\?\C:`:                 `\\?\C:`,
+		`\\?\1:\x`:               `\\?\1:\x`,
+		`\\.\C:\x`:               `\\.\C:\x`,
+	} {
+		if got := localExtendedLengthPath(in); got != want {
+			t.Errorf("localExtendedLengthPath(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

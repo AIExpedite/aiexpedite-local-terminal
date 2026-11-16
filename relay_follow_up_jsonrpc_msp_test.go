@@ -111,10 +111,35 @@ func mspSteerAnswer(result string) func(f jsonRPCFrame) []string {
 	}
 }
 
+// mspAbsorbed answers a steer as Muse does when the running turn takes it:
+// accepted for that turn, then (at the turn's next model-call boundary) the
+// steer's own userMessage item in that turn.
 func mspAbsorbed(f jsonRPCFrame) []string {
 	var p mspSteerParams
 	_ = json.Unmarshal(f.Params, &p)
+	return []string{mspAcceptedFor(f)[0], mspUserMessage(p.CommandID, p.ExpectedTurnID)}
+}
+
+// mspAcceptedFor is only Muse's answer: accepted for the turn the steer named.
+func mspAcceptedFor(f jsonRPCFrame) []string {
+	var p mspSteerParams
+	_ = json.Unmarshal(f.Params, &p)
 	return []string{`{"jsonrpc":"2.0","id":` + string(f.ID) + `,"result":{"commandId":"` + p.CommandID + `","status":"accepted","turnId":"` + p.ExpectedTurnID + `"}}`}
+}
+
+// mspUserMessage is a steer's own userMessage item, in turnID.
+func mspUserMessage(commandID, turnID string) string {
+	return `{"jsonrpc":"2.0","method":"item/completed","params":{"sessionId":"` + mspTestSession + `","item":{"itemId":"um-` + commandID + `","kind":"userMessage","turnId":"` + turnID + `","status":"completed","commandId":"` + commandID + `","steered":true}}}`
+}
+
+// mspTurnEvent is a turn notification for turnID.
+func mspTurnEvent(method, turnID string) string {
+	return `{"jsonrpc":"2.0","method":"` + method + `","params":{"sessionId":"` + mspTestSession + `","turnId":"` + turnID + `","terminal":"completed"}}`
+}
+
+// mspAgentMessageCompleted is an agentMessage item completing in turnID, in phase.
+func mspAgentMessageCompleted(turnID, phase string) string {
+	return `{"jsonrpc":"2.0","method":"item/completed","params":{"sessionId":"` + mspTestSession + `","item":{"itemId":"am-1","kind":"agentMessage","turnId":"` + turnID + `","status":"completed","text":"done","messagePhase":"` + phase + `"}}}`
 }
 
 /* --- contract pins (shared-constants 3.23.580) --- */
@@ -133,6 +158,10 @@ func TestMuseMSPWireValuesMatchSharedConstants(t *testing.T) {
 		mspRejectMissingRun: "missing_run", mspRejectAlreadyTerminal: "already_terminal", mspRejectCommandIDConflict: "command_id_conflict",
 		mspApprovalApproved: "approved", mspApprovalDenied: "denied", mspApprovalScopeOnce: "once",
 		mspIfBusyQueue: "queue", mspTurnTerminalCompleted: "completed",
+		// MUSE_MSP_NOTIFICATIONS / MUSE_MSP_ITEM_KINDS / MUSE_MSP_MESSAGE_PHASES
+		// (shared-constants 3.23.594).
+		mspNotifyItemStarted: "item/started", mspNotifyItemCompleted: "item/completed",
+		mspItemUserMessage: "userMessage", mspItemAgentMessage: "agentMessage", mspPhaseFinalAnswer: "finalAnswer",
 	}
 	for got, want := range strs {
 		if got != want {
@@ -251,6 +280,123 @@ func TestAMuseCodeLiveFollowUpWritesOneSteerAndIsWrittenOnItsAnswer(t *testing.T
 	}
 	wantAck(t, acks[0], followUpOutcomeWritten, "", followUpProcessedInCurrent)
 	wantAck(t, acks[1], followUpOutcomeWritten, "", followUpProcessedInCurrent)
+	for _, a := range acks {
+		if a.FollowUpMSPTurnID != mspTestTurn {
+			t.Fatalf("followUpMspTurnId = %q, want the turn it joined %q", a.FollowUpMSPTurnID, mspTestTurn)
+		}
+	}
+}
+
+// Muse acks a steer for the running turn, finishes that turn without it, and
+// runs it as the next turn under the steer's own commandId (certification,
+// 2026-11-16: every steer sent at a turn's start that used no tool, and
+// every one sent while the final answer streamed). The device answers only
+// once it sees that: written, `next`, naming that turn; never `current`.
+func TestAMuseCodeSteerMuseRunsAsTheNextTurnIsWrittenNextWithThatTurn(t *testing.T) {
+	h, s := newMSPLiveHarness(t)
+	startMSPTurn(t, h, s)
+	h.child.setRespond(mspHostAnswers(mspAcceptedFor))
+	cmd := h.mspCmd("msp-next", "Also write STEERED.", mspTestTurn)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.handle(cmd)
+	}()
+	waitForLive(t, "Muse's answer", func() bool { return s.liveFollowUps.mspWatched("relay-followup-msp-next") })
+	time.Sleep(50 * time.Millisecond)
+	// Accepted, not yet seen running: in flight, so a redelivery and a query
+	// publish nothing.
+	h.handle(cmd)
+	h.query("msp-next")
+	if acks := h.acks.snapshot(); len(acks) != 0 {
+		t.Fatalf("answered before the steer was seen running: %+v", acks)
+	}
+	commandID, _ := mspFollowUpCommandID("msp-next", cmd.Ts)
+	h.child.emit(mspAgentMessageCompleted(mspTestTurn, mspPhaseFinalAnswer))
+	h.child.emit(mspTurnEvent(mspNotifyTurnCompleted, mspTestTurn))
+	h.child.emit(mspTurnEvent(mspNotifyTurnStarted, commandID))
+	h.child.emit(mspUserMessage(commandID, commandID))
+	<-done
+	acks := h.acks.snapshot()
+	if len(acks) != 1 {
+		t.Fatalf("want one ack, got %+v", acks)
+	}
+	wantAck(t, acks[0], followUpOutcomeWritten, "", followUpProcessedInNext)
+	if acks[0].FollowUpMSPTurnID != commandID {
+		t.Fatalf("followUpMspTurnId = %q, want the steer's own turn %q", acks[0].FollowUpMSPTurnID, commandID)
+	}
+	// The ledger answers a redelivery the same, turn included.
+	h.handle(cmd)
+	if a := h.acks.snapshot()[1]; a.FollowUpOutcome != followUpOutcomeWritten || a.FollowUpProcessedIn != followUpProcessedInNext || a.FollowUpMSPTurnID != commandID {
+		t.Fatalf("redelivery answered %+v", a)
+	}
+	if n := len(h.child.framesWithMethod(mspMethodTurnSteer)); n != 1 {
+		t.Fatalf("%d steers written", n)
+	}
+}
+
+// Seen only as the steer's userMessage in another turn (no turn/started read
+// for it): still the next turn, that one.
+func TestAMuseCodeSteerSeenInAnotherTurnIsWrittenNext(t *testing.T) {
+	h, s := newMSPLiveHarness(t)
+	startMSPTurn(t, h, s)
+	h.child.setRespond(mspHostAnswers(func(f jsonRPCFrame) []string {
+		var p mspSteerParams
+		_ = json.Unmarshal(f.Params, &p)
+		return []string{mspAcceptedFor(f)[0], mspTurnEvent(mspNotifyTurnCompleted, mspTestTurn), mspUserMessage(p.CommandID, mspOtherTurn)}
+	}))
+	h.handle(h.mspCmd("msp-other", "x", mspTestTurn))
+	a := h.acks.snapshot()[0]
+	wantAck(t, a, followUpOutcomeWritten, "", followUpProcessedInNext)
+	if a.FollowUpMSPTurnID != mspOtherTurn {
+		t.Fatalf("followUpMspTurnId = %q", a.FollowUpMSPTurnID)
+	}
+}
+
+// The turn the steer named ends without it and Muse starts no turn of its
+// own (what Muse did with every steer it dropped): unknown, never written.
+func TestAMuseCodeSteerNeverSeenRunningIsUnknownUnplaced(t *testing.T) {
+	prev := mspAfterTurnWait
+	mspAfterTurnWait = 50 * time.Millisecond
+	t.Cleanup(func() { mspAfterTurnWait = prev })
+	h, s := newMSPLiveHarness(t)
+	startMSPTurn(t, h, s)
+	h.child.setRespond(mspHostAnswers(func(f jsonRPCFrame) []string {
+		return []string{mspAcceptedFor(f)[0], mspTurnEvent(mspNotifyTurnCompleted, mspTestTurn)}
+	}))
+	cmd := h.mspCmd("msp-lost", "x", mspTestTurn)
+	h.handle(cmd)
+	a := h.acks.snapshot()[0]
+	wantAck(t, a, followUpOutcomeUnknown, followUpReasonUnplaced, "")
+	if a.FollowUpMSPTurnID != "" {
+		t.Fatalf("an unplaced steer named a turn: %q", a.FollowUpMSPTurnID)
+	}
+	// Seen running after all, while the broker can still take it: lifted.
+	commandID, _ := mspFollowUpCommandID("msp-lost", cmd.Ts)
+	h.child.emit(mspTurnEvent(mspNotifyTurnStarted, commandID))
+	waitForLive(t, "the late placement", func() bool { return len(h.acks.snapshot()) == 2 })
+	b := h.acks.snapshot()[1]
+	wantAck(t, b, followUpOutcomeWritten, "", followUpProcessedInNext)
+	if b.FollowUpMSPTurnID != commandID {
+		t.Fatalf("late followUpMspTurnId = %q", b.FollowUpMSPTurnID)
+	}
+}
+
+// The host exits after accepting a steer, before it is seen running.
+func TestAMuseCodeSteerWhoseHostExitsBeforeItRunsIsUnknown(t *testing.T) {
+	h, s := newMSPLiveHarness(t)
+	startMSPTurn(t, h, s)
+	h.child.setRespond(mspHostAnswers(mspAcceptedFor))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.handle(h.mspCmd("msp-exit", "x", mspTestTurn))
+	}()
+	waitForLive(t, "Muse's answer", func() bool { return s.liveFollowUps.mspWatched("relay-followup-msp-exit") })
+	time.Sleep(50 * time.Millisecond)
+	s.liveFollowUps.readerDone(false)
+	<-done
+	wantAck(t, h.acks.snapshot()[0], followUpOutcomeUnknown, followUpReasonNoAnswer, "")
 }
 
 func TestEachMuseCodeSteerAnswerSettlesTheAttempt(t *testing.T) {
@@ -303,9 +449,20 @@ func TestAMuseCodeSteerWithNoAnswerIsUnknownThenLiftedByALateSuccess(t *testing.
 	h.handle(h.mspCmd("msp-late", "text", mspTestTurn))
 	wantAck(t, h.acks.snapshot()[0], followUpOutcomeUnknown, followUpReasonNoAnswer, "")
 	steer := h.child.framesWithMethod(mspMethodTurnSteer)[0]
-	h.child.emit(mspAbsorbed(steer)[0])
+	// Muse's late answer alone says nothing of where the steer runs.
+	h.child.emit(mspAcceptedFor(steer)[0])
+	time.Sleep(100 * time.Millisecond)
+	if n := len(h.acks.snapshot()); n != 1 {
+		t.Fatalf("a late answer lifted the attempt before the steer was seen running: %+v", h.acks.snapshot())
+	}
+	for _, line := range mspAbsorbed(steer)[1:] {
+		h.child.emit(line)
+	}
 	waitForLive(t, "the late upgrade", func() bool { return len(h.acks.snapshot()) == 2 })
 	wantAck(t, h.acks.snapshot()[1], followUpOutcomeWritten, "", followUpProcessedInCurrent)
+	if got := h.acks.snapshot()[1].FollowUpMSPTurnID; got != mspTestTurn {
+		t.Fatalf("followUpMspTurnId = %q, want %q", got, mspTestTurn)
+	}
 }
 
 // A late answer that names another turn never lifts the attempt.
@@ -334,6 +491,11 @@ func TestAMuseCodeFollowUpIsNotWrittenWhereItCouldNotLand(t *testing.T) {
 			startMSPTurn(t, h, s)
 			h.child.emit(`{"jsonrpc":"2.0","method":"turn/foregroundCompleted","params":{"turnId":"` + mspTestTurn + `","sessionId":"` + mspTestSession + `"}}`)
 			waitForLive(t, "the foreground", func() bool { _, done := s.liveFollowUps.mspTurn(); return done })
+		}, mspTestTurn, followUpReasonNoActiveTurn},
+		{"after the final answer completed", func(h *liveFollowUpHarness, s *ACPSession) {
+			startMSPTurn(t, h, s)
+			h.child.emit(mspAgentMessageCompleted(mspTestTurn, mspPhaseFinalAnswer))
+			waitForLive(t, "the final answer", func() bool { _, done := s.liveFollowUps.mspTurn(); return done })
 		}, mspTestTurn, followUpReasonNoActiveTurn},
 		{"after the turn completed", func(h *liveFollowUpHarness, s *ACPSession) {
 			startMSPTurn(t, h, s)
@@ -427,7 +589,9 @@ func TestAMuseCodeFollowUpRedeliveredWhileItsAnswerIsPendingPublishesNothing(t *
 	if acks := h.acks.snapshot(); len(acks) != 0 {
 		t.Fatalf("an in-flight attempt was answered from the ledger: %+v", acks)
 	}
-	h.child.emit(mspAbsorbed(h.child.framesWithMethod(mspMethodTurnSteer)[0])[0])
+	for _, line := range mspAbsorbed(h.child.framesWithMethod(mspMethodTurnSteer)[0]) {
+		h.child.emit(line)
+	}
 	<-done
 	acks := h.acks.snapshot()
 	if len(acks) != 1 {
@@ -542,5 +706,128 @@ func TestTheMSPTrackerAdmitsALiveWriteOnlyIntoTheRunningTurn(t *testing.T) {
 	tr.inbound(`{"jsonrpc":"2.0","method":"turn/foregroundCompleted","params":{"turnId":"` + mspTestTurn + `"}}`)
 	if ch, reason := tr.admitLiveWriteFor("relay-followup-e", "e", "t", mspTestTurn, fence); ch != nil || reason != followUpReasonNoActiveTurn {
 		t.Fatalf("after the foreground: %q", reason)
+	}
+}
+
+// Muse dropped every steer it read after the turn's final answer had
+// completed and before `turn/foregroundCompleted` (2026-11-16, 4 of 10):
+// from the final answer's item/completed the turn takes no live write. A
+// commentary message, or another turn's final answer, closes nothing; the
+// next turn opens again.
+func TestTheMSPTrackerClosesTheTurnAtItsFinalAnswer(t *testing.T) {
+	fence := func(s liveWriteState) string {
+		c := okCheck(time.Now())
+		c.SessionRunning = !s.Closed
+		c.ApprovalPending = s.ApprovalPending
+		c.NoActiveTurn = s.NoActiveTurn
+		c.TurnMismatch = s.TurnMismatch
+		return c.fenceReason()
+	}
+	tr := newLiveFollowUpTrackerFor(museCodeCliAgentID)
+	tr.inbound(mspTurnEvent(mspNotifyTurnStarted, mspTestTurn))
+	tr.inbound(mspAgentMessageCompleted(mspTestTurn, "commentary"))
+	tr.inbound(`{"jsonrpc":"2.0","method":"item/started","params":{"item":{"kind":"agentMessage","turnId":"` + mspTestTurn + `","messagePhase":"finalAnswer"}}}`)
+	tr.inbound(mspAgentMessageCompleted(mspOtherTurn, mspPhaseFinalAnswer))
+	if ch, reason := tr.admitLiveWriteFor("relay-followup-a", "a", "t", mspTestTurn, fence); ch == nil || reason != "" {
+		t.Fatalf("while the final answer streams: %q", reason)
+	}
+	tr.forget("relay-followup-a")
+	tr.inbound(mspAgentMessageCompleted(mspTestTurn, mspPhaseFinalAnswer))
+	if _, closing := tr.mspTurn(); !closing {
+		t.Fatal("the final answer did not close the turn")
+	}
+	if ch, reason := tr.admitLiveWriteFor("relay-followup-b", "b", "t", mspTestTurn, fence); ch != nil || reason != followUpReasonNoActiveTurn {
+		t.Fatalf("after the final answer: %q", reason)
+	}
+	tr.inbound(mspTurnEvent(mspNotifyTurnCompleted, mspTestTurn))
+	tr.inbound(mspTurnEvent(mspNotifyTurnStarted, mspOtherTurn))
+	if ch, reason := tr.admitLiveWriteFor("relay-followup-c", "c", "t", mspOtherTurn, fence); ch == nil || reason != "" {
+		t.Fatalf("the next turn: %q", reason)
+	}
+}
+
+// Where a steer ran, from Muse's frames: its userMessage in the named turn
+// (or naming no turn, while that one runs), a turn started under its
+// commandId, or the named turn ending without it.
+func TestTheMSPTrackerPlacesASteerFromWhatMuseDoes(t *testing.T) {
+	const cmdA, cmdB, cmdC = "01a1dc92-aaaa-7000-8000-00000000000a", "01a1dc92-bbbb-7000-8000-00000000000b", "01a1dc92-cccc-7000-8000-00000000000c"
+	tr := newLiveFollowUpTrackerFor(museCodeCliAgentID)
+	tr.inbound(mspTurnEvent(mspNotifyTurnStarted, mspTestTurn))
+	tr.mspWatchSteer("a", cmdA, mspTestTurn)
+	tr.mspWatchSteer("b", cmdB, mspTestTurn)
+	tr.mspWatchSteer("c", cmdC, mspTestTurn)
+	far := time.Now().Add(time.Minute)
+	tr.inbound(`{"jsonrpc":"2.0","method":"item/started","params":{"item":{"kind":"userMessage","commandId":"` + cmdA + `"}}}`)
+	if p, ok := tr.awaitMSPPlacement("a", far, true); !ok || p.processedIn != followUpProcessedInCurrent || p.turnID != mspTestTurn {
+		t.Fatalf("a: %+v %v", p, ok)
+	}
+	// Another steer's message places nothing for b; its own completion repeated places once.
+	tr.inbound(mspUserMessage(cmdA, mspTestTurn))
+	tr.inbound(mspTurnEvent(mspNotifyTurnCompleted, mspTestTurn))
+	tr.inbound(mspTurnEvent(mspNotifyTurnStarted, cmdB))
+	if p, ok := tr.awaitMSPPlacement("b", far, true); !ok || p.processedIn != followUpProcessedInNext || p.turnID != cmdB {
+		t.Fatalf("b: %+v %v", p, ok)
+	}
+	prev := mspAfterTurnWait
+	mspAfterTurnWait = 20 * time.Millisecond
+	t.Cleanup(func() { mspAfterTurnWait = prev })
+	if p, ok := tr.awaitMSPPlacement("c", far, true); ok {
+		t.Fatalf("c was placed: %+v", p)
+	}
+	// Without the after-turn rule it waits to the deadline.
+	start := time.Now()
+	if _, ok := tr.awaitMSPPlacement("c", time.Now().Add(60*time.Millisecond), false); ok || time.Since(start) < 50*time.Millisecond {
+		t.Fatal("c: gave up before its deadline")
+	}
+	tr.forget("c")
+	if tr.mspWatched("c") {
+		t.Fatal("forget kept the watch")
+	}
+}
+
+// mspWatched reports whether the tracker still follows the steer written
+// under rpcID.
+func (t *liveFollowUpTracker) mspWatched(rpcID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.msp != nil && t.msp.watches[rpcID] != nil
+}
+
+// The certification's mid-tool gate sends its wrong-turn probe while the
+// running steer's delivery still waits to see the steer run (the delivery
+// blocks until then). That probe is fenced at once, on its own: turnMismatch
+// while the turn runs, and noActiveTurn once the turn's final answer is done,
+// whichever turn it names. Nothing is written for either.
+func TestAWrongTurnFollowUpIsRefusedWhileAnotherSteerAwaitsPlacement(t *testing.T) {
+	h, s := newMSPLiveHarness(t)
+	startMSPTurn(t, h, s)
+	h.child.setRespond(mspHostAnswers(mspAcceptedFor))
+	steer := h.mspCmd("msp-held", "Also write TOOLSTEER.", mspTestTurn)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.handle(steer)
+	}()
+	waitForLive(t, "Muse's answer", func() bool { return s.liveFollowUps.mspWatched("relay-followup-msp-held") })
+	time.Sleep(50 * time.Millisecond)
+
+	h.handle(h.mspCmd("msp-wrong", "x", mspOtherTurn))
+	acks := h.acks.snapshot()
+	if len(acks) != 1 || acks[0].FollowUpAttemptID != "msp-wrong" {
+		t.Fatalf("acks %+v", acks)
+	}
+	wantAck(t, acks[0], followUpOutcomeNotWritten, followUpReasonTurnMismatch, "")
+
+	// Once the final answer is done the same probe reads noActiveTurn.
+	commandID, _ := mspFollowUpCommandID("msp-held", steer.Ts)
+	h.child.emit(mspUserMessage(commandID, mspTestTurn))
+	<-done
+	h.child.emit(mspAgentMessageCompleted(mspTestTurn, mspPhaseFinalAnswer))
+	waitForLive(t, "the final answer", func() bool { _, closing := s.liveFollowUps.mspTurn(); return closing })
+	h.handle(h.mspCmd("msp-wrong-late", "x", mspOtherTurn))
+	acks = h.acks.snapshot()
+	wantAck(t, acks[len(acks)-1], followUpOutcomeNotWritten, followUpReasonNoActiveTurn, "")
+	if n := len(h.child.framesWithMethod(mspMethodTurnSteer)); n != 1 {
+		t.Fatalf("%d steers written, want only the held one", n)
 	}
 }
