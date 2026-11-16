@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.23';
+  var VERSION = 'aix-1.0.24';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1669,16 +1669,20 @@
         else ok = !!sel && (lower(shown) === want2 || lower(shown).indexOf(lower(value)) >= 0);
       }
       else if (kind === 'combobox') {
+        // With the option the kit picked on record, the field must show exactly that answer: a
+        // prefix would read "Not sure" as "No". Without one, the old lenient reading stays.
+        var exactly = function (s) { return s === want2 || looksSame(s, want2); };
+        var accept = chosen ? exactly : function (s) { return exactly(s) || s.indexOf(want2) === 0; };
         if (el.tagName === 'INPUT') {
           var iv = lower(el.value);
           var cv = lower(containerValue(el, f.label));
           shown = el.value || containerValue(el, f.label);
-          ok = (!!iv && (iv === want2 || looksSame(iv, want2))) || (!iv && (cv === want2 || cv.indexOf(want2) === 0));
+          ok = (!!iv && exactly(iv)) || (!iv && accept(cv));
         } else {
           var disp = lower(comboDisplay(el));
           shown = comboDisplay(el);
-          if (disp) ok = disp === want2 || looksSame(disp, want2) || disp.indexOf(want2) === 0;
-          else { var cv2 = lower(containerValue(el, f.label)); shown = cv2; ok = cv2 === want2 || cv2.indexOf(want2) === 0; }
+          if (disp) ok = accept(disp);
+          else { var cv2 = lower(containerValue(el, f.label)); shown = cv2; ok = accept(cv2); }
         }
         if (!ok) dismiss(el);
       }

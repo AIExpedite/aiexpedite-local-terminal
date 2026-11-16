@@ -100,6 +100,7 @@ second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="plans2"><fieldset><legend>Plan choice</legend><label><input type="radio" name="pc" id="pc1" value="cheap"> Standard</label><label><input type="radio" name="pc" value="premium"> Premium</label></fieldset><label><input type="checkbox" id="cb28" name="extras" value="none"> Add extras</label><label for="t29">Delivery note</label><input id="t29" name="dnote"></form>
 <form id="seats"><fieldset><legend>Seat class</legend><label><input type="radio" name="sc" id="sc1" value="cheap"> Standard</label><label><input type="radio" name="sc" id="sc2" value="expensive"> Standard</label></fieldset></form>
 <form id="omega2" method="post" action="/posted31"><label for="r31">Required thing</label><input id="r31" name="req" required><button type="submit" id="send31">Send required</button></form>
+<span id="cb32l">Attending</span><button type="button" id="cb32" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="lb32" aria-labelledby="cb32l">Choose</button><ul id="lb32" role="listbox" hidden><li role="option">No</li><li role="option">Not sure</li><li role="option">Yes</li></ul>
 <form id="tiers"><label for="tier">Tier</label><select id="tier" name="tier"><option value="">Choose</option><option value="cheap">Standard</option><option value="expensive">Standard</option></select></form>
 <form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
@@ -168,6 +169,16 @@ document.getElementById('tier2').addEventListener('change', function () { if (th
 document.getElementById('pc1').addEventListener('change', function () { this.value = 'expensive'; });
 document.getElementById('sc1').addEventListener('change', function () { var other = document.getElementById('sc2'); this.closest('label').remove(); other.checked = true; });
 document.getElementById('send31').addEventListener('click', function () { fetch('/slowsave', { method: 'POST', body: 'x' }); });
+(function () {
+  var btn = document.getElementById('cb32'), lb = document.getElementById('lb32');
+  btn.addEventListener('click', function () { lb.hidden = false; btn.setAttribute('aria-expanded', 'true'); });
+  Array.prototype.forEach.call(lb.querySelectorAll('[role=option]'), function (li) {
+    li.addEventListener('click', function () {
+      btn.textContent = li.textContent === 'No' ? 'Not sure' : li.textContent;
+      lb.hidden = true; btn.setAttribute('aria-expanded', 'false');
+    });
+  });
+})();
 document.getElementById('cb28').addEventListener('change', function () { this.value = 'all'; });
 document.getElementById('t29').addEventListener('focus', function () { var el = this; setTimeout(function () { el.type = 'password'; }, 0); });
 document.getElementById('send20').addEventListener('click', function () {
@@ -824,6 +835,16 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('t29').value)`); err != nil || v != `""` {
 		t.Fatalf("the refused field was written: %q %v", v, err)
+	}
+
+	// 4d32. A custom combobox (a button) whose page shows "Not sure" after the kit chose "No":
+	// mismatch, not filled (a prefix of the shown answer is not the answer).
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Attending", Value: "No"}}})
+	if err != nil {
+		t.Fatalf("fill attending: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a combobox that shows another answer must read as a mismatch: %+v", o)
 	}
 
 	// 4d30. A radio whose change handler removes the clicked option and selects another with
