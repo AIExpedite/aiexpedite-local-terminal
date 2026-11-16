@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.18';
+  var VERSION = 'aix-1.0.19';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -54,7 +54,7 @@
     blockedSubmits: [], allowedByPerson: [], allowedByAgent: [], requests: [], perf: null,
     retargeted: [],
     host: null, outline: null, msg: null, outlineTarget: null, raf: 0,
-    pending: new Map()
+    pending: new Map(), pin: null
   };
 
   // ---------------------------------------------------------------- small helpers
@@ -1088,6 +1088,7 @@
         record('approved-changed', { submitter: s ? clip(accName(s) || s.innerText || s.value, 60) : null });
         return;
       }
+      state.approved.event = e;
       state.allowedByAgent.push({ at: Date.now(), kind: 'approved-submit' });
       return;
     }
@@ -1134,6 +1135,61 @@
       if (!eff || /^(_self|_top|_parent)$/i.test(eff)) return;
       retargetTo(form, 'target');
     });
+  }
+  function nativeSubmitter(el) {
+    return !!el && ((el.tagName === 'BUTTON' && el.type === 'submit') || (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'image')));
+  }
+  // While the approved submission is armed it stays aimed at the page itself. A trusted click
+  // dispatches natively, so this observer runs after each of the page's submit handlers returns,
+  // before the browser plans the submission: a handler that re-aims the button or the form at a
+  // frame is undone in between. onSubmitLate runs after the page's handlers on every route.
+  function pinApproved() {
+    unpinApproved();
+    var a = state.approved, c = a && a.el.deref(), form = a && a.form && a.form.deref();
+    if (!c || !form) return;
+    var mo = new MutationObserver(function () { repinApproved(); });
+    if (nativeSubmitter(c)) mo.observe(c, { attributes: true, attributeFilter: ['formtarget'] });
+    mo.observe(form, { attributes: true, attributeFilter: ['target'] });
+    state.pin = { observer: mo, form: new WeakRef(form) };
+    // On the form it runs after the listeners the page registered there before; on window
+    // (bubble) it is re-added so it runs after the page's own.
+    form.addEventListener('submit', onSubmitLate);
+    window.removeEventListener('submit', onSubmitLate);
+    window.addEventListener('submit', onSubmitLate);
+  }
+  function repinApproved() {
+    var a = state.approved, c = a && a.el.deref(), form = a && a.form && a.form.deref();
+    if (!c || !form) return;
+    var moved = false;
+    if (nativeSubmitter(c) && c.getAttribute('formtarget') !== '_self') { c.setAttribute('formtarget', '_self'); moved = true; }
+    if (form.getAttribute('target') !== '_self') { form.setAttribute('target', '_self'); moved = true; }
+    if (moved) { a.retargetSeen = true; record('approved-retargeted', {}); }
+  }
+  function unpinApproved() {
+    var p = state.pin;
+    state.pin = null;
+    window.removeEventListener('submit', onSubmitLate);
+    if (!p) return;
+    try { p.observer.disconnect(); } catch (e) { /* ignore */ }
+    var f = p.form.deref();
+    if (f) f.removeEventListener('submit', onSubmitLate);
+  }
+  // After the page's own submit handlers ran (they run after the capture-phase check): the
+  // approved submission still aims at the page and still carries what was approved, or it is
+  // stopped here, before the browser plans it. One the page cancelled itself (it saves by fetch)
+  // is left alone: it sends nothing natively.
+  function onSubmitLate(e) {
+    var a = state.approved;
+    if (!a || a.event !== e) return;
+    a.lateSeen = true;
+    if (e.defaultPrevented || a.changed) return;
+    repinApproved();
+    if (!approvedPayloadHolds(a, e.target)) {
+      a.used = false;
+      a.changed = true;
+      e.preventDefault();
+      record('approved-changed', { late: true });
+    }
   }
   // Point one element's target-like attribute at the page itself while guarding; restored
   // exactly by restoreForms.
@@ -1182,6 +1238,7 @@
     window.removeEventListener('pointerdown', onGesture, true);
     window.removeEventListener('keydown', onGesture, true);
     if (globalThis.navigation && navigation.removeEventListener) navigation.removeEventListener('navigate', onNavigate);
+    unpinApproved();
     restoreForms();
     if (state.perf) { try { state.perf.disconnect(); } catch (e) { /* ignore */ } state.perf = null; }
     state.guardsInstalled = false;
@@ -1423,7 +1480,7 @@
         return { done: false, next: 'verify', waitMs: 80, method: 'setter' };
       }
       if (kind === 'select') {
-        var opts2 = Array.prototype.map.call(el.options, function (o) { return { label: norm(o.label || o.text), value: o.value, disabled: optionDisabled(o) }; });
+        var opts2 = Array.prototype.map.call(el.options, function (o) { return { label: norm(o.label || o.text), value: o.value, disabled: optionDisabled(o), el: o }; });
         var m = matchOption(opts2, value);
         if (m.ambiguous) return { done: true, outcome: 'ambiguous-option', options: m.ambiguous };
         if (!m.match) {
@@ -1441,7 +1498,8 @@
         var wr3 = refusalAfterFocus(ref, value, opts);
         if (wr3) return wr3;
         setNativeValue(el, m.match.value); fireInput(el, m.match.label); fireChange(el);
-        state.pending.set(ref, { chosen: m.match.label });   // verify checks exactly this option
+        // Verify checks exactly this option: two options may share a label (or a value).
+        state.pending.set(ref, { chosen: m.match.label, chosenOption: new WeakRef(m.match.el), chosenValue: m.match.value });
         return { done: false, next: 'verify', waitMs: 80, method: 'setter', chosen: m.match.label };
       }
       if (kind === 'checkbox' || kind === 'switch') {
@@ -1557,7 +1615,16 @@
       var ok = false, shown = '';
       var want2 = lower(chosen || value);
       if (kind === 'text' || kind === 'datetime') { shown = el.value; ok = looksSame(shown, value); }
-      else if (kind === 'select') { shown = currentValue(el, kind); ok = chosen ? lower(shown) === lower(chosen) : lower(shown).indexOf(lower(value)) >= 0; }
+      else if (kind === 'select') {
+        shown = currentValue(el, kind);
+        // The option the kit chose, exactly: options that share a label ("Standard" at two prices)
+        // differ by value, so a handler that switches between them must not pass a label test.
+        var cur = el.selectedOptions && el.selectedOptions[0];
+        var po = pend.chosenOption && pend.chosenOption.deref();
+        if (po && po.isConnected) ok = !!cur && cur === po;
+        else if (pend.chosenValue != null) ok = !!cur && cur.value === pend.chosenValue && lower(shown) === lower(chosen);
+        else ok = chosen ? lower(shown) === lower(chosen) : lower(shown).indexOf(lower(value)) >= 0;
+      }
       else if (kind === 'checkbox' || kind === 'switch') { ok = isChecked(el) === toBool(value); shown = isChecked(el) ? 'checked' : 'unchecked'; }
       else if (kind === 'radio-group') {
         var sel = info.members.filter(isChecked)[0];
@@ -2113,22 +2180,16 @@
     if (t.why) return { ok: false, reason: 'hidden', detail: t.why };
     openGuard('submit');
     guardShadowRoot(r.control.getRootNode ? r.control.getRootNode() : null);
-    // A submitter's formtarget overrides its form's target: an approved button aimed at an
-    // iframe would post there, past the main document's navigation guard, so a submit handler
-    // that changes a value AFTER the capture-phase check would go unseen. For this one click it
-    // posts to the page itself (as retargetForms does for forms), so the outgoing data is checked
-    // after every handler ran. After the digest check above, before the approved reading below,
-    // so both readings agree; restored with the forms when the guard closes.
-    var ft = r.control.getAttribute('formtarget');
-    if (r.form && ft && !/^(_self|_top|_parent)$/i.test(ft)) retargetTo(r.control, 'formtarget');
-    // The approved form itself may sit in a shadow root, where document.forms never lists it, so
-    // retargetForms left its target (or the page's <base target>) alone: an iframe target would
-    // take the post past the navigation guard the same way. Point it at the page for this submit.
-    if (r.form && r.form.getAttribute('target') !== '_self') {
-      var baseT = (document.querySelector('base[target]') || {}).target || '';
-      var effT = r.form.getAttribute('target') || baseT;
-      if (effT && !/^(_self|_top|_parent)$/i.test(effT)) retargetTo(r.form, 'target');
-    }
+    // The approved submission posts to the page itself, whatever the page's handlers do: a post
+    // aimed at an iframe would leave past the main document's navigation guard, so a submit
+    // handler that changes a value AFTER the capture-phase check would go unseen. A submitter's
+    // formtarget overrides its form's target, so with the button pinned to _self a handler that
+    // sets form.target = 'sink' changes nothing; the form is pinned too (it may sit in a shadow
+    // root, where retargetForms never sees it, and a script may submit it without a submitter).
+    // pinApproved keeps both pinned while armed. After the digest check above, before the
+    // approved reading below, so both readings agree; restored with the forms when the guard closes.
+    if (r.form && nativeSubmitter(r.control) && !/^_self$/i.test(r.control.getAttribute('formtarget') || '')) retargetTo(r.control, 'formtarget');
+    if (r.form && !/^_self$/i.test(r.form.getAttribute('target') || '')) retargetTo(r.form, 'target');
     state.allowNavHref = null;
     // Where the approved form may post when a script submits it: its own action, or the
     // control's formaction (the digest just confirmed both are the approved ones).
@@ -2139,7 +2200,8 @@
     }
     state.approved = { el: new WeakRef(r.control), form: r.form ? new WeakRef(r.form) : null, virtual: !r.form,
       until: Date.now() + APPROVED_MS, used: false, navUsed: false, pressed: false, actions: actions,
-      ref: ref, payload: payloadOf(r), changed: false };
+      ref: ref, payload: payloadOf(r), changed: false, event: null, lateSeen: false, retargetSeen: false };
+    pinApproved();
     state.agentActingUntil = Date.now() + AGENT_ACT_MS;
     if (how === 'scriptClick') {
       // Activate the control as a press would: its own click handlers run (a page that saves by
@@ -2147,6 +2209,11 @@
       // submit button then submits its form with itself as the submitter, validation included.
       // requestSubmit(c) would skip those handlers and post the form natively instead.
       r.control.click();
+      // A script click dispatches synchronously, so the pin observer cannot run between the
+      // page's handlers (onSubmitLate does, unless a handler stopped the event): a re-aiming is
+      // undone only now, after the browser planned the submission. retargetSeen records it, and
+      // submitEnd reports the submission as redirected.
+      repinApproved();
       return { ok: true, docId: DOC_ID, submitted: true };
     }
     return { ok: true, docId: DOC_ID, x: t.x, y: t.y };
@@ -2155,12 +2222,18 @@
   // would send, so it was stopped. invalid: the browser's validation
   // refused it. requests: fetch / XHR the page made meanwhile (a script-driven save sends one).
   function submitEnd() {
-    var used = !!(state.approved && state.approved.used);
-    var changed = !!(state.approved && state.approved.changed);
+    var a = state.approved;
+    var used = !!(a && a.used);
+    var changed = !!(a && a.changed);
+    // The approved submission may have left aimed at a frame: the page re-aimed it and stopped its
+    // event, so onSubmitLate never checked it. (On a trusted click the pin observer undid the
+    // re-aiming between the handlers and the page navigated, so this is not consulted.)
+    var redirected = !!(a && !changed && a.used && !a.lateSeen && a.retargetSeen);
+    unpinApproved();
     var invalid = state.mode === 'submit' && !!state.sawInvalid;
     var requests = state.requests.length;
     if (state.mode === 'submit') { state.approved = null; closeGuard(0); }
-    return { ok: true, docId: DOC_ID, used: used, changed: changed, invalid: invalid, requests: requests, blockedSubmits: state.blockedSubmits.slice() };
+    return { ok: true, docId: DOC_ID, used: used, changed: changed, redirected: redirected, invalid: invalid, requests: requests, blockedSubmits: state.blockedSubmits.slice() };
   }
 
   var API = {

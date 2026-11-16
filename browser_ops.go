@@ -728,10 +728,11 @@ func (r *browserOpRun) submit(ctx context.Context) (any, error) {
 	out := browserClickResult{TabID: pg.TabID(), URL: p.URL, Title: clipString(p.Title, 300), Navigated: navigated, SubmitObserved: &observed}
 	if !navigated && !k.hung {
 		var e struct {
-			Used     bool `json:"used"`
-			Changed  bool `json:"changed"`
-			Invalid  bool `json:"invalid"`
-			Requests int  `json:"requests"`
+			Used       bool `json:"used"`
+			Changed    bool `json:"changed"`
+			Redirected bool `json:"redirected"`
+			Invalid    bool `json:"invalid"`
+			Requests   int  `json:"requests"`
 		}
 		endCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		_, endErr := k.call(endCtx, "submitEnd", &e)
@@ -740,6 +741,13 @@ func (r *browserOpRun) submit(ctx context.Context) (any, error) {
 			// The control's own click handler changed what would be sent (or
 			// where), after the digest was checked: the kit stopped it.
 			return nil, formChanged("The page changed the form while it was being submitted, so it was stopped.")
+		}
+		if endErr == nil && e.Redirected {
+			// The page aimed the approved submission at a frame and stopped its
+			// event before the kit could check it: it may have been sent, and
+			// what it carried is unknown. Never reported as submitted.
+			return nil, browserErr(browserErrSubmitFormChanged,
+				"The page redirected the submission into another part of the page after you approved it, so what it sent could not be checked, and it may have been sent. Check the page in Chrome before you prepare it again.")
 		}
 		if endErr == nil && !e.Used && e.Invalid && e.Requests == 0 {
 			// The browser's own validation refused it (it fired `invalid`, no

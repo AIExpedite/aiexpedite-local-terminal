@@ -87,6 +87,11 @@ second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="chi" method="post" action="/posted19"><label for="c1x">Chi first</label><input id="c1x" name="action" value="save"><label for="c2x">Chi second</label><input id="c2x" name="action" value="edit"><button type="submit" name="action" value="save">Save chi</button></form>
 <form id="phi"><label for="sa">Signed amount</label><input id="sa" name="signed"><label for="da">Decimal amount</label><input id="da" name="decimal"><label for="acct">Tracking reference</label><input id="acct" name="tracking"><label for="pr">Unit price</label><input id="pr" name="price"></form>
 <form id="omega"><label for="cw">Code word</label><input id="cw" name="codeword"><fieldset><legend>Answer</legend><label><input type="radio" name="ans" id="ansNo" value="no"> No</label><label><input type="radio" name="ans" id="ansNs" value="notsure"> Not sure</label></fieldset><fieldset><legend>Updates</legend><label><input type="radio" name="upd" value="agree"> I agree to receive occasional product updates and understand that I can unsubscribe at any time from my settings page</label><label><input type="radio" name="upd" value="decline"> No thanks</label></fieldset></form>
+<iframe name="sink21" style="display:none"></iframe>
+<form id="ups21" method="post" action="/posted21"><label for="k21">Kappa one</label><input id="k21" name="kappa" value="twentyone"><input type="hidden" id="amt21" name="amount" value="10.00"><button type="submit">Send kappa one</button></form>
+<form id="ups22" method="post" action="/posted22"><label for="k22">Kappa two</label><input id="k22" name="kappa" value="twentytwo"><input type="hidden" id="amt22" name="amount" value="10.00"><button type="submit">Send kappa two</button></form>
+<form id="ups23" method="post" action="/posted23"><label for="k23">Kappa three</label><input id="k23" name="kappa" value="twentythree"><button type="submit">Send kappa three</button></form>
+<form id="tiers"><label for="tier">Tier</label><select id="tier" name="tier"><option value="">Choose</option><option value="cheap">Standard</option><option value="expensive">Standard</option></select></form>
 <form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
 <div id="radios1"></div><div id="radios2"></div>
@@ -132,6 +137,11 @@ document.getElementById('acct').addEventListener('blur', function () { this.valu
 document.getElementById('pr').addEventListener('blur', function () { this.value = this.value.replace(/,/g, '').replace(/0+$/, ''); });
 document.getElementById('cw').addEventListener('focus', function () { this.type = 'password'; });
 document.getElementById('ansNo').addEventListener('change', function () { document.getElementById('ansNs').checked = true; });
+['21', '22'].forEach(function (n) {
+  document.getElementById('ups' + n).addEventListener('submit', function () { this.target = 'sink21'; document.getElementById('amt' + n).value = '9999.00'; });
+});
+document.getElementById('ups23').addEventListener('submit', function (e) { if (e.submitter) e.submitter.setAttribute('formtarget', 'sink21'); e.stopImmediatePropagation(); });
+document.getElementById('tier').addEventListener('change', function () { if (this.value === 'cheap') this.value = 'expensive'; });
 document.getElementById('send20').addEventListener('click', function () {
   var f = document.getElementById('psi');
   HTMLFormElement.prototype.submit.call(f);
@@ -700,6 +710,60 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
 		t.Fatalf("a stripped minus sign must read as a mismatch: %+v", o)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d18. Two options share a label ("Standard" at two prices) and the page switches from
+	// the chosen one to the other: mismatch, not filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Tier", Value: "cheap"}}})
+	if err != nil {
+		t.Fatalf("fill tier: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a select switched to another option with the same label must read as a mismatch: %+v", o)
+	}
+
+	// 4d19. The approved form's own submit handler, after the capture-phase check, aims the
+	// form at a hidden iframe and raises a hidden amount: stopped, nothing sent (trusted click).
+	prep = prepare(refs["Send kappa one"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r21"})
+	time.Sleep(800 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted21") != 0 {
+		t.Fatalf("re-aimed and changed in a submit handler (trusted): %v posted21=%d", err, hit("POST /posted21"))
+	}
+	// 4d20. The same through a script click (the AppleScript route's path).
+	prep = prepare(refs["Send kappa two"])
+	_, err = (&browserOpRun{p: browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r22"},
+		be: ub, stop: stop}).run(ctx)
+	time.Sleep(800 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted22") != 0 {
+		t.Fatalf("re-aimed and changed in a submit handler (script click): %v posted22=%d", err, hit("POST /posted22"))
+	}
+	// 4d21. A submit handler that re-aims the button itself and stops the event, so nothing of
+	// the kit runs after it. Script click: the browser planned the post into the frame before
+	// the kit could look, so the result says it may have been sent, never "submitted".
+	prep = prepare(refs["Send kappa three"])
+	_, err = (&browserOpRun{p: browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r23"},
+		be: ub, stop: stop}).run(ctx)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || !strings.Contains(err.Error(), "may have been sent") {
+		t.Fatalf("re-aimed with the event stopped (script click) must be reported: %v", err)
+	}
+	// Trusted click: the pin observer undoes the re-aiming as soon as the handler returns, so the
+	// approved data posts to the page itself and the page navigates.
+	before23 := hit("POST /posted23")
+	prep = prepare(refs["Send kappa three"])
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r23b"})
+	if err != nil || hit("POST /posted23") != before23+1 || !res.(browserClickResult).Navigated {
+		t.Fatalf("re-aimed with the event stopped (trusted): %v posted23 %d -> %d %+v", err, before23, hit("POST /posted23"), res)
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
 	}
 	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
 	if err != nil {
