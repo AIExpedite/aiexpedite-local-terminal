@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.1';
+  var VERSION = 'aix-1.0.2';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1675,31 +1675,72 @@
   function submitUrl(action) {
     try { return new URL(action || location.href, document.baseURI).href.split('#')[0]; } catch (e) { return String(action || ''); }
   }
+  // Every name/value pair the submission would carry, in tree order, whether or not the person
+  // can see or fill the control: hidden inputs (an amount, a recipient id), read-only and
+  // unlabelled ones included. The fillable-field scan skips hidden inputs, so it cannot be the
+  // only thing the digest covers. A sensitive value (a password) contributes only its length.
+  // The controls come from the form's own `elements` getter (a control named "elements" shadows
+  // the property) or, for a control outside any form, from its container.
+  var FORM_ELEMENTS = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'elements').get;
+  function submittedData(r, sensitiveEls) {
+    var els = r.form ? Array.prototype.slice.call(FORM_ELEMENTS.call(r.form))
+      : Array.prototype.slice.call(r.container.querySelectorAll('input, select, textarea'));
+    var out = [];
+    els.forEach(function (el) {
+      if (inOwnUi(el)) return;
+      var tag = el.tagName, type = lower(el.getAttribute('type') || '');
+      if (tag !== 'INPUT' && tag !== 'SELECT' && tag !== 'TEXTAREA') return;   // buttons: the submitter is in parts.submit
+      if (tag === 'INPUT' && /^(submit|image|reset|button)$/.test(type)) return;
+      var name = el.getAttribute('name') || '';
+      if (!name) return;
+      var disabled = false;
+      try { disabled = el.matches(':disabled'); } catch (e) { disabled = !!el.disabled; }
+      if (disabled) return;
+      var push = function (v) {
+        v = v == null ? '' : String(v);
+        var sens = sensitiveEls.has(el) || type === 'password';
+        out.push({ name: name, value: sens ? '' : v, len: sens ? v.length : 0, sensitive: sens });
+      };
+      if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) { if (el.checked) push(el.value); return; }
+      if (tag === 'INPUT' && type === 'file') {
+        Array.prototype.forEach.call(el.files || [], function (f) { push(f.name + '␟' + f.size); });
+        return;
+      }
+      if (tag === 'SELECT') {
+        Array.prototype.forEach.call(el.options, function (o) { if (o.selected && !o.disabled) push(o.value); });
+        return;
+      }
+      push(el.value);
+    });
+    return out;
+  }
   // What the digest covers, in DOM order: the page, the form's identity, every field's identity
   // and current value, and the submit control. A sensitive value (a password the person typed)
   // contributes only its length, so its hash never leaves the computer.
   function submitParts(r) {
     var sc = scan();
-    var parts = { origin: location.origin, path: location.pathname, form: '', fields: [], submit: '', kind: r.form ? 'form' : 'virtual' };
+    var parts = { origin: location.origin, path: location.pathname, form: '', fields: [], data: [], submit: '', kind: r.form ? 'form' : 'virtual' };
     var summary = [];
     var c = r.control;
     var formEl = r.form || r.container;
     // Where the data goes is part of what the person approved: the form's resolved action,
     // method and encoding, and the submitter's own formaction / formmethod / formenctype /
-    // formtarget overrides (a trusted click and requestSubmit(c) both honour them). Attributes,
+    // formtarget overrides (any activation of the control honours them). Attributes,
     // never the form's IDL properties, which a field named "action" or "method" shadows. The
     // form's target is left out: the guard itself retargets forms to _self while it runs.
     parts.form = fnv([formEl.tagName, r.form ? 'form' : 'virtual', formEl.id || '', formEl.getAttribute('name') || '',
       r.form ? (r.form.getAttribute('action') || '') : '', r.form ? lower(r.form.getAttribute('method') || 'get') : '',
       r.form ? submitUrl(r.form.getAttribute('action')) : '', r.form ? lower(r.form.getAttribute('enctype') || '') : ''].join('␟'));
-    parts.submit = fnv([c.tagName, lower(c.type || ''), c.getAttribute('name') || '', c.id || '', controlText(c),
+    parts.submit = fnv([c.tagName, lower(c.type || ''), c.getAttribute('name') || '', c.getAttribute('value') || '', c.id || '', controlText(c),
       c.hasAttribute('formaction') ? submitUrl(c.getAttribute('formaction')) : '', lower(c.getAttribute('formmethod') || ''),
       lower(c.getAttribute('formenctype') || ''), c.getAttribute('formtarget') || ''].join('␟'));
+    var sensitiveEls = new Set();
     sc.fields.forEach(function (f) {
       var info = fieldFor(f.ref);
       if (!info || !inContainer(info, r)) return;
       var raw = rawValue(info);
       var sensitive = !!f.sensitive;
+      if (sensitive) (info.members || [info.el]).forEach(function (m) { if (m) sensitiveEls.add(m); });
       parts.fields.push({ fp: f.fp, value: sensitive ? '' : raw, len: sensitive ? raw.length : 0, sensitive: sensitive });
       var shown = (f.kind === 'checkbox' || f.kind === 'switch') ? (raw === 'true' ? 'checked' : 'unchecked') : (sensitive ? (raw ? '•••' : '') : clip(raw, 500));
       if (!f.visible && !norm(raw)) return;    // an empty field nobody can see sends nothing worth showing
@@ -1708,6 +1749,7 @@
       if (sensitive) row.sensitive = true;
       if (summary.length < 300) summary.push(row);
     });
+    parts.data = submittedData(r, sensitiveEls);
     return { parts: parts, summary: summary };
   }
   function prepareSubmit(ref) {
@@ -1733,7 +1775,7 @@
   }
   // The person approved this submit and the agent checked the digest: lift the guard for exactly
   // this control, once. token is the cheap hash submitCheck returned; anything that changed in
-  // between refuses. With how = 'requestSubmit' (AppleScript) the kit submits right here;
+  // between refuses. With how = 'scriptClick' (AppleScript) the kit clicks the control right here;
   // otherwise it returns the point for the agent's trusted click.
   function armSubmit(ref, token, how) {
     var r = resolveSubmit(ref);
@@ -1746,11 +1788,12 @@
     state.approved = { el: new WeakRef(r.control), form: r.form ? new WeakRef(r.form) : null, virtual: !r.form,
       until: Date.now() + APPROVED_MS, used: false, navUsed: false };
     state.agentActingUntil = Date.now() + AGENT_ACT_MS;
-    if (how === 'requestSubmit') {
-      var c = r.control;
-      var nativeSubmitter = r.form && c.form === r.form &&
-        ((c.tagName === 'BUTTON' && lower(c.type || 'submit') === 'submit') || (c.tagName === 'INPUT' && /^(submit|image)$/i.test(c.type)));
-      if (nativeSubmitter) r.form.requestSubmit(c); else c.click();
+    if (how === 'scriptClick') {
+      // Activate the control as a press would: its own click handlers run (a page that saves by
+      // fetch in a submit button's onclick and cancels the native submission), and a native
+      // submit button then submits its form with itself as the submitter, validation included.
+      // requestSubmit(c) would skip those handlers and post the form natively instead.
+      r.control.click();
       return { ok: true, docId: DOC_ID, submitted: true };
     }
     return { ok: true, docId: DOC_ID, x: t.x, y: t.y };

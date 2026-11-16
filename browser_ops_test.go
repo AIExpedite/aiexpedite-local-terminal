@@ -208,6 +208,29 @@ func TestBrowserDigestCanonical(t *testing.T) {
 	if len(want) != 64 || strings.ToLower(want) != want {
 		t.Fatal("digest is lowercase hex sha256")
 	}
+
+	// The submitted name/value pairs (hidden inputs among them) are covered too:
+	// a hidden amount changed after approval must change the digest.
+	var withData browserDigestParts
+	if err := json.Unmarshal([]byte(`{"origin":"https://ex.com","path":"/pay","form":"1a2b","kind":"form","fields":[],
+		"data":[{"name":"amount","value":"10.00"},{"name":"pw","value":"x","len":6,"sensitive":true}],"submit":"9z"}`), &withData); err != nil {
+		t.Fatal(err)
+	}
+	canonical = `{"v":1,"page":"https://ex.com/pay","form":"1a2b","fields":[],"data":[{"name":"amount","value":"10.00"},{"name":"pw","value":"","len":6,"sensitive":true}],"submit":"9z"}`
+	sum = sha256.Sum256([]byte(canonical))
+	want = hex.EncodeToString(sum[:])
+	if got := browserDigest(withData); got != want {
+		t.Fatalf("digest with data %s, want %s", got, want)
+	}
+	withData.Data[0].Value = "1000.00"
+	if browserDigest(withData) == want {
+		t.Fatal("a changed hidden value must change the digest")
+	}
+	withData.Data[0].Value = "10.00"
+	withData.Data[1].Value = "changed"
+	if browserDigest(withData) != want {
+		t.Fatal("a sensitive submitted value must not reach the digest")
+	}
 }
 
 // ---------------------------------------------------------------- ops
@@ -400,9 +423,9 @@ func TestBrowserSubmit(t *testing.T) {
 	if string(arm[0]) != `"f3_a"` || string(arm[1]) != `"tok"` || string(arm[2]) != `"click"` {
 		t.Fatalf("armSubmit args %s", arm)
 	}
-	// AppleScript: the kit submits with requestSubmit; no trusted click exists.
+	// AppleScript: the kit clicks the control from the page (its handlers run); no trusted click exists.
 	page, _, err = run(setup{check: okCheck, arm: map[string]any{"ok": true, "docId": "doc-1", "submitted": true}, used: true}, approved)
-	if err != nil || len(page.clicks) != 0 || string(page.called("armSubmit")[0].args[2]) != `"requestSubmit"` {
+	if err != nil || len(page.clicks) != 0 || string(page.called("armSubmit")[0].args[2]) != `"scriptClick"` {
 		t.Fatalf("applescript: %v", err)
 	}
 	if so := res.(browserClickResult).SubmitObserved; so == nil || !*so {

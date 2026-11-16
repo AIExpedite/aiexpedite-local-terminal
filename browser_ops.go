@@ -464,6 +464,14 @@ type browserDigestParts struct {
 		Len       int    `json:"len"`
 		Sensitive bool   `json:"sensitive"`
 	} `json:"fields"`
+	// Data is every name/value pair the submission carries (hidden inputs
+	// included), in tree order; a sensitive value contributes only its length.
+	Data []struct {
+		Name      string `json:"name"`
+		Value     string `json:"value"`
+		Len       int    `json:"len"`
+		Sensitive bool   `json:"sensitive"`
+	} `json:"data"`
 	Submit string `json:"submit"`
 	// Kind is "form" for a real <form>, "virtual" for a control outside any
 	// form. Not part of the digest (the form fingerprint already covers it).
@@ -471,9 +479,10 @@ type browserDigestParts struct {
 }
 
 // browserDigest is the lowercase hex SHA-256 of the canonical JSON of a form:
-// page origin + path, the form's identity fingerprint, every field's
-// fingerprint and current value in DOM order, and the submit control's
-// fingerprint. The canonical form is fixed here, field by field, so the digest
+// page origin + path, the form's identity fingerprint (its destination
+// included), every field's fingerprint and current value in DOM order, every
+// name/value pair the submission carries (hidden inputs included), and the
+// submit control's fingerprint (its destination overrides included). The canonical form is fixed here, field by field, so the digest
 // the person approved and the one recomputed before the submit can only differ
 // when the form did.
 func browserDigest(p browserDigestParts) string {
@@ -483,14 +492,28 @@ func browserDigest(p browserDigestParts) string {
 		Len   int    `json:"len,omitempty"`
 		S     bool   `json:"sensitive,omitempty"`
 	}
+	type canonDatum struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+		Len   int    `json:"len,omitempty"`
+		S     bool   `json:"sensitive,omitempty"`
+	}
 	type canon struct {
 		V      int          `json:"v"`
 		Page   string       `json:"page"`
 		Form   string       `json:"form"`
 		Fields []canonField `json:"fields"`
+		Data   []canonDatum `json:"data,omitempty"`
 		Submit string       `json:"submit"`
 	}
 	c := canon{V: 1, Page: p.Origin + p.Path, Form: p.Form, Fields: []canonField{}, Submit: p.Submit}
+	for _, d := range p.Data {
+		cd := canonDatum{Name: d.Name, Value: d.Value}
+		if d.Sensitive {
+			cd = canonDatum{Name: d.Name, Len: d.Len, S: true}
+		}
+		c.Data = append(c.Data, cd)
+	}
 	for _, f := range p.Fields {
 		cf := canonField{FP: f.FP, Value: f.Value}
 		if f.Sensitive {
@@ -655,7 +678,7 @@ func (r *browserOpRun) submit(ctx context.Context) (any, error) {
 	}
 	how := "click"
 	if !pg.TrustedInput() {
-		how = "requestSubmit"
+		how = "scriptClick"
 	}
 	var arm kitArm
 	if _, err := k.call(ctx, "armSubmit", &arm, r.p.SubmitRef, chk.Token, how); err != nil {
