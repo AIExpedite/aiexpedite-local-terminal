@@ -103,6 +103,9 @@ type museCertApprovals struct {
 	asked    []string // per approval/request: subject kind, stages, judgeEscalated
 	resolved []string // per approval/resolved: resolvedBy/decision
 	decided  []string // per approval/decide sent: decision/scope
+	// fenced: decisions the device's client-frame fence refused (each then
+	// written past it, so the turn can end and the run go on).
+	fenced []string
 }
 
 func (a *museCertApprovals) setPolicy(p museCertPolicy) {
@@ -151,7 +154,10 @@ func (a *museCertApprovals) onFrame(f jsonRPCFrame, _ string) {
 }
 
 // decide sends approval/decide with the request's once-scoped choice for
-// decision (a deny when no once-scoped approve is offered).
+// decision; a deny takes Muse's own once-scoped Reject (`abort`) when no
+// `denied` is offered (Muse 1.4.20 shell approvals), and an approve falls
+// back to a deny. Sent through the device's fence, as terminal-service's is;
+// a decision the fence refuses is recorded and written past it.
 func (a *museCertApprovals) decide(f jsonRPCFrame, decision string) {
 	var p struct {
 		ApprovalID           string          `json:"approvalId"`
@@ -166,7 +172,7 @@ func (a *museCertApprovals) decide(f jsonRPCFrame, decision string) {
 	if json.Unmarshal(f.Params, &p) != nil {
 		return
 	}
-	for _, want := range []string{decision, mspApprovalDenied} {
+	for _, want := range []string{decision, mspApprovalDenied, "abort"} {
 		for _, c := range p.AvailableChoices {
 			if c.Decision != want || c.Scope != mspApprovalScopeOnce {
 				continue
@@ -175,9 +181,17 @@ func (a *museCertApprovals) decide(f jsonRPCFrame, decision string) {
 			a.mu.Lock()
 			a.decided = append(a.decided, c.Decision+"/"+c.Scope)
 			a.mu.Unlock()
-			_ = a.c.client.send(`{"jsonrpc":"2.0","id":"aix-msp-decide-` + cmd + `","method":"approval/decide","params":{"commandId":"` + cmd +
+			frame := `{"jsonrpc":"2.0","id":"aix-msp-decide-` + cmd + `","method":"approval/decide","params":{"commandId":"` + cmd +
 				`","sessionId":"` + p.SessionID + `","approvalId":"` + p.ApprovalID + `","choiceId":` + strconv.Quote(c.ChoiceID) +
-				`,"requirementId":` + string(p.CurrentRequirementID) + `}}`)
+				`,"requirementId":` + string(p.CurrentRequirementID) + `}}`
+			if err := a.c.client.send(frame); err != nil {
+				a.mu.Lock()
+				a.fenced = append(a.fenced, c.Decision+"/"+c.Scope+": "+err.Error())
+				a.mu.Unlock()
+				a.c.note("the device fence refused " + c.Decision + "/" + c.Scope + ": " + err.Error())
+				a.c.record("out", "raw", frame)
+				_ = a.c.m.sendDeviceFrame(a.c.sid, frame, nil)
+			}
 			return
 		}
 	}
@@ -195,10 +209,10 @@ func (a *museCertApprovals) releaseHeld() {
 	}
 }
 
-func (a *museCertApprovals) snapshot() (asked, resolved, decided []string) {
+func (a *museCertApprovals) snapshot() (asked, resolved, decided, fenced []string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return append([]string(nil), a.asked...), append([]string(nil), a.resolved...), append([]string(nil), a.decided...)
+	return append([]string(nil), a.asked...), append([]string(nil), a.resolved...), append([]string(nil), a.decided...), append([]string(nil), a.fenced...)
 }
 
 // museCert is one `muse serve` host driven through the device's manager.
@@ -393,8 +407,10 @@ func (c *museCert) newSession(t *testing.T) {
 	t.Logf("session %s, model %s, approval mode %s", c.msp, started.Session.ModelID, started.Session.ApprovalMode.Mode)
 }
 
-// turn sends a `turn/start` as terminal-service does and checks it started
-// at once; it returns the turn id and the frame count before it.
+// turn sends a `turn/start` as terminal-service does and waits for that
+// turn to start (Muse answers `queued` to one sent while it is still closing
+// the previous turn, and starts it a moment later under the same id); it
+// returns the turn id and the frame count before it.
 func (c *museCert) turn(t *testing.T, text string) (string, int) {
 	t.Helper()
 	mark := c.frames()
@@ -412,9 +428,11 @@ func (c *museCert) turn(t *testing.T, text string) (string, int) {
 		TurnID      string `json:"turnId"`
 		Disposition string `json:"disposition"`
 	}
-	if len(f.Error) > 0 || json.Unmarshal(f.Result, &ack) != nil || ack.Disposition != mspDispositionStarted || ack.TurnID != turn {
-		t.Fatalf("turn/start did not start its turn: %s", c.frame(i))
+	if len(f.Error) > 0 || json.Unmarshal(f.Result, &ack) != nil || ack.TurnID != turn ||
+		(ack.Disposition != mspDispositionStarted && ack.Disposition != "queued") {
+		t.Fatalf("turn/start did not take its turn: %s", c.frame(i))
 	}
+	c.client.waitFor("turn/started", mark, 2*time.Minute, turnEvent(mspNotifyTurnStarted, turn))
 	return turn, mark
 }
 
@@ -921,10 +939,13 @@ func TestMuseCodeLiveFollowUpCertification(t *testing.T) {
 		}
 		c.completed(t, mark, turn, 10*time.Minute)
 		c.drainStray(t, mark)
-		requests, resolved, decided := c.approvals.snapshot()
+		requests, resolved, decided, fenced := c.approvals.snapshot()
 		_, statErr := os.Stat(filepath.Join(c.cwd, "cert.txt"))
-		t.Logf("approvals: asked %v; resolved %v; decisions sent %v; cert.txt written: %v; reply: %q",
-			requests, resolved, decided, statErr == nil, c.agentText(mark, c.frames(), turn))
+		t.Logf("approvals: asked %v; resolved %v; decisions sent %v; refused by the device fence %v; cert.txt written: %v; reply: %q",
+			requests, resolved, decided, fenced, statErr == nil, c.agentText(mark, c.frames(), turn))
+		if len(fenced) > 0 {
+			t.Errorf("the device's fence refused a decision a person needs: %v", fenced)
+		}
 		for _, line := range c.client.snapshot()[mark:] {
 			if f, ok := parseJSONRPCFrame(line); ok && f.isResponse() && strings.HasPrefix(strings.Trim(string(f.ID), `"`), "aix-msp-decide-") && len(f.Error) > 0 {
 				t.Errorf("approval/decide refused: %s", line)
@@ -1048,6 +1069,95 @@ func TestMuseCodeMSPHandshakeSmoke(t *testing.T) {
 	if !strings.Contains(c3.frame(i), "-32020") {
 		t.Errorf("a gone session was not -32020")
 	}
+}
+
+// TestMuseCodeMSPResumeAndReject runs what the main run could not reach once
+// its approvals turn hung: exact resume (the same session in a new host, its
+// mode replayed, its context kept; a gone session -32020), and what Muse does
+// with its own once-scoped Reject (`abort`) on a shell approval.
+func TestMuseCodeMSPResumeAndReject(t *testing.T) {
+	b := museCertBinary(t)
+	t.Logf("Muse Code %s (%s), effort %q, settings: %s", b.version, b.path, museCertEffort(), museCertSettings())
+	ledger, _, acks := installLiveCertLedger(t)
+	m := newACPManager(nil, museCodeMSPProfile)
+	prev := globalMuseCodeMSPManager
+	globalMuseCodeMSPManager = m
+	t.Cleanup(func() { globalMuseCodeMSPManager = prev })
+	cwd := t.TempDir()
+	c := startMuseCert(t, m, "cert-musecode-r1", cwd, ledger, acks)
+	c.newSession(t)
+	turn, mark := c.turn(t, "Remember the code word PINEAPPLE. Reply with just OK. Do not use any tools.")
+	c.completed(t, mark, turn, 5*time.Minute)
+	c.settle(t)
+
+	t.Run("reject", func(t *testing.T) {
+		c.bind(t)
+		c.approvals.setPolicy(museCertDeny)
+		turn, mark := c.turn(t, "Run the shell command `git --version` and tell me what it printed.")
+		end := c.completed(t, mark, turn, 5*time.Minute)
+		c.drainStray(t, end)
+		asked, resolved, decided, fenced := c.approvals.snapshot()
+		ran := false
+		for _, it := range c.completedItems(mark, c.frames()) {
+			if it.Kind == "toolCall" && it.TurnID == turn && it.Status == "completed" {
+				ran = true
+			}
+		}
+		t.Logf("reject: asked %v; decisions sent %v; refused by the device fence %v; resolved %v; a tool call completed: %v; turn: %s; reply: %q",
+			asked, decided, fenced, resolved, ran, c.frame(end), c.agentText(mark, c.frames(), turn))
+		if len(fenced) > 0 {
+			t.Errorf("the device's fence refused the only Reject Muse offered: %v", fenced)
+		}
+	})
+
+	t.Run("resume", func(t *testing.T) {
+		c.bind(t)
+		c.settle(t)
+		if err := m.End(c.sid); err != nil {
+			t.Fatal(err)
+		}
+		c2 := startMuseCert(t, m, "cert-musecode-r2", cwd, ledger, acks)
+		r := c2.client.request(`"relay-msp-resume"`, mspMethodSessionResume, map[string]any{
+			"commandId": newMuseCodeCommandID(), "sessionId": c.msp, "excludeItems": true}, 2*time.Minute)
+		var resumed struct {
+			Session struct {
+				SessionID    string `json:"sessionId"`
+				TurnCount    int    `json:"turnCount"`
+				ApprovalMode struct {
+					Mode   string `json:"mode"`
+					Source string `json:"source"`
+				} `json:"approvalMode"`
+			} `json:"session"`
+			PendingRequests []json.RawMessage `json:"pendingRequests"`
+		}
+		if err := json.Unmarshal(r.Result, &resumed); err != nil || resumed.Session.SessionID != c.msp ||
+			resumed.Session.ApprovalMode.Mode != museMSPChatApprovalMode || c2.session().liveFollowUps.mspSession() != c.msp {
+			t.Fatalf("resume: %s", r.Result)
+		}
+		t.Logf("resumed %s (%d turns), approval mode %s (%s), pending requests %d",
+			resumed.Session.SessionID, resumed.Session.TurnCount, resumed.Session.ApprovalMode.Mode, resumed.Session.ApprovalMode.Source, len(resumed.PendingRequests))
+		c2.msp = c.msp
+		turn, mark := c2.turn(t, "What was the code word I asked you to remember? Reply with just the word. Do not use any tools.")
+		c2.completed(t, mark, turn, 5*time.Minute)
+		reply := c2.agentText(mark, c2.frames(), turn)
+		t.Logf("resumed conversation's reply: %q", reply)
+		if !strings.Contains(strings.ToUpper(reply), "PINEAPPLE") {
+			t.Errorf("the resumed conversation lost its context: %q", reply)
+		}
+		c2.settle(t)
+		_ = m.End(c2.sid)
+
+		c3 := startMuseCert(t, m, "cert-musecode-r3", cwd, ledger, acks)
+		mark = c3.frames()
+		c3.client.sendRequest(`"relay-msp-resume"`, mspMethodSessionResume, map[string]any{
+			"commandId": newMuseCodeCommandID(), "sessionId": newMuseCodeCommandID(), "excludeItems": true})
+		i := c3.client.waitFor("the gone resume's answer", mark, 2*time.Minute, isResponseTo(`"relay-msp-resume"`))
+		t.Logf("gone resume answered %s", c3.frame(i))
+		if !strings.Contains(c3.frame(i), "-32020") || !strings.Contains(c3.frame(i), "sessionNotFound") {
+			t.Errorf("a gone session was not -32020 sessionNotFound")
+		}
+		_ = m.End(c3.sid)
+	})
 }
 
 // museCertOneShotSession runs one `muse exec` turn the way the one-shot
