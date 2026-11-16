@@ -19,7 +19,9 @@ package main
 //   - an approved control whose onclick calls form.submit() (no submit event)
 //     posts the approved form, once;
 //   - an approved submit button in a form inside an open shadow root submits
-//     (its click and submit events are retargeted or not composed).
+//     (its click and submit events are retargeted or not composed);
+//   - a form with a control named "elements" still lists its submit button;
+//   - a field the page repurposes during the highlight delay is not filled.
 
 import (
 	"context"
@@ -54,6 +56,8 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
 <form id="geo">
   <label for="country">Country</label><select id="country" name="country"><option value="">Choose</option><option value="DE">Germany</option><option value="FR">France</option></select>
 </form>
+<form id="shadowed" method="post" action="/posted8"><label for="el">Elements</label><input id="el" name="elements" value="x"><button type="submit">Send eta</button></form>
+<form id="retheta"><label for="th">Theta</label><input id="th" name="theta"></form>
 <div id="shadowhost"></div>
 <div id="shadowform"></div>
 <form id="scripted" method="post" action="/posted5">
@@ -151,6 +155,26 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFilled {
 		t.Fatalf("fill select by value: %+v", o)
 	}
+	// A control named "elements" shadows form.elements: the submit button is
+	// still found, and the form can be prepared by its ref.
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	etaForm := ""
+	for _, f := range res.(browserReadResult).Forms {
+		for _, c := range f.SubmitControls {
+			if c.Text == "Send eta" {
+				etaForm = f.FormRef
+			}
+		}
+	}
+	if etaForm == "" {
+		t.Fatalf("the form with a control named elements lists no submit control: %+v", res.(browserReadResult).Forms)
+	}
+	if r, err := run(browserParams{Op: browserOpPrepareSubmit, TabID: tab, Ref: etaForm}); err != nil || r.(browserPrepareResult).SubmitText != "Send eta" {
+		t.Fatalf("prepare by form ref: %v %+v", err, r)
+	}
 	_, raw, _ := parseBrowserTabID(tab)
 	pg, err := be.Page(ctx, raw)
 	if err != nil {
@@ -163,6 +187,22 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 			t.Fatalf("prepare %s: %v", ref, err)
 		}
 		return res.(browserPrepareResult)
+	}
+
+	// The page repurposes the planned field during the highlight delay: it is
+	// reported form-changed and nothing is written into it.
+	if _, err := pg.Eval(ctx, `setTimeout(function () { document.getElementById('th').setAttribute('name', 'notes'); }, 250); 'ok'`); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Theta", Value: "hello"}}})
+	if err != nil {
+		t.Fatalf("fill theta: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFormChanged {
+		t.Fatalf("repurposed field: %+v", o)
+	}
+	if v, _ := pg.Eval(ctx, `document.getElementById('th').value || 'empty'`); !strings.Contains(v, "empty") {
+		t.Fatalf("a repurposed field was written: %q", v)
 	}
 
 	// 1. The destination changes after approval: refused, nothing posted anywhere.

@@ -115,7 +115,7 @@ func TestBrowserControlCapabilityShape(t *testing.T) {
 // The kit and the Chrome helper are embedded, and every kit call the agent
 // makes exists in the kit.
 func TestBrowserKitEmbedded(t *testing.T) {
-	if !strings.Contains(browserKitJS, "var VERSION = 'aix-1.0.5'") {
+	if !strings.Contains(browserKitJS, "var VERSION = 'aix-1.0.6'") {
 		t.Fatal("kit version missing")
 	}
 	for _, name := range []string{"ping", "scan", "snapshot", "fingerprint", "check", "begin", "end", "status", "fillStep",

@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.5';
+  var VERSION = 'aix-1.0.6';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1242,6 +1242,17 @@
     return null;
   }
 
+  function writeRefusal(f, kind, value, opts) {
+    if (opts.fp && f.fp !== opts.fp) return { done: true, outcome: 'form-changed' };
+    var vs = valueSensitivity(value);
+    if (vs && vs.level === 'never') return { done: true, outcome: 'refused-sensitive', detail: vs.kind };
+    if (vs && vs.level === 'confirm' && !opts.sensitiveConfirmed) return { done: true, outcome: 'needs-confirmation', detail: vs.kind };
+    if (f.sensitive && f.sensitive.level === 'never') return { done: true, outcome: 'refused-sensitive', detail: f.sensitive.kind };
+    if (f.sensitive && f.sensitive.level === 'confirm' && !opts.sensitiveConfirmed) return { done: true, outcome: 'needs-confirmation', detail: f.sensitive.kind };
+    if (f.disabled || f.readOnly) return { done: true, outcome: 'not-editable' };
+    if (kind === 'unsupported') return { done: true, outcome: 'unsupported', detail: f.type || f.tag };
+    return null;
+  }
   function fillStep(ref, value, step, opts) {
     opts = opts || {};
     var info = fieldFor(ref);
@@ -1254,14 +1265,14 @@
       if (step === 'pick') dismiss(el);
       return { done: true, outcome: 'stopped-mid-field' };
     }
+    // Before every step that writes (start decides, apply and pick write): the field must still
+    // be the one the plan was matched to (a page can repurpose an input during the highlight
+    // delay) and still allowed. opts.fp is the identity the agent matched.
+    if (step === 'start' || step === 'apply' || step === 'pick') {
+      var wr = writeRefusal(f, kind, value, opts);
+      if (wr) { stopPending(ref); if (step === 'pick') dismiss(el); return wr; }
+    }
     if (step === 'start') {
-      var vs = valueSensitivity(value);
-      if (vs && vs.level === 'never') return { done: true, outcome: 'refused-sensitive', detail: vs.kind };
-      if (vs && vs.level === 'confirm' && !opts.sensitiveConfirmed) return { done: true, outcome: 'needs-confirmation', detail: vs.kind };
-      if (f.sensitive && f.sensitive.level === 'never') return { done: true, outcome: 'refused-sensitive', detail: f.sensitive.kind };
-      if (f.sensitive && f.sensitive.level === 'confirm' && !opts.sensitiveConfirmed) return { done: true, outcome: 'needs-confirmation', detail: f.sensitive.kind };
-      if (f.disabled || f.readOnly) return { done: true, outcome: 'not-editable' };
-      if (kind === 'unsupported') return { done: true, outcome: 'unsupported', detail: f.type || f.tag };
       var target = el, vkind = kind;
       if (kind === 'radio-group') {
         var mm = matchOption(f.options.map(function (o, i) { return { label: o.label, value: o.value, disabled: o.disabled, i: i }; }), value);
@@ -1566,7 +1577,8 @@
   // The visible submit-class controls of a form (inside it, or tied to it with form=).
   function formSubmitControls(form) {
     var seen = new Set(), out = [];
-    var cands = Array.prototype.slice.call(form.elements || []).concat(Array.prototype.slice.call(form.querySelectorAll('[role=button], a[href]')));
+    // The prototype getter: a control named "elements" shadows the form's own property.
+    var cands = Array.prototype.slice.call(FORM_ELEMENTS.call(form)).concat(Array.prototype.slice.call(form.querySelectorAll('[role=button], a[href]')));
     for (var i = 0; i < cands.length && out.length < 10; i++) {
       var c = cands[i];
       if (seen.has(c) || inOwnUi(c)) continue;

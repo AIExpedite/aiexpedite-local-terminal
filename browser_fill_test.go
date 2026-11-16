@@ -176,7 +176,7 @@ func TestBrowserFillFieldForwardsChosenLabel(t *testing.T) {
 		"ping": pingOK,
 	}
 	k := newKitRunner(page)
-	r, err := k.fillField(context.Background(), "f1_a", browserPlanValue{Field: "Country", Value: "DE"}, true, nil)
+	r, err := k.fillField(context.Background(), "f1_a", "", browserPlanValue{Field: "Country", Value: "DE"}, true, nil)
 	if err != nil || r.Outcome != "filled" {
 		t.Fatalf("%+v %v", r, err)
 	}
@@ -204,7 +204,7 @@ func TestBrowserFillFieldHonoursStopBeforeWriting(t *testing.T) {
 		"check": func([]json.RawMessage) any { return map[string]any{"ok": true} },
 		"ping":  pingOK,
 	}
-	r, err := newKitRunner(page).fillField(context.Background(), "f1_a", browserPlanValue{Field: "Name", Value: "Ada"}, true, stop)
+	r, err := newKitRunner(page).fillField(context.Background(), "f1_a", "", browserPlanValue{Field: "Name", Value: "Ada"}, true, stop)
 	if err != nil || r.Outcome != browserOutcomeStoppedMidField {
 		t.Fatalf("stop during the wait: %+v %v", r, err)
 	}
@@ -225,8 +225,32 @@ func TestBrowserFillFieldHonoursStopBeforeWriting(t *testing.T) {
 		"check": func([]json.RawMessage) any { return map[string]any{"ok": true} },
 		"ping":  pingOK,
 	}
-	r, err = newKitRunner(page2).fillField(context.Background(), "f1_a", browserPlanValue{Field: "Name", Value: "Ada"}, true, stop)
+	r, err = newKitRunner(page2).fillField(context.Background(), "f1_a", "", browserPlanValue{Field: "Name", Value: "Ada"}, true, stop)
 	if err != nil || r.Outcome != browserOutcomeStoppedMidField || len(page2.inserted) != 0 {
 		t.Fatalf("stop before typing: %+v %v inserted=%v", r, err, page2.inserted)
+	}
+}
+
+// The identity the plan was matched to travels with every step, so the kit can
+// refuse a field the page repurposed between the agent's check and the write.
+func TestBrowserFillFieldSendsPlannedIdentity(t *testing.T) {
+	var seen []string
+	page := &fakePage{id: "d:T1", trusted: true}
+	page.kit = map[string]func([]json.RawMessage) any{
+		"fillStep": func(args []json.RawMessage) any {
+			var opts map[string]any
+			_ = json.Unmarshal(args[3], &opts)
+			fp, _ := opts["fp"].(string)
+			seen = append(seen, fp)
+			return map[string]any{"done": true, "outcome": browserOutcomeFormChanged}
+		},
+		"ping": pingOK,
+	}
+	r, err := newKitRunner(page).fillField(context.Background(), "f1_a", "fp-name", browserPlanValue{Field: "Name", Value: "Ada"}, true, nil)
+	if err != nil || r.Outcome != browserOutcomeFormChanged {
+		t.Fatalf("%+v %v", r, err)
+	}
+	if len(seen) != 1 || seen[0] != "fp-name" {
+		t.Fatalf("fp sent to the kit: %v", seen)
 	}
 }

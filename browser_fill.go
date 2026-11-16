@@ -273,9 +273,16 @@ func clipString(s string, n int) string {
 }
 
 // fillField runs one field through the kit's steps (start, apply, pick, verify).
-func (k *kitRunner) fillField(ctx context.Context, ref string, pv browserPlanValue, trusted bool, stop *atomic.Bool) (kitStepResult, error) {
+//
+// fp is the identity the plan value was matched to: the kit re-checks it (and
+// the field's sensitivity and editability) before every step that writes, so a
+// field the page repurposed meanwhile is reported form-changed, never filled.
+func (k *kitRunner) fillField(ctx context.Context, ref, fp string, pv browserPlanValue, trusted bool, stop *atomic.Bool) (kitStepResult, error) {
 	step := "start"
 	opts := map[string]any{"trustedText": trusted, "sensitiveConfirmed": pv.Confirmed}
+	if fp != "" {
+		opts["fp"] = fp
+	}
 	var acc kitStepResult
 	for i := 0; i < 160; i++ {
 		var r kitStepResult
@@ -460,7 +467,7 @@ func runBrowserFill(ctx context.Context, k *kitRunner, values []browserPlanValue
 				out.Outcome = browserOutcomeFormChanged
 				return
 			}
-			r, err := k.fillField(ctx, f.Ref, pv, trusted, stop)
+			r, err := k.fillField(ctx, f.Ref, fp[f.Ref], pv, trusted, stop)
 			if err != nil {
 				out.Outcome = browserOutcomeFailed
 				return
