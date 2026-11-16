@@ -130,7 +130,7 @@ const (
 	mspDispositionStarted = "started"
 	mspStatusAccepted     = "accepted"
 
-	// MUSE_MSP_ITEM_KINDS / MUSE_MSP_MESSAGE_PHASES.
+	// MUSE_MSP_ITEM_KINDS / MUSE_MSP_MESSAGE_PHASES (shared-constants 3.23.594).
 	mspItemUserMessage  = "userMessage"
 	mspItemAgentMessage = "agentMessage"
 	mspPhaseFinalAnswer = "finalAnswer"

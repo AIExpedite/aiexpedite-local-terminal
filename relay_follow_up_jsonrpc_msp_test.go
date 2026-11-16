@@ -158,6 +158,10 @@ func TestMuseMSPWireValuesMatchSharedConstants(t *testing.T) {
 		mspRejectMissingRun: "missing_run", mspRejectAlreadyTerminal: "already_terminal", mspRejectCommandIDConflict: "command_id_conflict",
 		mspApprovalApproved: "approved", mspApprovalDenied: "denied", mspApprovalScopeOnce: "once",
 		mspIfBusyQueue: "queue", mspTurnTerminalCompleted: "completed",
+		// MUSE_MSP_NOTIFICATIONS / MUSE_MSP_ITEM_KINDS / MUSE_MSP_MESSAGE_PHASES
+		// (shared-constants 3.23.594).
+		mspNotifyItemStarted: "item/started", mspNotifyItemCompleted: "item/completed",
+		mspItemUserMessage: "userMessage", mspItemAgentMessage: "agentMessage", mspPhaseFinalAnswer: "finalAnswer",
 	}
 	for got, want := range strs {
 		if got != want {

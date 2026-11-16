@@ -51,6 +51,8 @@ func TestLiveFollowUpJSONRPCWireValuesArePinned(t *testing.T) {
 		{followUpReasonNoAnswer, "noAnswer"},
 		{followUpReasonWriteFailed, "writeFailed"},
 		{followUpReasonAnswerUnrecognised, "answerUnrecognised"},
+		// DEVICE_FOLLOW_UP_UNKNOWN_REASON.UNPLACED (shared-constants 3.23.594).
+		{followUpReasonUnplaced, "unplaced"},
 	}
 	for _, p := range pins {
 		if p[0] != p[1] {
