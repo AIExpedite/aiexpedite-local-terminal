@@ -32,6 +32,7 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -78,6 +79,39 @@ func processTreeGone(p ledgerProcess, job uintptr) bool {
 	}
 	n, err := jobActiveProcesses(job)
 	return err == nil && n == 0
+}
+
+// leftoverWait bounds how long ending a session's leftovers waits for the
+// job to empty.
+var leftoverWait = 3 * time.Second
+
+// endLeftoverProcessTree terminates everything still in a session's
+// kill-on-close Job Object, ONLY once the recorded process itself is gone
+// (its own END stopped it): then every process left in the job is something
+// the session started. A live recorded process is never touched here, and a
+// process outside any job (job == 0, an assignment that failed) is out of
+// reach. Reports whether the job is empty afterwards.
+// owner is unused here: the Job Object is the kernel's own proof that a
+// process belongs to the session.
+func endLeftoverProcessTree(rec ledgerProcess, job uintptr, owner string) bool {
+	if job == 0 {
+		return false
+	}
+	if probeRecordedProcess(rec) != processGone {
+		return false
+	}
+	if processTreeGone(rec, job) {
+		return true
+	}
+	_ = windows.TerminateJobObject(windows.Handle(job), 1)
+	deadline := time.Now().Add(leftoverWait)
+	for !processTreeGone(rec, job) {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return true
 }
 
 // ownProcessGroup is Unix-only (process groups); Windows uses Job Objects.
