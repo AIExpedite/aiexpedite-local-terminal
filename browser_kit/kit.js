@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.19';
+  var VERSION = 'aix-1.0.20';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1538,6 +1538,11 @@
         if (el.tagName === 'INPUT' && !isSelectOnlyInput(el)) {
           pointerSequence(visualTarget(el, kind));
           el.focus({ preventScroll: true });
+          // The pointer and focus handlers may have changed the field (type="password", another
+          // name, read-only, hidden): check it again, as it is now, before anything is typed.
+          var why6b = recheck(el, kind);
+          var wr6 = why6b ? { done: true, outcome: 'refused-hidden', detail: why6b } : refusalAfterFocus(ref, value, opts);
+          if (wr6) { stopPending(ref); dismiss(el); return wr6; }
           var method = fillText(el, value);   // typing filters the options and opens the list
           return { done: false, next: 'pick', waitMs: 350, method: 'type-to-filter (' + method + ')' };
         }

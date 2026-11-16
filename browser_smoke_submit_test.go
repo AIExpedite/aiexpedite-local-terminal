@@ -91,6 +91,7 @@ second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="ups21" method="post" action="/posted21"><label for="k21">Kappa one</label><input id="k21" name="kappa" value="twentyone"><input type="hidden" id="amt21" name="amount" value="10.00"><button type="submit">Send kappa one</button></form>
 <form id="ups22" method="post" action="/posted22"><label for="k22">Kappa two</label><input id="k22" name="kappa" value="twentytwo"><input type="hidden" id="amt22" name="amount" value="10.00"><button type="submit">Send kappa two</button></form>
 <form id="ups23" method="post" action="/posted23"><label for="k23">Kappa three</label><input id="k23" name="kappa" value="twentythree"><button type="submit">Send kappa three</button></form>
+<form id="cities"><label for="cb24">Shipping city</label><input id="cb24" name="shipcity" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="lb24"><ul id="lb24" role="listbox" style="display:none"><li role="option">Boston</li><li role="option">Denver</li></ul></form>
 <form id="tiers"><label for="tier">Tier</label><select id="tier" name="tier"><option value="">Choose</option><option value="cheap">Standard</option><option value="expensive">Standard</option></select></form>
 <form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
@@ -142,6 +143,7 @@ document.getElementById('ansNo').addEventListener('change', function () { docume
 });
 document.getElementById('ups23').addEventListener('submit', function (e) { if (e.submitter) e.submitter.setAttribute('formtarget', 'sink21'); e.stopImmediatePropagation(); });
 document.getElementById('tier').addEventListener('change', function () { if (this.value === 'cheap') this.value = 'expensive'; });
+document.getElementById('cb24').addEventListener('focus', function () { this.type = 'password'; });
 document.getElementById('send20').addEventListener('click', function () {
   var f = document.getElementById('psi');
   HTMLFormElement.prototype.submit.call(f);
@@ -680,6 +682,17 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('cw').value)`); err != nil || v != `""` {
 		t.Fatalf("the refused field was written: %q %v", v, err)
+	}
+	// 4d22. An editable combobox that turns into a password field when focused: refused, nothing typed.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Shipping city", Value: "Boston"}}})
+	if err != nil {
+		t.Fatalf("fill shipping city: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || (o[0].Outcome != "refused-sensitive" && o[0].Outcome != browserOutcomeFormChanged) {
+		t.Fatalf("a combobox that becomes a password on focus must be refused: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('cb24').value)`); err != nil || v != `""` {
+		t.Fatalf("the refused combobox was written: %q %v", v, err)
 	}
 	// 4d14. A radio whose handler selects "Not sure" when "No" was asked: mismatch.
 	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Answer", Value: "No"}}})
