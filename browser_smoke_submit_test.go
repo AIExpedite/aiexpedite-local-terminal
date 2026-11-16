@@ -28,6 +28,7 @@ package main
 //     is blocked by the network backstop;
 //   - an approved button whose handler natively submits a SECOND form to the
 //     same action with other values is refused (the outgoing data counts);
+//   - an approved button sharing its name with a filled field submits;
 //   - an unapproved click whose handler sends a GET form with data into a
 //     hidden iframe is blocked by the network backstop;
 //   - a value a blur handler clears is reported mismatch, not filled;
@@ -68,6 +69,7 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
   <label for="country">Country</label><select id="country" name="country"><option value="">Choose</option><option value="DE">Germany</option><option value="FR">France</option></select>
 </form>
 <form id="shadowed" method="post" action="/posted8"><label for="el">Elements</label><input id="el" name="elements" value="x"><button type="submit">Send eta</button></form>
+<form id="xi" method="post" action="/posted12"><label for="xa">Xi</label><input id="xa" name="action" value="edit"><button id="send12" type="submit" name="action" value="save">Save xi</button></form>
 <form id="clearing"><label for="nu">Nu</label><input id="nu" name="nu"></form>
 <form id="retheta"><label for="th">Theta</label><input id="th" name="theta"></form>
 <form id="tamper" method="post" action="/posted9"><label for="io">Iota</label><input id="io" name="iota" value="nine"><input type="hidden" id="amt9" name="amount" value="10.00"><button id="send9" type="submit">Send iota</button></form>
@@ -410,6 +412,34 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted11") != 0 {
 		t.Fatalf("forged second form: %v posted11=%d", err, hit("POST /posted11"))
+	}
+
+	// 4d2. The approved button shares its name with a filled field
+	// (action=edit + button action=save): the unchanged form submits.
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+	prep = prepare(refs["Save xi"])
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r12"})
+	if err != nil || hit("POST /posted12") != 1 {
+		t.Fatalf("submitter sharing a field's name: %v posted12=%d", err, hit("POST /posted12"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
 	}
 
 	// 4e. An unapproved, non-submit-class button whose handler submits a GET

@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.10';
+  var VERSION = 'aix-1.0.11';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -975,7 +975,7 @@
       // approved. Any other navigation without form data stays allowed (a script that saved by
       // fetch and then shows its confirmation page).
       if (!a.virtual && a.payload && dest && sendsToApprovedAction(a, dest) && hasQuery(dest) &&
-          !entriesHold(a.payload.by, queryEntries(dest))) {
+          !outgoingHolds(a, queryEntries(dest))) {
         a.changed = true;
         return false;
       }
@@ -989,7 +989,7 @@
       // the same action and other values and call its native submit(), which fires no submit
       // event and leaves the approved form's DOM untouched.
       if (!dest || a.actions.indexOf(String(dest).split('#')[0]) < 0 || !approvedPayloadHolds(a) ||
-          (a.payload && !entriesHold(a.payload.by, formDataEntries(e.formData)))) {
+          (a.payload && !outgoingHolds(a, formDataEntries(e.formData)))) {
         a.changed = true;
         return false;
       }
@@ -1881,6 +1881,20 @@
       for (var i = 0; i < n.length; i++) if (n[i] !== ws[i]) return false;
     }
     return true;
+  }
+  // Does the data actually leaving carry what was approved? The approved reading excludes the
+  // submit control, but a submission the control triggers also sends the control's own
+  // name=value (approved too: it is part of the destination reading), which may share a name
+  // with a field. So either reading holds: exactly the approved fields (a native submit()), or
+  // those plus the approved control's own pair (the control's activation).
+  function outgoingHolds(a, now) {
+    if (entriesHold(a.payload.by, now)) return true;
+    var c = a.el && a.el.deref && a.el.deref(), name = c && c.getAttribute && c.getAttribute('name');
+    if (!name || lower(c.getAttribute('type') || '') === 'image') return false;
+    var withSubmitter = Object.create(null);
+    for (var k in a.payload.by) withSubmitter[k] = a.payload.by[k].slice();
+    (withSubmitter[name] = withSubmitter[name] || []).push(c.getAttribute('value') || '');
+    return entriesHold(withSubmitter, now);
   }
   // What a navigation's form data carries, as name -> [values]; a file as name␟size, as
   // submittedData reads it. null when it cannot be read (then nothing is allowed).
