@@ -74,17 +74,38 @@ function handle(chrome, req) {
   throw new Error('unknown op ' + req.op);
 }
 
+// takeCompleteLines removes every complete line (through the last newline byte) from pending and
+// returns them decoded, or null when no line is complete yet; it returns false when the complete
+// lines are not valid UTF-8. A read can end in the middle of a UTF-8 character (a request carries
+// the fill values), so bytes are kept until their line is complete: a newline byte never occurs
+// inside a UTF-8 character, so everything through the last one decodes on its own.
+// NSData's numbers bridge as string-like values ("5"), so each is read through Number().
+var NEWLINE = $('\n').dataUsingEncoding($.NSUTF8StringEncoding);
+function takeCompleteLines(pending) {
+  var total = Number(pending.length);
+  var at = pending.rangeOfDataOptionsRange(NEWLINE, $.NSDataSearchBackwards, $.NSMakeRange(0, total));
+  if (Number(at.length) === 0) return null;
+  var upto = Number(at.location) + 1;
+  var text = $.NSString.alloc.initWithDataEncoding(pending.subdataWithRange($.NSMakeRange(0, upto)), $.NSUTF8StringEncoding);
+  pending.setData(pending.subdataWithRange($.NSMakeRange(upto, total - upto)));
+  if (text.isNil()) return false;
+  return text.js;
+}
+
 function run(argv) {
   var chrome = Application('Google Chrome');
   var stdin = $.NSFileHandle.fileHandleWithStandardInput;
-  var buf = '';
+  var pending = $.NSMutableData.data;
   writeLine(JSON.stringify({ id: 0, ok: true, result: 'ready' }));
   while (true) {
     var data = stdin.availableData;
     // NSData's length bridges as a string-like value ("0"), so compare as a
     // number: at EOF (the agent went away) the helper must exit, not spin.
     if (Number(data.length) === 0) break;
-    buf += $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding).js;
+    pending.appendData(data);
+    var buf = takeCompleteLines(pending);
+    if (buf === null) continue;
+    if (buf === false) { writeLine(JSON.stringify({ id: -1, ok: false, error: 'bad request encoding' })); continue; }
     var nl;
     while ((nl = buf.indexOf('\n')) >= 0) {
       var line = buf.slice(0, nl);

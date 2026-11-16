@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -109,5 +110,97 @@ func TestASBridgeQueuedRequestHonorsItsDeadline(t *testing.T) {
 	}
 	if w := f.written(); len(w) != 1 || !strings.Contains(w[0], `"id":1`) {
 		t.Fatalf("written = %q", w)
+	}
+}
+
+// A pipe read can end in the middle of a UTF-8 character (a request carries
+// the fill values, such as a name or an address). The helper keeps the bytes
+// until their line is complete instead of decoding each read on its own, and a
+// complete line that is not UTF-8 is answered as such without stopping it.
+func TestBrowserChromeHelperDecodesSplitUTF8(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("osascript is macOS only")
+	}
+	b := &asBridge{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := b.acquire(ctx); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer b.release()
+	if err := b.start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = b.in.Close(); b.kill() }()
+
+	send := func(p []byte) {
+		t.Helper()
+		if _, err := b.in.Write(p); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	// Pause so that the helper reads what came before on its own.
+	splitSend := func(p []byte, at int) {
+		t.Helper()
+		send(p[:at])
+		time.Sleep(300 * time.Millisecond)
+		send(p[at:])
+	}
+	type reply struct {
+		ID     int             `json:"id"`
+		OK     bool            `json:"ok"`
+		Error  string          `json:"error"`
+		Result json.RawMessage `json:"result"`
+	}
+	next := func() reply {
+		t.Helper()
+		ch := make(chan []byte, 1)
+		go func() {
+			l, _ := b.out.ReadBytes('\n')
+			ch <- l
+		}()
+		select {
+		case l := <-ch:
+			var r reply
+			if err := json.Unmarshal(l, &r); err != nil {
+				t.Fatalf("reply %q: %v", l, err)
+			}
+			return r
+		case <-time.After(30 * time.Second):
+			t.Fatal("no reply from the helper")
+		}
+		return reply{}
+	}
+	status := func(id int, pad string) []byte {
+		line, _ := json.Marshal(map[string]any{"id": id, "op": "status", "pad": pad})
+		return append(line, '\n')
+	}
+
+	// Split inside a three-byte character.
+	l1 := status(1, "José, Zürich, 価格")
+	splitSend(l1, bytes.Index(l1, []byte("価"))+1)
+	if r := next(); r.ID != 1 || !r.OK {
+		t.Fatalf("split three-byte character: %+v", r)
+	}
+
+	// A complete line and the start of the next one, split inside a four-byte character.
+	l2, l3 := status(2, "first"), status(3, "smile 😀 done")
+	both := append(append([]byte{}, l2...), l3...)
+	splitSend(both, len(l2)+bytes.Index(l3, []byte("😀"))+2)
+	if r := next(); r.ID != 2 || !r.OK {
+		t.Fatalf("first of two: %+v", r)
+	}
+	if r := next(); r.ID != 3 || !r.OK {
+		t.Fatalf("split four-byte character: %+v", r)
+	}
+
+	// A complete line that is not UTF-8 is answered, and the helper goes on.
+	send([]byte("{\"id\":4,\"op\":\"status\",\"pad\":\"\xff\xfe\"}\n"))
+	if r := next(); r.ID != -1 || r.OK || r.Error != "bad request encoding" {
+		t.Fatalf("invalid UTF-8: %+v", r)
+	}
+	send(status(5, "after"))
+	if r := next(); r.ID != 5 || !r.OK {
+		t.Fatalf("after invalid UTF-8: %+v", r)
 	}
 }
