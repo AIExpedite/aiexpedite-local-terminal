@@ -108,6 +108,7 @@ second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="upl35" method="get" action="/got35"><label for="att35">Attachment</label><input type="file" id="att35" name="attachment"><label for="u35">Upsilon three</label><input id="u35" name="ups" value="thirtyfive"><button type="submit">Send upload</button></form>
 <form id="img36" method="post" action="/posted36"><label for="i36">Iota six</label><input id="i36" name="iota" value="thirtysix"><input type="image" alt="Send image six" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='24'%3E%3Crect width='80' height='24' fill='%23336'/%3E%3C/svg%3E" width="80" height="24"></form>
 <form id="img37" method="post" action="/posted37"><label for="x37">X mark</label><input id="x37" name="x" value="seven"></form><input type="image" form="img37" alt="Send x mark" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='24'%3E%3Crect width='80' height='24' fill='%23336'/%3E%3C/svg%3E" width="80" height="24">
+<form id="img38" method="post" action="/posted38"><label for="x38">X tag</label><input id="x38" name="x" value="eight"></form><input type="image" form="img38" alt="Send x tag" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='24'%3E%3Crect width='80' height='24' fill='%23336'/%3E%3C/svg%3E" width="80" height="24">
 <form id="tiers"><label for="tier">Tier</label><select id="tier" name="tier"><option value="">Choose</option><option value="cheap">Standard</option><option value="expensive">Standard</option></select></form>
 <form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
@@ -227,7 +228,7 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	hits := map[string]int{}
 	posted := map[string]map[string][]string{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && (r.URL.Path == "/posted36" || r.URL.Path == "/posted37") {
+		if r.Method == http.MethodPost && (r.URL.Path == "/posted36" || r.URL.Path == "/posted37" || r.URL.Path == "/posted38") {
 			_ = r.ParseForm()
 			mu.Lock()
 			posted[r.URL.Path] = r.PostForm
@@ -927,7 +928,12 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	// 4d37. An image button tied to its form from outside it (form=), in a form with a field
 	// named x: the press adds its own x and y after the field's, and the unchanged form is
 	// submitted, not refused.
-	for i, tc := range []struct{ button, path string }{{"Send image six", "/posted36"}, {"Send x mark", "/posted37"}} {
+	// 4d38. The same through a script click (the AppleScript route's path): the kit clicks the
+	// image button from the page, which presses it at 0, 0.
+	for i, tc := range []struct {
+		button, path string
+		script       bool
+	}{{"Send image six", "/posted36", false}, {"Send x mark", "/posted37", false}, {"Send x tag", "/posted38", true}} {
 		n := 36 + i
 		formRef := ""
 		for _, f := range res.(browserReadResult).Forms {
@@ -944,24 +950,38 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 		if prep.SubmitText != tc.button {
 			t.Fatalf("4d%d: prepared by the form's ref: %+v", n, prep)
 		}
-		r, err := run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: fmt.Sprintf("r%d", n)})
-		if err != nil || hit("POST "+tc.path) != 1 || !r.(browserClickResult).Navigated {
+		var b browserBackend = be
+		if tc.script {
+			b = ub
+		}
+		r, err := (&browserOpRun{p: browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: fmt.Sprintf("r%d", n)},
+			be: b, stop: stop}).run(ctx)
+		deadline := time.Now().Add(5 * time.Second)
+		for hit("POST "+tc.path) == 0 && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if err != nil || hit("POST "+tc.path) != 1 {
 			t.Fatalf("4d%d: approved image button: %v posted=%d %+v", n, err, hit("POST "+tc.path), r)
+		}
+		if cr, ok := r.(browserClickResult); !tc.script && (!ok || !cr.Navigated) {
+			t.Fatalf("4d%d: not navigated: %+v", n, r)
 		}
 		mu.Lock()
 		got := posted[tc.path]
 		mu.Unlock()
-		wantX := 1
-		if n == 37 {
-			wantX = 2
-			if len(got["x"]) != 2 || got["x"][0] != "seven" {
+		switch n {
+		case 36:
+			if len(got["iota"]) != 1 || got["iota"][0] != "thirtysix" || len(got["x"]) != 1 || len(got["y"]) != 1 {
+				t.Fatalf("4d36: posted %v", got)
+			}
+		case 37:
+			if len(got["x"]) != 2 || got["x"][0] != "seven" || len(got["y"]) != 1 {
 				t.Fatalf("4d37: the field x must come first, then the press: %v", got)
 			}
-		} else if len(got["iota"]) != 1 || got["iota"][0] != "thirtysix" {
-			t.Fatalf("4d36: posted %v", got)
-		}
-		if len(got["x"]) != wantX || len(got["y"]) != 1 {
-			t.Fatalf("4d%d: the press's coordinates: %v", n, got)
+		case 38:
+			if len(got["x"]) != 2 || got["x"][0] != "eight" || got["x"][1] != "0" || len(got["y"]) != 1 || got["y"][0] != "0" {
+				t.Fatalf("4d38: the field x, then the press at 0, 0: %v", got)
+			}
 		}
 		if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
 			t.Fatal(err)
