@@ -477,7 +477,10 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	prep = prepare(refs["Send iota"])
 	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r9"})
-	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted9") != 0 {
+	// Stopped after the click: the page's own handlers ran first, so the result
+	// must not claim that nothing was sent.
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted9") != 0 ||
+		strings.Contains(err.Error(), "Nothing was submitted") || !strings.Contains(err.Error(), "may still have sent") {
 		t.Fatalf("changed during activation: %v posted9=%d", err, hit("POST /posted9"))
 	}
 

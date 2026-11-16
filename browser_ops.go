@@ -675,8 +675,20 @@ type kitArm struct {
 	Submitted bool    `json:"submitted"`
 }
 
+// formChanged: a refusal BEFORE the approved control was activated. Nothing was
+// sent, because nothing was clicked.
 func formChanged(msg string) *browserError {
 	return browserErr(browserErrSubmitFormChanged, "%s Nothing was submitted.", msg)
+}
+
+// stoppedAfterClick: the approved control was activated, then the native
+// submission did not happen (the kit stopped it, or the browser's validation
+// refused it). The form itself was not sent, but the page's own handlers ran
+// first, and a save they started by fetch is seen only once it completes: it
+// never claims nothing was sent.
+func stoppedAfterClick(why string) *browserError {
+	return browserErr(browserErrSubmitFormChanged,
+		"%s, so the form itself was not sent. A script on the page may still have sent something on its own: check the page in Chrome before you prepare it again.", why)
 }
 
 // submit runs a submit the person approved: re-read the form, refuse unless its
@@ -740,7 +752,7 @@ func (r *browserOpRun) submit(ctx context.Context) (any, error) {
 		if endErr == nil && e.Changed && !e.Used {
 			// The control's own click handler changed what would be sent (or
 			// where), after the digest was checked: the kit stopped it.
-			return nil, formChanged("The page changed the form while it was being submitted, so it was stopped.")
+			return nil, stoppedAfterClick("The page changed the form while it was being submitted")
 		}
 		if endErr == nil && e.Redirected {
 			// The page aimed the approved submission at a frame and stopped its
@@ -755,8 +767,7 @@ func (r *browserOpRun) submit(ctx context.Context) (any, error) {
 			// not prove the page sent nothing: a click handler's own fetch is
 			// seen only once it completes, so one still in flight is invisible
 			// here. Say both, so nobody retries a save that already happened.
-			return nil, browserErr(browserErrSubmitFormChanged,
-				"The page showed a validation message instead of submitting the form, so the form itself was not sent. A script on the page may still have sent something on its own: check the page in Chrome before you prepare it again.")
+			return nil, stoppedAfterClick("The page showed a validation message instead of submitting the form")
 		}
 		// No submit event and no navigation is NOT proof that nothing was sent:
 		// a control whose script saves by fetch fires neither. Report the click
