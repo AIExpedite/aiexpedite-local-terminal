@@ -118,6 +118,10 @@ const (
 	followUpReasonNoAnswer           = "noAnswer"
 	followUpReasonWriteFailed        = "writeFailed"
 	followUpReasonAnswerUnrecognised = "answerUnrecognised"
+	// DEVICE_FOLLOW_UP_UNKNOWN_REASON.UNPLACED (Muse Code on MSP): the CLI took
+	// the message, but it was seen running neither in the turn it named nor
+	// as a turn of its own.
+	followUpReasonUnplaced = "unplaced"
 
 	// ACP `initialize`: its answer advertises OpenCode's steering
 	// (`_meta.steering.supported`).
@@ -1261,6 +1265,7 @@ func (t *liveFollowUpTracker) forget(rpcID string) {
 	delete(t.lateWaiters, rpcID)
 	if t.msp != nil {
 		delete(t.msp.expected, rpcID)
+		delete(t.msp.watches, rpcID)
 	}
 	for _, p := range t.acpPrompts {
 		if p.handoverTo == rpcID {
@@ -1370,10 +1375,17 @@ func (t *liveFollowUpTracker) readerDone(flush bool) {
 	}
 	t.acpPrompts = nil
 	if t.msp != nil {
-		// The host is gone: no turn runs and nothing it asked is open.
-		t.msp.runningTurnID, t.msp.foregroundDone = "", false
+		// The host is gone: no turn runs and nothing it asked is open, and a
+		// steer not seen running yet never will be.
+		t.msp.runningTurnID, t.msp.foregroundDone, t.msp.answerDone = "", false, false
 		t.msp.approvals = map[string]string{}
 		t.msp.userInputs = map[string]string{}
+		for _, w := range t.msp.watches {
+			if !w.sent {
+				w.sent = true
+				w.placed <- mspPlacement{exited: true}
+			}
+		}
 	}
 	t.mu.Unlock()
 	for _, ch := range waiters {

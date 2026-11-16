@@ -387,17 +387,17 @@ func TestSettleIsDurableAndOnlyLeavesAccepted(t *testing.T) {
 		t.Fatalf("unknown row after restart: %+v", r)
 	}
 	// Late evidence lifts unknown to written, and never touches another state.
-	if r, ok := reloaded.LateWritten("u", "m-u", "s1", followUpProcessedInCurrent); !ok || r.State != followUpRowWritten || r.Reason != "" {
+	if r, ok := reloaded.LateWritten("u", "m-u", "s1", followUpProcessedInCurrent, ""); !ok || r.State != followUpRowWritten || r.Reason != "" {
 		t.Fatalf("late success on an unknown row: ok=%v %+v", ok, r)
 	}
-	if _, ok := reloaded.LateWritten("r", "m-r", "s1", followUpProcessedInCurrent); ok {
+	if _, ok := reloaded.LateWritten("r", "m-r", "s1", followUpProcessedInCurrent, ""); ok {
 		t.Fatal("a late success lifted a refused row")
 	}
 	// A row the broker confirmed away is still answered written, unstored.
 	if _, err := reloaded.ConfirmAcked([]string{"w"}); err != nil {
 		t.Fatal(err)
 	}
-	if r, ok := reloaded.LateWritten("w", "m-w", "s1", followUpProcessedInCurrent); !ok || r.State != followUpRowWritten || r.FollowUpID != "m-w" {
+	if r, ok := reloaded.LateWritten("w", "m-w", "s1", followUpProcessedInCurrent, ""); !ok || r.State != followUpRowWritten || r.FollowUpID != "m-w" {
 		t.Fatalf("late success for a confirmed row: ok=%v %+v", ok, r)
 	}
 	again := reopenFollowUpLedger(t, reloaded, path)

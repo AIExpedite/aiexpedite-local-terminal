@@ -182,7 +182,10 @@ type relayFollowUpRow struct {
 	State       string `json:"state"`
 	Reason      string `json:"reason,omitempty"`
 	ProcessedIn string `json:"processedIn,omitempty"`
-	UpdatedAt   int64  `json:"updatedAt"`
+	// MSPTurnID (Muse Code on MSP) is the turn a written steer was seen
+	// running in: the named turn (current), or its own turn (next).
+	MSPTurnID string `json:"mspTurnId,omitempty"`
+	UpdatedAt int64  `json:"updatedAt"`
 	// inFlight marks an answer for an attempt this process is still writing or
 	// waiting on the CLI's answer for. Never stored: set only on the copy
 	// Begin and Query return, so the caller publishes nothing for it.
@@ -642,13 +645,40 @@ func (l *relayFollowUpLedger) Settle(attemptID, state, reason, processedIn strin
 	return *r
 }
 
+// SettlePlaced records a Muse Code steer as written, where Muse was seen
+// running it: in the turn it named (current) or as its own turn (next), the
+// MSP turn mspTurnID. Otherwise as Settle.
+func (l *relayFollowUpLedger) SettlePlaced(attemptID, processedIn, mspTurnID string) relayFollowUpRow {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.inFlight, attemptID)
+	if !l.ownLocked() {
+		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
+	}
+	r := l.rows[attemptID]
+	if r == nil {
+		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
+	}
+	if r.State != followUpRowAccepted {
+		return *r
+	}
+	r.State = followUpRowWritten
+	r.Reason = ""
+	r.ProcessedIn = processedIn
+	r.MSPTurnID = mspTurnID
+	r.UpdatedAt = l.now().UnixMilli()
+	_ = l.persistLocked()
+	return *r
+}
+
 // LateWritten records a success the CLI answered after the attempt had
 // already been answered unknown for want of an answer: late evidence of
 // receipt can only lift unknown to written (SR accepts unknown → written). A
 // row the broker has since confirmed away is answered written without being
 // stored again. ok is false when there is nothing to publish: the row is in
 // another state, or the upgrade did not reach disk (it then stays unknown).
-func (l *relayFollowUpLedger) LateWritten(attemptID, followUpID, sessionID, processedIn string) (relayFollowUpRow, bool) {
+// mspTurnID (Muse Code) is the turn the steer was seen running in.
+func (l *relayFollowUpLedger) LateWritten(attemptID, followUpID, sessionID, processedIn, mspTurnID string) (relayFollowUpRow, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if !l.ownLocked() {
@@ -657,7 +687,7 @@ func (l *relayFollowUpLedger) LateWritten(attemptID, followUpID, sessionID, proc
 	r := l.rows[attemptID]
 	if r == nil {
 		return relayFollowUpRow{AttemptID: attemptID, FollowUpID: followUpID, SessionID: sessionID,
-			State: followUpRowWritten, ProcessedIn: processedIn, UpdatedAt: l.now().UnixMilli()}, true
+			State: followUpRowWritten, ProcessedIn: processedIn, MSPTurnID: mspTurnID, UpdatedAt: l.now().UnixMilli()}, true
 	}
 	if r.State != followUpRowUnknown {
 		return relayFollowUpRow{}, false
@@ -666,6 +696,7 @@ func (l *relayFollowUpLedger) LateWritten(attemptID, followUpID, sessionID, proc
 	r.State = followUpRowWritten
 	r.Reason = ""
 	r.ProcessedIn = processedIn
+	r.MSPTurnID = mspTurnID
 	r.UpdatedAt = l.now().UnixMilli()
 	if err := l.persistLocked(); err != nil {
 		*r = prev
@@ -791,6 +822,7 @@ func relayFollowUpAckFrame(cmd commandMsg, agentID string, r relayFollowUpRow, l
 		FollowUpOutcome:     outcomeOf(&r),
 		FollowUpReason:      r.Reason,
 		FollowUpProcessedIn: r.ProcessedIn,
+		FollowUpMSPTurnID:   r.MSPTurnID,
 		FollowUpLedgerID:    ledgerID,
 	}
 }
@@ -1053,8 +1085,10 @@ func (t liveFollowUpTarget) attemptCheck(cmd commandMsg, p relayFollowUpPayload,
 		check.ConversationOK = metadataMatches && cmd.ConversationID != "" && cmd.ExpectedTurnID != "" &&
 			cmd.ConversationID == s.liveFollowUps.mspSession()
 		check.ApprovalPending = s.liveFollowUps.approvalPending()
-		running, foregroundDone := s.liveFollowUps.mspTurn()
-		check.NoActiveTurn = running == "" || foregroundDone
+		// A turn whose final answer has completed (or whose foreground is
+		// done) takes no steer: Muse dropped the ones it read there.
+		running, closing := s.liveFollowUps.mspTurn()
+		check.NoActiveTurn = running == "" || closing
 		check.TurnMismatch = !check.NoActiveTurn && running != cmd.ExpectedTurnID
 	case t.acp != nil && t.acpManager != nil:
 		s := t.acp
@@ -1179,6 +1213,12 @@ func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollo
 	// the interjection on the running prompt.
 	var answer <-chan liveFollowUpAnswer
 	var refusedAtStdin *relayFollowUpRow
+	// Muse Code: the steer's commandId, by which its own userMessage item and
+	// turn are recognised (awaitMSPPlacement).
+	mspCommandID := ""
+	if kind == museCodeCliAgentID {
+		mspCommandID, _ = mspFollowUpCommandID(attemptID, cmd.Ts)
+	}
 	err = send(cmd.SessionID, frame, func() error {
 		recheck := check
 		recheck.Now = time.Now()
@@ -1197,6 +1237,9 @@ func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollo
 			return errFollowUpRefusedAtStdin
 		}
 		answer = ch
+		if mspCommandID != "" {
+			tracker.mspWatchSteer(rpcID, mspCommandID, cmd.ExpectedTurnID)
+		}
 		return nil
 	})
 	if refusedAtStdin != nil {
@@ -1207,6 +1250,7 @@ func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollo
 		if answer == nil {
 			// Refused before the stdin boundary (the session ended, or its
 			// Send rejected the frame): nothing was written.
+			tracker.forget(rpcID)
 			reason := followUpReasonCliRefused
 			if status() != "running" {
 				reason = followUpReasonSessionNotRunning
@@ -1244,6 +1288,10 @@ func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollo
 	}
 	select {
 	case a := <-answer:
+		if kind == museCodeCliAgentID {
+			settleMSPLiveFollowUp(publish, ledger, tracker, rpcID, attemptID, p.FollowUpID, cmd.SessionID, a, check)
+			return
+		}
 		publish(settleLiveFollowUpAnswer(ledger, kind, attemptID, a))
 	case <-timer.C:
 		// No answer yet: unknown now, and a success that still arrives within
@@ -1273,6 +1321,52 @@ func settleLiveFollowUpAnswer(ledger *relayFollowUpLedger, kind, attemptID strin
 	return ledger.Settle(attemptID, v.State, v.Reason, processedIn)
 }
 
+// settleMSPLiveFollowUp settles a Muse Code steer from Muse's answer AND from
+// what Muse then does. A refusal, an unrecognised answer or the host's exit is
+// settled at once, as for the other kinds. A steer Muse took for the running
+// turn is settled only once Muse is seen running it: written `current` when
+// its userMessage is in that turn, written `next` (with Muse's turn id for
+// it) when Muse runs it as a turn of its own, and `unknown` (unplaced) when
+// neither is seen by the attempt's expiry or soon after that turn ended. The
+// attempt stays in flight meanwhile, so a redelivery publishes nothing. A
+// placement seen after the unknown, while the broker can still take it,
+// lifts it to written.
+func settleMSPLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollowUpLedger, tracker *liveFollowUpTracker, rpcID, attemptID, followUpID, sessionID string, a liveFollowUpAnswer, check followUpAttemptCheck) {
+	if a.Exited {
+		tracker.forget(rpcID)
+		publish(ledger.Settle(attemptID, followUpRowUnknown, followUpReasonNoAnswer, ""))
+		return
+	}
+	v := classifyMSPSteerAnswer(a.Frame, a.ExpectedTurnID)
+	if v.State != followUpRowWritten {
+		tracker.forget(rpcID)
+		publish(ledger.Settle(attemptID, v.State, v.Reason, ""))
+		return
+	}
+	expires := time.UnixMilli(check.expiresAtMs())
+	if pl, ok := tracker.awaitMSPPlacement(rpcID, expires, true); ok {
+		tracker.forget(rpcID)
+		if pl.exited {
+			publish(ledger.Settle(attemptID, followUpRowUnknown, followUpReasonNoAnswer, ""))
+			return
+		}
+		publish(ledger.SettlePlaced(attemptID, pl.processedIn, pl.turnID))
+		return
+	}
+	publish(ledger.Settle(attemptID, followUpRowUnknown, followUpReasonUnplaced, ""))
+	go func() {
+		defer tracker.forget(rpcID)
+		pl, ok := tracker.awaitMSPPlacement(rpcID, expires.Add(followUpSkewMargin), false)
+		if !ok || pl.exited {
+			return
+		}
+		if row, ok := ledger.LateWritten(attemptID, followUpID, sessionID, pl.processedIn, pl.turnID); ok {
+			fmt.Printf("%s[follow-up] attempt %s seen running after it was answered unknown: written%s\n", colorCyan, attemptID, colorReset)
+			publish(row)
+		}
+	}()
+}
+
 // liveFollowUpProcessedIn is where a written attempt went: the running turn,
 // or (OpenCode) held for the next prompt.
 func liveFollowUpProcessedIn(kind string, a liveFollowUpAnswer) string {
@@ -1299,7 +1393,17 @@ func awaitLateLiveFollowUpAnswer(publish func(relayFollowUpRow), ledger *relayFo
 		if a.Exited || classifyLiveFollowUpAnswerFor(kind, a).State != followUpRowWritten {
 			return
 		}
-		if row, ok := ledger.LateWritten(attemptID, followUpID, sessionID, liveFollowUpProcessedIn(kind, a)); ok {
+		processedIn, mspTurnID := liveFollowUpProcessedIn(kind, a), ""
+		if isMSPDriverKind(kind) {
+			// Muse's answer does not say where the steer runs: only seeing
+			// it run does.
+			pl, ok := tracker.awaitMSPPlacement(rpcID, deadline, false)
+			if !ok || pl.exited {
+				return
+			}
+			processedIn, mspTurnID = pl.processedIn, pl.turnID
+		}
+		if row, ok := ledger.LateWritten(attemptID, followUpID, sessionID, processedIn, mspTurnID); ok {
 			fmt.Printf("%s[follow-up] attempt %s answered after the timeout: written%s\n", colorCyan, attemptID, colorReset)
 			publish(row)
 		}
