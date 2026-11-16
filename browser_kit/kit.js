@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.25';
+  var VERSION = 'aix-1.0.26';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1827,8 +1827,7 @@
   // The visible submit-class controls of a form (inside it, or tied to it with form=).
   function formSubmitControls(form) {
     var seen = new Set(), out = [];
-    // The prototype getter: a control named "elements" shadows the form's own property.
-    var cands = Array.prototype.slice.call(FORM_ELEMENTS.call(form)).concat(Array.prototype.slice.call(form.querySelectorAll('[role=button], a[href]')));
+    var cands = formControls(form).concat(Array.prototype.slice.call(form.querySelectorAll('[role=button], a[href]')));
     for (var i = 0; i < cands.length && out.length < 10; i++) {
       var c = cands[i];
       if (seen.has(c) || inOwnUi(c)) continue;
@@ -2007,6 +2006,23 @@
   // The controls come from the form's own `elements` getter (a control named "elements" shadows
   // the property) or, for a control outside any form, from its container.
   var FORM_ELEMENTS = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'elements').get;
+  var INPUT_FORM = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'form').get;
+  // A form's controls in tree order, image buttons included. `elements` leaves out
+  // <input type=image> ("for historical reasons"), yet one submits its form like any submit
+  // button, so they are added back: those whose form owner is this form (inside it, or tied to
+  // it with form=), from the form's own tree, which is where `elements` looks too.
+  function formControls(form) {
+    var els = Array.prototype.slice.call(FORM_ELEMENTS.call(form));
+    var root = form.getRootNode ? form.getRootNode() : document;
+    var imgs = Array.prototype.filter.call(root.querySelectorAll('input[type="image" i]'), function (el) {
+      return el.type === 'image' && INPUT_FORM.call(el) === form;
+    });
+    if (!imgs.length) return els;
+    return els.concat(imgs).sort(function (x, y) {
+      return x === y ? 0 : (x.compareDocumentPosition(y) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1;
+    });
+  }
+  function isImageButton(el) { return !!el && el.tagName === 'INPUT' && el.type === 'image'; }
   // raw: keep sensitive values too (only for comparisons that never leave the page).
   // The values one control contributes to a submission, by the form data set's rules: null for a
   // control that contributes nothing (a button, an unnamed or disabled control, the kit's own UI).
@@ -2044,13 +2060,14 @@
     });
     return out;
   }
-  // Where the approved control's own pair sits among its name's values in the submission: how many
-  // values of that name come before the control in tree order, read from the LIVE page at the
+  // Where the approved control's own entry sits among one name's values in the submission (its
+  // name=value pair, or an image button's name.x / name.y): how many values of that name come
+  // before the control in tree order, read from the LIVE page at the
   // moment of submission (a handler may have moved the control). -1 when it cannot be read.
   function submitterIndex(a, name) {
     var c = a.el && a.el.deref(), form = a.form && a.form.deref();
     if (!c || !form) return -1;
-    var els = FORM_ELEMENTS.call(form), count = 0;
+    var els = formControls(form), count = 0;
     for (var i = 0; i < els.length; i++) {
       if (els[i] === c) return count;
       var cv = controlValues(els[i]);
@@ -2115,22 +2132,35 @@
   // name=value (approved too: it is part of the destination reading), which may share a name
   // with a field. So either reading holds: exactly the approved fields (a native submit()), or
   // those plus the approved control's own pair (the control's activation).
+  // An image button sends where it was pressed instead of its value: name.x and name.y (x and y
+  // when it has no name), whole numbers, at its place in tree order. Those may share a name with
+  // a field too (a field named x), so they are taken out the same way.
   // by: the approved data in the outgoing data's own serialization (a.payload.byGet for a query).
   function outgoingHolds(a, now, by) {
     by = by || a.payload.by;
     if (entriesHold(by, now)) return true;
-    var c = a.el && a.el.deref && a.el.deref(), name = c && c.getAttribute && c.getAttribute('name');
-    if (!name || lower(c.getAttribute('type') || '') === 'image' || !now || !now[name]) return false;
-    // The control's own pair sits at the control's place in tree order: take out exactly that
-    // entry (never just the first equal value: with action=save, action=edit and a button
-    // action=save, that would reorder an unchanged form), keep the rest in order.
-    var idx = submitterIndex(a, name), list = now[name];
-    if (idx < 0 || idx >= list.length || eol(list[idx]) !== eol(c.getAttribute('value') || '')) return false;
+    var c = a.el && a.el.deref && a.el.deref(), name = (c && c.getAttribute && c.getAttribute('name')) || '';
+    if (!c || !now) return false;
+    var image = isImageButton(c);
+    if (!image && (!name || !now[name])) return false;
     var without = Object.create(null);
     for (var k in now) without[k] = now[k].slice();
-    without[name] = list.slice(0, idx).concat(list.slice(idx + 1));
-    return entriesHold(by, without);
+    // The control's own entry sits at the control's place in tree order: take out exactly that
+    // entry (never just the first equal value: with action=save, action=edit and a button
+    // action=save, that would reorder an unchanged form), keep the rest in order.
+    function takeOut(key, matches) {
+      var idx = submitterIndex(a, key), list = without[key];
+      if (!list || idx < 0 || idx >= list.length || !matches(list[idx])) return false;
+      without[key] = list.slice(0, idx).concat(list.slice(idx + 1));
+      return true;
+    }
+    var prefix = name ? name + '.' : '';
+    var taken = image
+      ? takeOut(prefix + 'x', isCoordinate) && takeOut(prefix + 'y', isCoordinate)
+      : takeOut(name, function (v) { return eol(v) === eol(c.getAttribute('value') || ''); });
+    return taken && entriesHold(by, without);
   }
+  function isCoordinate(v) { return /^-?\d+$/.test(String(v)); }
   // What a navigation's form data carries, as name -> [values]; a file as name␟size, as
   // submittedData reads it. null when it cannot be read (then nothing is allowed).
   function formDataEntries(fd) {

@@ -33,7 +33,10 @@ package main
 //     hidden iframe is blocked by the network backstop;
 //   - a value a blur handler clears is reported mismatch, not filled;
 //   - same-named form-less radios in two shadow roots are two groups;
-//   - an option inside a disabled <optgroup> is never chosen.
+//   - an option inside a disabled <optgroup> is never chosen;
+//   - an image button (left out of form.elements) is its form's submit control,
+//     inside the form or tied to it with form=, and its press's x / y never
+//     make an unchanged form read as changed.
 
 import (
 	"context"
@@ -103,6 +106,8 @@ second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <span id="cb32l">Attending</span><button type="button" id="cb32" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="lb32" aria-labelledby="cb32l">Choose</button><ul id="lb32" role="listbox" hidden><li role="option">No</li><li role="option">Not sure</li><li role="option">Yes</li></ul>
 <form id="sci"><label for="ex33">Exponent</label><input id="ex33" name="exponent"><label for="co34">Coordinates</label><input id="co34" name="coords"></form>
 <form id="upl35" method="get" action="/got35"><label for="att35">Attachment</label><input type="file" id="att35" name="attachment"><label for="u35">Upsilon three</label><input id="u35" name="ups" value="thirtyfive"><button type="submit">Send upload</button></form>
+<form id="img36" method="post" action="/posted36"><label for="i36">Iota six</label><input id="i36" name="iota" value="thirtysix"><input type="image" alt="Send image six" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='24'%3E%3Crect width='80' height='24' fill='%23336'/%3E%3C/svg%3E" width="80" height="24"></form>
+<form id="img37" method="post" action="/posted37"><label for="x37">X mark</label><input id="x37" name="x" value="seven"></form><input type="image" form="img37" alt="Send x mark" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='24'%3E%3Crect width='80' height='24' fill='%23336'/%3E%3C/svg%3E" width="80" height="24">
 <form id="tiers"><label for="tier">Tier</label><select id="tier" name="tier"><option value="">Choose</option><option value="cheap">Standard</option><option value="expensive">Standard</option></select></form>
 <form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
@@ -220,7 +225,14 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 
 	var mu sync.Mutex
 	hits := map[string]int{}
+	posted := map[string]map[string][]string{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && (r.URL.Path == "/posted36" || r.URL.Path == "/posted37") {
+			_ = r.ParseForm()
+			mu.Lock()
+			posted[r.URL.Path] = r.PostForm
+			mu.Unlock()
+		}
 		mu.Lock()
 		hits[r.Method+" "+r.URL.Path]++
 		mu.Unlock()
@@ -907,6 +919,60 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	for _, b := range res.(browserReadResult).Buttons {
 		refs[b.Text] = b.Ref
+	}
+
+	// 4d36. A form whose only submit control is an image button, which form.elements leaves
+	// out: read lists it as the form's submit control, preparing by the form's ref finds it,
+	// and the approved submission posts (with the press's x / y).
+	// 4d37. An image button tied to its form from outside it (form=), in a form with a field
+	// named x: the press adds its own x and y after the field's, and the unchanged form is
+	// submitted, not refused.
+	for i, tc := range []struct{ button, path string }{{"Send image six", "/posted36"}, {"Send x mark", "/posted37"}} {
+		n := 36 + i
+		formRef := ""
+		for _, f := range res.(browserReadResult).Forms {
+			for _, c := range f.SubmitControls {
+				if c.Text == tc.button {
+					formRef = f.FormRef
+				}
+			}
+		}
+		if formRef == "" {
+			t.Fatalf("4d%d: the image button is not among its form's submit controls: %+v", n, res.(browserReadResult).Forms)
+		}
+		prep = prepare(formRef)
+		if prep.SubmitText != tc.button {
+			t.Fatalf("4d%d: prepared by the form's ref: %+v", n, prep)
+		}
+		r, err := run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: fmt.Sprintf("r%d", n)})
+		if err != nil || hit("POST "+tc.path) != 1 || !r.(browserClickResult).Navigated {
+			t.Fatalf("4d%d: approved image button: %v posted=%d %+v", n, err, hit("POST "+tc.path), r)
+		}
+		mu.Lock()
+		got := posted[tc.path]
+		mu.Unlock()
+		wantX := 1
+		if n == 37 {
+			wantX = 2
+			if len(got["x"]) != 2 || got["x"][0] != "seven" {
+				t.Fatalf("4d37: the field x must come first, then the press: %v", got)
+			}
+		} else if len(got["iota"]) != 1 || got["iota"][0] != "thirtysix" {
+			t.Fatalf("4d36: posted %v", got)
+		}
+		if len(got["x"]) != wantX || len(got["y"]) != 1 {
+			t.Fatalf("4d%d: the press's coordinates: %v", n, got)
+		}
+		if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+			t.Fatal(err)
+		}
+		res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, b := range res.(browserReadResult).Buttons {
+			refs[b.Text] = b.Ref
+		}
 	}
 
 	// 4d23. An approved POST form whose button's click handler switches it to GET and submits
