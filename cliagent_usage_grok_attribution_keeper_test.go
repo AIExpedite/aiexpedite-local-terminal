@@ -129,12 +129,15 @@ func TestGrokBillingAttributionKeeper_IsRefCountedAndReleaseIsIdempotent(t *test
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "5ms")
 
 	first := startGrokBillingAttributionKeeper("acct-1")
+	defer first()
 	second := startGrokBillingAttributionKeeper("acct-1")
+	defer second()
 	first()
 	first() // idempotent
 
 	grokAttributionKeeperMu.Lock()
 	refs, running := grokAttributionKeeperRefs, grokAttributionKeeperStop != nil
+	done := grokAttributionKeeperDone
 	grokAttributionKeeperMu.Unlock()
 	if refs != 1 || !running {
 		t.Fatalf("refs = %d running = %v — one session ending stopped the other's keeper",
@@ -142,12 +145,53 @@ func TestGrokBillingAttributionKeeper_IsRefCountedAndReleaseIsIdempotent(t *test
 	}
 
 	second()
+	select {
+	case <-done:
+	default:
+		t.Fatal("last release returned before the keeper exited; a tick can outlive temporary log cleanup")
+	}
 	grokAttributionKeeperMu.Lock()
 	refs, running = grokAttributionKeeperRefs, grokAttributionKeeperStop != nil
 	grokAttributionKeeperMu.Unlock()
 	if refs != 0 || running {
 		t.Fatalf("refs = %d running = %v — the last release did not stop the keeper",
 			refs, running)
+	}
+}
+
+// Hold the worker's exit acknowledgement so a stop-only release cannot pass
+// merely because the scheduler happened to finish the worker first.
+func TestGrokBillingAttributionKeeper_LastReleaseWaitsForWorkerExit(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+	finish := startGrokBillingAttributionKeeper("acct-1")
+
+	grokAttributionKeeperMu.Lock()
+	workerDone := grokAttributionKeeperDone
+	exitAcknowledged := make(chan struct{})
+	grokAttributionKeeperDone = exitAcknowledged
+	grokAttributionKeeperMu.Unlock()
+	released := make(chan struct{})
+	go func() {
+		finish()
+		close(released)
+	}()
+	t.Cleanup(func() {
+		close(exitAcknowledged)
+		<-released
+	})
+
+	select {
+	case <-workerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("last release did not stop the worker")
+	}
+	select {
+	case <-released:
+		t.Fatal("last release returned without waiting for worker exit acknowledgement")
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
