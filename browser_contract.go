@@ -73,6 +73,7 @@ const (
 const (
 	browserOutcomeFilled            = "filled"
 	browserOutcomeFilledThenHidden  = "filled-then-hidden"
+	browserOutcomeMismatch          = "mismatch"
 	browserOutcomeAlreadySet        = "already-set"
 	browserOutcomeNotFound          = "not-found"
 	browserOutcomeNoMatch           = "no-match"
@@ -107,10 +108,20 @@ const (
 	// The DevTools connection closes after this long unused: Chrome asks
 	// "Allow remote debugging?" once per connection, so it is kept while used.
 	browserCDPIdleClose = 10 * time.Minute
+	// After a prepareSubmit the connection (and so the kit's refs, which live
+	// in the page's isolated world for as long as the connection does) stays
+	// open at least this long: a prepared request lives 15 minutes, plus the
+	// 10 s undo window, plus the execute grace, so a late approval still finds
+	// the control it approved.
+	browserCDPPrepareHold = 20 * time.Minute
 	// A command whose signed deadline is further away than this is clamped.
 	browserMaxOpDuration = 5 * time.Minute
 	// Time kept back from a command's deadline to post its result.
 	browserResultMargin = 1500 * time.Millisecond
+	// The most a result's own JSON may take: terminal-service stores at most
+	// 900,000 bytes of it (MAX_STORED_RESULT_BYTES) and refuses a larger one,
+	// so the agent trims to this, with room for encoding differences.
+	browserResultBudget = 880_000
 	// How long the result poster keeps retrying a 5xx / network failure.
 	browserResultRetryWindow = 60 * time.Second
 )

@@ -26,6 +26,11 @@ package main
 //     stopped, while a token written into an empty hidden input is allowed;
 //   - an unapproved click whose handler posts a new form into a hidden iframe
 //     is blocked by the network backstop;
+//   - an approved button whose handler natively submits a SECOND form to the
+//     same action with other values is refused (the outgoing data counts);
+//   - an unapproved click whose handler sends a GET form with data into a
+//     hidden iframe is blocked by the network backstop;
+//   - a value a blur handler clears is reported mismatch, not filled;
 //   - same-named form-less radios in two shadow roots are two groups;
 //   - an option inside a disabled <optgroup> is never chosen.
 
@@ -63,10 +68,13 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
   <label for="country">Country</label><select id="country" name="country"><option value="">Choose</option><option value="DE">Germany</option><option value="FR">France</option></select>
 </form>
 <form id="shadowed" method="post" action="/posted8"><label for="el">Elements</label><input id="el" name="elements" value="x"><button type="submit">Send eta</button></form>
+<form id="clearing"><label for="nu">Nu</label><input id="nu" name="nu"></form>
 <form id="retheta"><label for="th">Theta</label><input id="th" name="theta"></form>
 <form id="tamper" method="post" action="/posted9"><label for="io">Iota</label><input id="io" name="iota" value="nine"><input type="hidden" id="amt9" name="amount" value="10.00"><button id="send9" type="submit">Send iota</button></form>
 <form id="token" method="post" action="/posted10"><label for="ka">Kappa</label><input id="ka" name="kappa" value="ten"><input type="hidden" id="tok10" name="captcha" value=""><button id="send10" type="submit">Send kappa</button></form>
 <button id="sneaky" type="button">Show more</button>
+<form id="forge" method="post" action="/posted11"><label for="mu">Mu</label><input id="mu" name="mu" value="eleven"><input type="hidden" name="amount" value="10.00"><button id="send11" type="submit">Send mu</button></form>
+<button id="peek" type="button">More options</button>
 <div id="radios1"></div><div id="radios2"></div>
 <form id="plans"><label for="plan">Plan</label><select id="plan" name="plan"><option value="">Choose</option><optgroup label="Old" disabled><option>Legacy</option></optgroup><option>Basic</option></select></form>
 <div id="shadowhost"></div>
@@ -80,12 +88,26 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
   var r = document.getElementById(x[0]).attachShadow({ mode: 'open' });
   r.innerHTML = '<fieldset><legend>' + x[1] + '</legend><label><input type="radio" name="agree" value="yes"> Yes</label><label><input type="radio" name="agree" value="no"> No</label></fieldset>';
 });
+document.getElementById('nu').addEventListener('blur', function () { this.value = ''; });
 document.getElementById('send9').addEventListener('click', function () { document.getElementById('amt9').value = '1000.00'; });
 document.getElementById('send10').addEventListener('click', function () { document.getElementById('tok10').value = 'tok-abc'; });
 document.getElementById('sneaky').addEventListener('click', function () {
   var f = document.createElement('iframe'); f.name = 'sink'; f.style.display = 'none'; document.body.appendChild(f);
   var fm = document.createElement('form'); fm.method = 'post'; fm.action = '/sneaky'; fm.target = 'sink';
   var i = document.createElement('input'); i.name = 'x'; i.value = 'y'; fm.appendChild(i); document.body.appendChild(fm);
+  fm.submit();
+});
+document.getElementById('send11').addEventListener('click', function (e) {
+  e.preventDefault();
+  var fm = document.createElement('form'); fm.method = 'post'; fm.action = '/posted11';
+  [['mu', 'eleven'], ['amount', '9999']].forEach(function (p) { var i = document.createElement('input'); i.type = 'hidden'; i.name = p[0]; i.value = p[1]; fm.appendChild(i); });
+  document.body.appendChild(fm);
+  HTMLFormElement.prototype.submit.call(fm);
+});
+document.getElementById('peek').addEventListener('click', function () {
+  var f = document.createElement('iframe'); f.name = 'sink2'; f.style.display = 'none'; document.body.appendChild(f);
+  var fm = document.createElement('form'); fm.method = 'get'; fm.action = '/peek'; fm.target = 'sink2';
+  var i = document.createElement('input'); i.name = 'q'; i.value = 'secret'; fm.appendChild(i); document.body.appendChild(fm);
   fm.submit();
 });
 var sr = document.getElementById('shadowhost').attachShadow({ mode: 'open' });
@@ -239,6 +261,16 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 		t.Fatalf("a repurposed field was written: %q", v)
 	}
 
+	// A field whose blur handler clears the value: the read-back comes after
+	// the blur, so it is reported as not holding the value, never as filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Nu", Value: "hello"}}})
+	if err != nil {
+		t.Fatalf("fill nu: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a value the blur handler cleared: %+v", o)
+	}
+
 	// 1. The destination changes after approval: refused, nothing posted anywhere.
 	prep := prepare(refs["Send alpha"])
 	if _, err := pg.Eval(ctx, `document.getElementById('go').setAttribute('formaction', '/elsewhere'); 'ok'`); err != nil {
@@ -367,6 +399,31 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if n := hit("POST /sneaky"); n != 0 {
 		t.Fatalf("an unapproved click posted a form %d time(s)", n)
+	}
+
+	// 4d. An approved submit button whose click handler cancels the approved
+	// post and natively submits a SECOND form to the same action with other
+	// values (amount 9999): the outgoing data is not what was approved, so
+	// nothing reaches the server and the submit reports the form changed.
+	prep = prepare(refs["Send mu"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r11"})
+	time.Sleep(500 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted11") != 0 {
+		t.Fatalf("forged second form: %v posted11=%d", err, hit("POST /posted11"))
+	}
+
+	// 4e. An unapproved, non-submit-class button whose handler submits a GET
+	// form carrying data into a new hidden iframe: no GET with that data
+	// reaches the server.
+	if refs["More options"] == "" {
+		t.Fatalf("no More options button: %+v", refs)
+	}
+	if _, err := run(browserParams{Op: browserOpClick, TabID: tab, Ref: refs["More options"]}); err != nil {
+		t.Fatalf("click more options: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n := hit("GET /peek"); n != 0 {
+		t.Fatalf("an unapproved click sent a GET form into an iframe %d time(s)", n)
 	}
 
 	// 5. A control inside an open shadow root is clicked, not reported covered.

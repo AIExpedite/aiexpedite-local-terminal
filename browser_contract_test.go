@@ -56,6 +56,7 @@ func TestBrowserContractPins(t *testing.T) {
 		{browserErrScreenshotNotFound, "BROWSER_SCREENSHOT_NOT_FOUND"},
 		{browserOutcomeFilled, "filled"},
 		{browserOutcomeFilledThenHidden, "filled-then-hidden"},
+		{browserOutcomeMismatch, "mismatch"},
 		{browserOutcomeAlreadySet, "already-set"},
 		{browserOutcomeNotFound, "not-found"},
 		{browserOutcomeNoMatch, "no-match"},
@@ -115,7 +116,7 @@ func TestBrowserControlCapabilityShape(t *testing.T) {
 // The kit and the Chrome helper are embedded, and every kit call the agent
 // makes exists in the kit.
 func TestBrowserKitEmbedded(t *testing.T) {
-	if !strings.Contains(browserKitJS, "var VERSION = 'aix-1.0.9'") {
+	if !strings.Contains(browserKitJS, "var VERSION = 'aix-1.0.10'") {
 		t.Fatal("kit version missing")
 	}
 	for _, name := range []string{"ping", "scan", "snapshot", "fingerprint", "check", "begin", "end", "status", "fillStep",

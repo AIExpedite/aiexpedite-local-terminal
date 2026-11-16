@@ -169,6 +169,20 @@ func TestFitBrowserResult(t *testing.T) {
 	if got := fitBrowserResult(small); got.Result == nil || !got.OK {
 		t.Fatal("a small result must pass unchanged")
 	}
+	// A read between terminal-service's stored-result budget (900,000 bytes)
+	// and the body cap is trimmed to the budget, not sent to be refused.
+	mid := browserReadResult{TabID: "d:A", Text: strings.Repeat("word ", 4000)}
+	for i := 0; i < browserMaxReadItems; i++ {
+		mid.Links = append(mid.Links, browserReadLink{Ref: "f1_a", Text: "x", Href: "https://example.com/" + strings.Repeat("p", 3100)})
+	}
+	if raw, _ := encodeBrowserJSON(mid); len(raw) <= 900_000 || len(raw) > browserMaxResultBytes-4096 {
+		t.Fatalf("fixture size %d", len(raw))
+	}
+	body = fitBrowserResult(browserResultBody{V: 1, CommandID: "c", OK: true, Result: mid})
+	res, _ := encodeBrowserJSON(body.Result)
+	if !body.OK || len(res) > 880_000 || len(body.Result.(browserReadResult).Links) == 0 {
+		t.Fatalf("mid: ok=%v result size=%d", body.OK, len(res))
+	}
 	huge := browserResultBody{V: 1, CommandID: "c", OK: true, Result: map[string]any{"a": strings.Repeat("x", browserMaxResultBytes)}}
 	if got := fitBrowserResult(huge); got.OK || got.Error == nil {
 		t.Fatal("an oversized result that cannot shrink must become an error")

@@ -2322,6 +2322,9 @@ func runPubSubConnection(cfg *Config) error {
 				return
 			}
 			defer releasePublish()
+			// The browser front door waits on its own result, not the topic.
+			globalBrowserDispatcher.refuseBeforeAdmission(cmd, cfg.AgentID, cfg.CommandSecret,
+				browserErrCommandTimeout, browserStaleRefusal)
 			if err := publishMsg(ctx, topic, res); err != nil {
 				m.Nack()
 			} else {
@@ -2361,6 +2364,9 @@ func runPubSubConnection(cfg *Config) error {
 				return
 			}
 			defer releasePublish()
+			// The browser front door waits on its own result, not the topic.
+			globalBrowserDispatcher.refuseBeforeAdmission(cmd, cfg.AgentID, cfg.CommandSecret,
+				browserErrDeviceOffline, browserRateLimitedRefusal)
 			if err := publishMsg(ctx, topic, res); err != nil {
 				m.Nack()
 			} else {

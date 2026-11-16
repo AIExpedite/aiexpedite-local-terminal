@@ -36,7 +36,10 @@ type browserDispatcher struct {
 	poster func() browserPoster
 	route  func(ctx context.Context, tabRoute string) (browserRouteChoice, *browserError)
 	open   func(ctx context.Context, c browserRouteChoice) (browserBackend, func(), error)
-	now    func() time.Time
+	// hold keeps the DevTools connection open for at least the given time
+	// (after a prepareSubmit; see browserCDPPrepareHold).
+	hold func(time.Duration)
+	now  func() time.Time
 	// done is called after a command's result was posted (tests wait on it).
 	done func(commandID string)
 }
@@ -61,6 +64,7 @@ func newBrowserDispatcher() *browserDispatcher {
 			return chooseBrowserRoute(ctx, runtime.GOOS, tabRoute, discoverChromeDevTools)
 		},
 		open: openBrowserBackend,
+		hold: globalCDPManager.holdFor,
 		now:  time.Now,
 	}
 }
@@ -149,12 +153,43 @@ func (d *browserDispatcher) handle(cmd commandMsg) {
 // refuseWhileDraining answers a browser command the update drain refused, so
 // the person hears why at once instead of waiting for the command to expire.
 func (d *browserDispatcher) refuseWhileDraining(cmd commandMsg) {
+	d.refuse(cmd, browserErrDeviceOffline, "the desktop app is updating; try again in a minute")
+}
+
+// The words a `__browser__` refused before admission carries (SPEC Round 2).
+const (
+	browserStaleRefusal       = "The request reached your computer too late."
+	browserRateLimitedRefusal = "Your computer is busy; try again in a moment."
+)
+
+// refuseBeforeAdmission answers a `__browser__` command that pubsub refused as
+// stale or rate-limited, on the same path as the drain refusal, so the person
+// hears why at once instead of waiting for the command to expire. Those checks
+// run BEFORE the command's signature is verified, so it is verified here: an
+// unsigned or forged message, or one for another agent, never makes this agent
+// post a result against a command id it names. Reports whether one was posted.
+func (d *browserDispatcher) refuseBeforeAdmission(cmd commandMsg, agentID, secret, code, message string) bool {
+	if cmd.Command != browserDeviceCommand || secret == "" {
+		return false
+	}
+	if cmd.AgentID != "" && cmd.AgentID != agentID {
+		return false
+	}
+	if cmd.Signature == "" || !verifySignature(cmd, secret) {
+		return false
+	}
+	return d.refuse(cmd, code, message)
+}
+
+func (d *browserDispatcher) refuse(cmd commandMsg, code, message string) bool {
 	start := d.now()
 	_, id, _ := parseBrowserCommand(cmd, start)
 	if id == "" || !d.firstSight(id, start) {
-		return
+		return false
 	}
-	d.finish(id, start, "", nil, browserErr(browserErrDeviceOffline, "the desktop app is updating; try again in a minute"))
+	logBrowser(id, "refused before admission: "+code)
+	d.finish(id, start, "", nil, browserErr(code, "%s", message))
+	return true
 }
 
 func (d *browserDispatcher) firstSight(id string, now time.Time) bool {
@@ -248,6 +283,11 @@ func (d *browserDispatcher) execute(id string, start, deadline time.Time, p brow
 	}
 	run := &browserOpRun{p: p, be: be, stop: stop}
 	result, err := run.run(ctx)
+	if err == nil && p.Op == browserOpPrepareSubmit && choice.Route == browserRouteDevTools && d.hold != nil {
+		// Taken before release, so the idle clock release starts already
+		// covers the time the person has to approve.
+		d.hold(browserCDPPrepareHold)
+	}
 	release()
 	if err != nil {
 		d.finish(id, start, choice.Route, nil, classifyBrowserError(err, ctx))

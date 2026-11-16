@@ -362,15 +362,19 @@ func (cn *cdpConn) page(ctx context.Context, targetID string) (*cdpPage, error) 
 
 // cdpManager owns the ONE connection. acquire hands it out (dialling when there
 // is none, or when Chrome restarted on another endpoint); release starts the
-// idle clock when nobody uses it.
+// idle clock when nobody uses it. holdFor keeps it open at least until a later
+// time (a prepared submit's refs live in the page's isolated world, which goes
+// away with the connection).
 type cdpManager struct {
-	mu      sync.Mutex
-	conn    *cdpConn
-	users   int
-	dialing chan struct{}
-	idle    *time.Timer
-	idleFor time.Duration
-	dial    func(ctx context.Context, url string, onEvent func(string, string, json.RawMessage)) (*cdpClient, error)
+	mu        sync.Mutex
+	conn      *cdpConn
+	users     int
+	dialing   chan struct{}
+	idle      *time.Timer
+	idleFor   time.Duration
+	keepUntil time.Time
+	now       func() time.Time
+	dial      func(ctx context.Context, url string, onEvent func(string, string, json.RawMessage)) (*cdpClient, error)
 }
 
 var globalCDPManager = &cdpManager{idleFor: browserCDPIdleClose, dial: dialCDP}
@@ -442,29 +446,69 @@ func (m *cdpManager) releaser() func() {
 				m.users--
 			}
 			if m.users == 0 && m.conn != nil {
-				if m.idle != nil {
-					m.idle.Stop()
-				}
-				m.idle = time.AfterFunc(m.idleFor, m.closeIfIdle)
+				m.armIdleLocked()
 			}
 		})
+	}
+}
+
+func (m *cdpManager) clock() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
+}
+
+// idleDelayLocked: how long an unused connection stays open from now, the
+// idle period or until the hold ends, whichever is later.
+func (m *cdpManager) idleDelayLocked() time.Duration {
+	d := m.idleFor
+	if rest := m.keepUntil.Sub(m.clock()); rest > d {
+		d = rest
+	}
+	return d
+}
+
+func (m *cdpManager) armIdleLocked() {
+	if m.idle != nil {
+		m.idle.Stop()
+	}
+	m.idle = time.AfterFunc(m.idleDelayLocked(), m.closeIfIdle)
+}
+
+// holdFor keeps the connection open for at least d from now, even when unused.
+func (m *cdpManager) holdFor(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if until := m.clock().Add(d); until.After(m.keepUntil) {
+		m.keepUntil = until
+	}
+	if m.users == 0 && m.conn != nil {
+		m.armIdleLocked()
 	}
 }
 
 func (m *cdpManager) closeIfIdle() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.users == 0 && m.conn != nil {
-		m.conn.c.close()
-		m.conn = nil
-	}
 	m.idle = nil
+	if m.users != 0 || m.conn == nil {
+		return
+	}
+	if m.clock().Before(m.keepUntil) {
+		// A hold was taken after this timer was set: wait for it to end.
+		m.armIdleLocked()
+		return
+	}
+	m.conn.c.close()
+	m.conn = nil
 }
 
 // closeAll drops the connection now (agent shutdown).
 func (m *cdpManager) closeAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.keepUntil = time.Time{}
 	if m.idle != nil {
 		m.idle.Stop()
 		m.idle = nil

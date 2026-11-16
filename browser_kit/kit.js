@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.9';
+  var VERSION = 'aix-1.0.10';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1471,6 +1471,15 @@
           return { done: false, next: 'verify', waitMs: 150 };
         }
       }
+      if ((kind === 'text' || kind === 'datetime' || kind === 'contenteditable') && !pend.blurred && isFocused(el)) {
+        // Blur BEFORE the read-back: a blur or change handler may clear or rewrite the value (and
+        // blurring commits a trusted-input edit), so what is reported is what the field holds
+        // after those handlers ran and the page settled, never the value before them.
+        pend.blurred = true;
+        state.pending.set(ref, pend);
+        el.blur();
+        return { done: false, next: 'verify', waitMs: 150 };
+      }
       if (kind === 'contenteditable' && !pend.secondLook) {
         // An editor may reconcile and revert the DOM a moment later: look twice.
         pend.secondLook = true;
@@ -1499,7 +1508,6 @@
         if (!ok) dismiss(el);
       }
       else if (kind === 'contenteditable') { shown = norm(el.innerText); ok = looksSame(shown, value); }
-      if ((kind === 'text' || kind === 'datetime' || kind === 'contenteditable') && isFocused(el)) el.blur();
       var invalid = el.getAttribute && el.getAttribute('aria-invalid') === 'true';
       var userInvalid = false;
       try { userInvalid = el.matches && el.matches(':user-invalid'); } catch (e) { /* ignore */ }

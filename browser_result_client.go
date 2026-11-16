@@ -150,12 +150,21 @@ func (h *httpBrowserPoster) once(ctx context.Context, path string, q neturl.Valu
 	return resp.StatusCode, nil
 }
 
-// fitBrowserResult keeps a result body under BROWSER_LIMITS.MAX_RESULT_BYTES.
-// Only a read can grow that large: its page text is cut first, then its lists.
+// fitBrowserResult keeps a result body under BROWSER_LIMITS.MAX_RESULT_BYTES
+// (less a margin) AND its result under terminal-service's stored-result budget
+// (it refuses a result whose JSON is over 900,000 bytes; browserResultBudget
+// aims below that). Only a read can grow that large: its page text is cut
+// first, then its lists.
 func fitBrowserResult(body browserResultBody) browserResultBody {
-	limit := browserMaxResultBytes - 4096
-	raw, err := encodeBrowserJSON(body)
-	if err == nil && len(raw) <= limit {
+	fits := func(b browserResultBody) bool {
+		raw, err := encodeBrowserJSON(b)
+		if err != nil || len(raw) > browserMaxResultBytes-4096 {
+			return false
+		}
+		res, err := encodeBrowserJSON(b.Result)
+		return err == nil && len(res) <= browserResultBudget
+	}
+	if fits(body) {
 		return body
 	}
 	if rr, ok := body.Result.(browserReadResult); ok {
@@ -174,7 +183,7 @@ func fitBrowserResult(body browserResultBody) browserResultBody {
 				i = 12
 			}
 			body.Result = rr
-			if raw, err := encodeBrowserJSON(body); err == nil && len(raw) <= limit {
+			if fits(body) {
 				return body
 			}
 		}

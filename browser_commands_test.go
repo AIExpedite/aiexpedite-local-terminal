@@ -93,6 +93,7 @@ func newDispatcherHarness(t *testing.T, page *fakePage) *dispatcherHarness {
 	d.open = func(ctx context.Context, c browserRouteChoice) (browserBackend, func(), error) {
 		return h.be, func() {}, nil
 	}
+	d.hold = func(time.Duration) {} // never the agent's own DevTools connection
 	d.done = func(id string) { h.done <- id }
 	h.d = d
 	return h
@@ -283,5 +284,58 @@ func TestBrowserRefusedWhileDraining(t *testing.T) {
 	h.wait(t, 1)
 	if r := h.poster.byID("d1"); len(r) != 1 || r[0].Error.Code != browserErrDeviceOffline {
 		t.Fatalf("%+v", r)
+	}
+}
+
+// A `__browser__` refused as stale or rate-limited (pubsub checks both before
+// the signature) is answered on the browser result path too, with the Round 2
+// codes and words; only when its signature verifies and it names this agent.
+func TestBrowserRefusedBeforeAdmission(t *testing.T) {
+	const secret = "s3cret"
+	signed := func(id string, mutate func(*commandMsg)) commandMsg {
+		cmd := browserCmd(t, map[string]any{"v": 1, "commandId": id, "op": "read", "tabId": "d:T1"})
+		cmd.ID, cmd.AgentID, cmd.Ts = "m-"+id, "agent-1", time.Now().UnixMilli()
+		cmd.Signature = signFixture(t, cmd, secret)
+		if mutate != nil {
+			mutate(&cmd)
+		}
+		return cmd
+	}
+	h := newDispatcherHarness(t, &fakePage{id: "d:T1"})
+	if !h.d.refuseBeforeAdmission(signed("s1", nil), "agent-1", secret, browserErrCommandTimeout, browserStaleRefusal) {
+		t.Fatal("stale: not answered")
+	}
+	if !h.d.refuseBeforeAdmission(signed("r1", nil), "agent-1", secret, browserErrDeviceOffline, browserRateLimitedRefusal) {
+		t.Fatal("rate-limited: not answered")
+	}
+	h.wait(t, 2)
+	if r := h.poster.byID("s1"); len(r) != 1 || r[0].OK || r[0].Error.Code != browserErrCommandTimeout || r[0].Error.Message != "The request reached your computer too late." {
+		t.Fatalf("stale: %+v", r)
+	}
+	if r := h.poster.byID("r1"); len(r) != 1 || r[0].OK || r[0].Error.Code != browserErrDeviceOffline || r[0].Error.Message != "Your computer is busy; try again in a moment." {
+		t.Fatalf("rate-limited: %+v", r)
+	}
+	// A redelivery is answered once.
+	if h.d.refuseBeforeAdmission(signed("s1", nil), "agent-1", secret, browserErrCommandTimeout, browserStaleRefusal) {
+		t.Fatal("redelivery answered twice")
+	}
+	// Never for an unverified message, another agent's, or without a secret.
+	for name, c := range map[string]struct {
+		cmd           commandMsg
+		agent, secret string
+	}{
+		"unsigned":      {signed("u1", func(c *commandMsg) { c.Signature = "" }), "agent-1", secret},
+		"forged":        {signed("u2", func(c *commandMsg) { c.Args = []string{`{"v":1,"commandId":"u2","op":"tabs"}`} }), "agent-1", secret},
+		"other agent":   {signed("u3", nil), "agent-2", secret},
+		"no secret":     {signed("u4", nil), "agent-1", ""},
+		"not a browser": {signed("u5", func(c *commandMsg) { c.Command = "ls" }), "agent-1", secret},
+	} {
+		if h.d.refuseBeforeAdmission(c.cmd, c.agent, c.secret, browserErrCommandTimeout, browserStaleRefusal) {
+			t.Errorf("%s: answered", name)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := h.poster.count(); n != 2 {
+		t.Fatalf("%d results posted, want 2", n)
 	}
 }
