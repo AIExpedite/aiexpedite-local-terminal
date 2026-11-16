@@ -676,11 +676,8 @@ func (p *cdpPage) Screenshot(ctx context.Context, fullPage bool) (browserShot, e
 	return browserShot{}, errors.New("the page is too large to capture")
 }
 
-// Guard: while a fill runs, pause every document request of the tab. The kit
-// already cancels page-initiated navigations of the main frame, so a main-frame
-// GET that still arrives here was let through on purpose (the person clicked a
-// link) and continues. Everything else (a form posted into a hidden iframe, an
-// iframe sent somewhere, a main-frame POST) is failed and logged. Chrome drops
+// Guard: while a fill runs, pause every document request of the tab and let
+// guardContinues decide each one; the rest is failed and logged. Chrome drops
 // the interception by itself if this connection goes away.
 func (p *cdpPage) Guard(ctx context.Context, on bool) error {
 	return p.intercept(ctx, on, false)
@@ -712,7 +709,7 @@ func (p *cdpPage) answerPaused(id, frameID, method, rawURL string) {
 	p.guardMu.Lock()
 	allowGET := p.allowGET
 	p.guardMu.Unlock()
-	if method == "GET" && (mainFrame || allowGET) {
+	if guardContinues(method, mainFrame, allowGET, rawURL) {
 		_ = p.conn.c.Call(ctx, p.sessionID, "Fetch.continueRequest", map[string]any{"requestId": id}, nil)
 		return
 	}
@@ -726,6 +723,37 @@ func (p *cdpPage) answerPaused(id, frameID, method, rawURL string) {
 		p.guardLog = append(p.guardLog, map[string]any{"atMs": time.Now().UnixMilli(), "method": method, "url": where, "mainFrame": mainFrame})
 	}
 	p.guardMu.Unlock()
+}
+
+// guardContinues decides one paused document request while a guard is on.
+//
+//   - A main-frame GET continues: the kit already cancels page-initiated
+//     navigations of the main document, so one that arrives here was let
+//     through on purpose (a link the click followed).
+//   - During the click backstop (allowGET), a child frame may load a page too
+//     (content the click opened), but NOT one that carries a query: a GET form
+//     puts its data in the query, and a page handler can build one aimed at a
+//     new hidden iframe and submit it, which fires no submit event and never
+//     reaches the main document's navigation listener.
+//   - Everything else (any POST, a fill's child-frame loads) is failed.
+func guardContinues(method string, mainFrame, allowGET bool, rawURL string) bool {
+	if method != "GET" {
+		return false
+	}
+	if mainFrame {
+		return true
+	}
+	return allowGET && !urlCarriesQuery(rawURL)
+}
+
+// urlCarriesQuery: true for a URL with a query (even an empty "?"), and for one
+// that cannot be parsed (refused rather than guessed).
+func urlCarriesQuery(rawURL string) bool {
+	u, err := neturl.Parse(rawURL)
+	if err != nil {
+		return true
+	}
+	return u.RawQuery != "" || u.ForceQuery
 }
 
 func (p *cdpPage) GuardLog() []map[string]any {

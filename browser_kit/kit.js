@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.8';
+  var VERSION = 'aix-1.0.9';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -968,13 +968,28 @@
     if (!a || Date.now() > a.until + APPROVED_MS) return false;
     if (!(a.used || a.virtual || a.pressed)) return false;
     if (a.changed) return false;
-    if (!e.formData) return true;
+    var dest = e.destination && e.destination.url;
+    if (!e.formData) {
+      // A GET form sends its data in the URL. A navigation to where the approved form sends that
+      // carries a query is that form, or a page handler's copy of it: it must carry what was
+      // approved. Any other navigation without form data stays allowed (a script that saved by
+      // fetch and then shows its confirmation page).
+      if (!a.virtual && a.payload && dest && sendsToApprovedAction(a, dest) && hasQuery(dest) &&
+          !entriesHold(a.payload.by, queryEntries(dest))) {
+        a.changed = true;
+        return false;
+      }
+      return true;
+    }
     if (a.navUsed) return false;
     if (!a.virtual) {
       // Form data leaves only for the approved form: to an approved destination, carrying what
-      // was approved (checked again here, after every handler ran).
-      var dest = e.destination && e.destination.url;
-      if (!dest || a.actions.indexOf(String(dest).split('#')[0]) < 0 || !approvedPayloadHolds(a)) {
+      // was approved. Checked again here, after every handler ran, on BOTH the approved form as
+      // it is now and the data actually leaving: a click handler can build a second form with
+      // the same action and other values and call its native submit(), which fires no submit
+      // event and leaves the approved form's DOM untouched.
+      if (!dest || a.actions.indexOf(String(dest).split('#')[0]) < 0 || !approvedPayloadHolds(a) ||
+          (a.payload && !entriesHold(a.payload.by, formDataEntries(e.formData)))) {
         a.changed = true;
         return false;
       }
@@ -1843,14 +1858,47 @@
     if (c.form != null && c.form !== form) return false;
     var now = payloadOf({ control: c, form: form, container: form }), was = a.payload;
     if (now.dest !== was.dest) return false;
-    for (var name in was.by) {
-      var w = was.by[name];
+    return entriesHold(was.by, now.by);
+  }
+  // The one rule for "still carries what was approved": every name that held a value at
+  // approval holds exactly the same value(s); a name that was empty or absent may gain one
+  // (anti-bot and CSRF tokens written on the way out). now: name -> [values], or null.
+  function entriesHold(was, now) {
+    if (!now) return false;
+    for (var name in was) {
+      var w = was[name];
       if (!w.some(function (v) { return v !== ''; })) continue;
-      var n = (now.by[name] || []).slice().sort(), ws = w.slice().sort();
+      var n = (now[name] || []).slice().sort(), ws = w.slice().sort();
       if (n.length !== ws.length) return false;
       for (var i = 0; i < n.length; i++) if (n[i] !== ws[i]) return false;
     }
     return true;
+  }
+  // What a navigation's form data carries, as name -> [values]; a file as name␟size, as
+  // submittedData reads it. null when it cannot be read (then nothing is allowed).
+  function formDataEntries(fd) {
+    var out = Object.create(null);
+    try {
+      fd.forEach(function (v, k) {
+        var s = (typeof File !== 'undefined' && v instanceof File) ? (v.name + '␟' + v.size) : String(v);
+        (out[k] = out[k] || []).push(s);
+      });
+    } catch (e) { return null; }
+    return out;
+  }
+  function queryEntries(url) {
+    var out = Object.create(null);
+    try {
+      new URL(url, location.href).searchParams.forEach(function (v, k) { (out[k] = out[k] || []).push(v); });
+    } catch (e) { return null; }
+    return out;
+  }
+  function withoutQuery(url) { return String(url).split('#')[0].split('?')[0]; }
+  function hasQuery(url) { return withoutQuery(url) !== String(url).split('#')[0]; }
+  function sendsToApprovedAction(a, url) {
+    var u = withoutQuery(url);
+    for (var i = 0; i < a.actions.length; i++) if (withoutQuery(a.actions[i]) === u) return true;
+    return false;
   }
   // What the digest covers, in DOM order: the page, the form's identity, every field's identity
   // and current value, and the submit control. A sensitive value (a password the person typed)
