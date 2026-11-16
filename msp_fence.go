@@ -35,7 +35,10 @@
 //                                or `workspaceRoots`
 //       approval/decide          an approval the host asked for and has not
 //                                resolved, with one of ITS choices whose scope
-//                                is "once" and decision approved or denied
+//                                is "once" and decision approved, denied or
+//                                abort (Muse 1.4.20's "Reject": it rejects that
+//                                one call and the turn goes on). Never a
+//                                feedback text.
 //       session/setModel, session/setReasoningEffort, turn/interrupt,
 //       turn/cancel, model/list, usage/read, approval/listPending
 //   - Refused by name: `turn/steer` (only the device's follow-up ledger writes
@@ -251,8 +254,8 @@ func (f *acpClientFence) checkMSP(frame, root string) (acpFenceCheck, error) {
 		if !offered {
 			return acpFenceCheck{}, f.refuse("approval/decide selects a choice the request did not offer")
 		}
-		if choice.scope != mspApprovalScopeOnce || (choice.decision != mspApprovalApproved && choice.decision != mspApprovalDenied) {
-			return acpFenceCheck{}, f.refuse("approval/decide selects a %s %s choice (only a once-scoped approve or deny)", choice.scope, choice.decision)
+		if choice.scope != mspApprovalScopeOnce || !mspFenceAnswerDecision(choice.decision) {
+			return acpFenceCheck{}, f.refuse("approval/decide selects a %s %s choice (only a once-scoped approve, deny or reject)", choice.scope, choice.decision)
 		}
 	case mspMethodModelList:
 		if id, present := str("sessionId"); present && id != st.sessionID {
@@ -260,6 +263,24 @@ func (f *acpClientFence) checkMSP(frame, root string) (acpFenceCheck, error) {
 		}
 	}
 	return acpFenceCheck{}, nil
+}
+
+// mspFenceAnswerDecision reports whether a person's `approval/decide` may
+// select a choice with this decision (its scope must also be "once"): an
+// approve, or one of shared-constants MUSE_MSP_DENY_ONCE_DECISIONS. Muse Code
+// 1.4.20 offers no `denied` choice on a command approval; its "Reject" is
+// `abort`, scope "once", which rejects that one tool call (the item ends
+// `rejected`) while the turn goes on. Never a decision that saves a rule
+// (`approvedPolicyAmendment`, `deniedPolicyAmendment`) or grants the session.
+// Reported to terminal-service as MSP_DRIVERS protocol 2
+// (mspDriversProtocol): an app at protocol 1 refused `abort`, so it is never
+// sent one.
+func mspFenceAnswerDecision(decision string) bool {
+	switch decision {
+	case mspApprovalApproved, mspApprovalDenied, mspApprovalAbort:
+		return true
+	}
+	return false
 }
 
 // mspCheckInitializeParams refuses an `initialize` asking for anything but

@@ -95,7 +95,7 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// Muse Code on `muse serve` (both always present, an empty list when
 			// no installed CLI qualifies); `browserControl` with the AI working
 			// in the person's own Chrome (browser_*.go).
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]},"mspDrivers":{"protocol":1,"agents":[]},"browserControl":`+string(bcRaw)+`}` {
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]},"mspDrivers":{"protocol":2,"agents":[]},"browserControl":`+string(bcRaw)+`}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})

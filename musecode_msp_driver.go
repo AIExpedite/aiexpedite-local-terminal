@@ -99,7 +99,7 @@ import (
 	"time"
 )
 
-// Wire values mirrored from shared-constants 3.23.580 (cliAgentPreference.js
+// Wire values mirrored from shared-constants 3.23.588 (cliAgentPreference.js
 // CLI_AGENT_IDS, museCode.js, residentKindsWire.js). Contract-pinned by
 // musecode_msp_driver_test.go.
 const (
@@ -107,8 +107,12 @@ const (
 	museCodeCliAgentID = "museCode"
 	// MUSE_CODE_MSP_MIN_VERSION.
 	museCodeMSPMinVersion = "1.4.18"
-	// MSP_DRIVERS_PROTOCOL: DEVICE_RELAY_CAPABILITIES.MSP_DRIVERS's protocol.
-	mspDriversProtocol = 1
+	// DEVICE_RELAY_CAPABILITIES.MSP_DRIVERS's protocol. 2 is
+	// MSP_DRIVERS_ABORT_DENY_PROTOCOL: this build's fence lets a person's Deny
+	// select a once-scoped `abort` choice (mspFenceAnswerDecision), so
+	// terminal-service may send one. It sends an app at 1 only `denied`.
+	// Readers accept any protocol at or above MSP_DRIVERS_PROTOCOL (1).
+	mspDriversProtocol = 2
 	// MUSE_MSP_CHAT_APPROVAL_MODE.
 	museMSPChatApprovalMode = "promptUnmatched"
 	// RELAY_MSP_RPC_IDS.INITIALIZE: the handshake's `initialize`.
