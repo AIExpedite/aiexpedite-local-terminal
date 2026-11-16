@@ -114,14 +114,6 @@ var grokACPProfile = &acpAgentProfile{
 	endedOutput: func(exit int) string {
 		return fmt.Sprintf("grok agent stdio ended (exit code: %d)", exit)
 	},
-	firstFrameStall: func(timeout time.Duration) string {
-		return fmt.Sprintf(
-			"grok produced no output within %v of starting — it is most likely not signed in on this computer "+
-				"(its saved grok login/token expired; run `grok` in a terminal on the terminal computer to sign in again) "+
-				"or wedged at startup. Session terminated.",
-			timeout,
-		)
-	},
 }
 
 // NewGrokACPManager creates a fresh Grok manager.

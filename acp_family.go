@@ -141,17 +141,22 @@ const (
 	// fail-fast.
 	acpFamilyEnqueueTimeout = 30 * time.Second
 
-	// acpFamilyFirstFrameTimeout bounds how long we wait, AFTER the started
-	// ack publish completes, for the CLI to emit its FIRST stdout frame. A
-	// healthy ACP child answers terminal-service's `initialize` request within
-	// about a second, so the first message frame normally lands a second or
-	// two after the ack (one Pub/Sub round-trip for terminal-service to send
-	// `initialize`). A child that stays completely silent past this window is
-	// almost always blocked needing INTERACTIVE re-authentication it cannot
-	// present over headless stdio. The dispatcher arms this timer via
-	// ArmFirstFrameWatchdog after the ack publish so the up-to-30s
-	// newSessionPublishFn timeout never eats into the budget.
+	// acpFamilyFirstFrameTimeout bounds how long we wait, AFTER the first
+	// request is written to the child (the handshake's `initialize`), for the
+	// CLI to emit its FIRST stdout frame. A healthy child answers `initialize`
+	// within about a second. None of the four agents writes anything before
+	// it is asked: Grok, OpenCode and agy speak ACP, where the client speaks
+	// first, and `muse serve`'s first frame is its answer to `initialize`
+	// (L5 spec, appendix A). So the clock starts at the first request, never
+	// at the spawn: a session can sit idle for minutes before its first
+	// message (the chat panel starts Grok when it is picked, and the
+	// handshake runs with the first typed turn), and a clock from the spawn
+	// killed every such session 45 s in (armFirstFrameWatchdog).
 	acpFamilyFirstFrameTimeout = 45 * time.Second
+
+	// acpFamilyStallQuoteMax bounds the child's last stderr line as quoted in
+	// the first-frame watchdog's error.
+	acpFamilyStallQuoteMax = 300
 )
 
 /* --------------------------------------------------------------------------
@@ -296,8 +301,6 @@ type acpAgentProfile struct {
 	afterEnded func(s *ACPSession)
 	// endedOutput is the ended frame's text.
 	endedOutput func(exit int) string
-	// firstFrameStall is the error a silent child is failed with.
-	firstFrameStall func(timeout time.Duration) string
 }
 
 // typePrefix is the stem of the profile's frame types (`grok_acp`), used in
@@ -404,6 +407,17 @@ type ACPSession struct {
 	// proves it is alive and producing output.
 	firstFrame     chan struct{}
 	firstFrameOnce sync.Once
+	// publish is the publishFn the session was started with. The first-frame
+	// watchdog, armed from a send, publishes its error through it. Nil on a
+	// hand-built session, which therefore never arms the watchdog.
+	publish PublishFunc
+	// watchdogArmed is set by the first request written to the child, which
+	// starts the first-frame watchdog (armFirstFrameWatchdog).
+	watchdogArmed atomic.Bool
+	// lastStderr is the child's newest non-empty stderr line, bounded. The
+	// first-frame watchdog quotes it: the CLI's own words are the only
+	// evidence of why it did not answer.
+	lastStderr atomic.Pointer[string]
 	// killUnconfirmed marks a session whose End escalated to Kill and then
 	// timed out waiting for the exit watcher. The session is RETAINED as a
 	// tombstone (see end_confirm.go): only probeProcessGone may convert it
@@ -468,14 +482,18 @@ type ACPManager struct {
 	Config  *Config
 	profile *acpAgentProfile
 	mu      sync.RWMutex
+	// firstFrameTimeout is the first-frame watchdog's window
+	// (acpFamilyFirstFrameTimeout; tests shorten it).
+	firstFrameTimeout time.Duration
 }
 
 // newACPManager creates a fresh manager for one agent's profile.
 func newACPManager(cfg *Config, profile *acpAgentProfile) *ACPManager {
 	return &ACPManager{
-		sessions: make(map[string]*ACPSession),
-		Config:   cfg,
-		profile:  profile,
+		sessions:          make(map[string]*ACPSession),
+		Config:            cfg,
+		profile:           profile,
+		firstFrameTimeout: acpFamilyFirstFrameTimeout,
 	}
 }
 
@@ -678,6 +696,7 @@ func (m *ACPManager) Start(id, cwd string, extraArgs []string, workspaceID, uid 
 		processExited:     make(chan struct{}),
 		streamDone:        make(chan struct{}),
 		firstFrame:        make(chan struct{}),
+		publish:           publishFn,
 	}
 	if p.fenceFrames {
 		session.fence = newACPClientFence(p)
@@ -735,34 +754,33 @@ func (m *ACPManager) Start(id, cwd string, extraArgs []string, workspaceID, uid 
 
 	go m.readStream(session, publishFn)
 	go m.waitForExit(session, publishFn)
-	// NOTE: the first-frame watchdog is NOT armed here. The dispatcher arms it
-	// via ArmFirstFrameWatchdog AFTER the started ack publish completes, so
-	// the budget excludes ack-publish latency (newSessionPublishFn can block
-	// for up to 30s when Pub/Sub is slow). Arming here would let a slow ack
-	// publish shrink the window enough to kill a healthy child that is just
-	// waiting on terminal-service's `initialize` frame.
+	// NOTE: the first-frame watchdog is NOT armed here. The child has nothing
+	// to answer until the first request reaches it, and that can be minutes
+	// away, so the first request written arms it (armFirstFrameWatchdog).
 
 	fmt.Printf("%s%s Session %s started (PID: %d)%s\n",
 		colorGreen, p.logTag, id, proc.Process.Pid, colorReset)
 	return nil
 }
 
-// ArmFirstFrameWatchdog starts the first-frame watchdog for an already-started
-// session. Split out from Start so the dispatcher can call it AFTER the
-// synchronous started ack publish completes — that publish can take up to 30s
-// on a slow Pub/Sub, and including it in the watchdog budget would risk
-// killing a healthy child that is just waiting on terminal-service's
-// `initialize` frame. No-op if the session is unknown (already removed) or
-// already exited.
-func (m *ACPManager) ArmFirstFrameWatchdog(id string, publishFn PublishFunc) {
-	session := m.Get(id)
-	if session == nil {
+// armFirstFrameWatchdog starts the first-frame watchdog when frame, just
+// written to the child's stdin, is the first REQUEST it was sent: from then on
+// the child owes an answer. A notification or a response asks for none, and
+// a frame written after the first request changes nothing. Each later send
+// pays one atomic load. Called under stdinMu, so the window starts once the
+// request has reached the child, whoever wrote it (terminal-service's
+// handshake, ai-service's Grok turn, the device's own follow-up).
+func (m *ACPManager) armFirstFrameWatchdog(session *ACPSession, frame string) {
+	if session.publish == nil || session.watchdogArmed.Load() {
 		return
 	}
-	if session.Status() == "ended" {
+	f, ok := parseJSONRPCFrame(frame)
+	if !ok || !f.isRequest() {
 		return
 	}
-	go m.watchFirstFrame(session, publishFn, acpFamilyFirstFrameTimeout)
+	if session.watchdogArmed.CompareAndSwap(false, true) {
+		go m.watchFirstFrame(session, session.publish, m.firstFrameTimeout, f.Method)
+	}
 }
 
 // Send writes a single JSON-RPC 2.0 frame to the child's stdin. payload must
@@ -913,6 +931,7 @@ func (m *ACPManager) sendAccepting(id string, payload string, accept func() erro
 		return fmt.Errorf("timeout writing to %s session %s stdin — session terminated to prevent frame interleave", p.noun, id)
 	}
 	wrote = true
+	m.armFirstFrameWatchdog(session, trimmed)
 
 	fmt.Printf("%s%s → %s (%d bytes)%s\n",
 		colorBlue, p.logTag, id, len(trimmed), colorReset)
@@ -1423,6 +1442,8 @@ func (m *ACPManager) readStream(session *ACPSession, publishFn PublishFunc) {
 			}
 			fmt.Printf("%s%s stderr %s: %s%s\n",
 				colorYellow, p.logTag, session.ID, truncateString(line, 200), colorReset)
+			quote := truncateString(strings.TrimSpace(line), acpFamilyStallQuoteMax)
+			session.lastStderr.Store(&quote)
 			// After any reply text read before it, never ahead of it. Once the
 			// session has failed nothing more is published, but stderr is
 			// still drained to EOF so nothing writing to it can block.
@@ -1582,18 +1603,20 @@ func (m *ACPManager) waitForExit(session *ACPSession, publishFn PublishFunc) {
 	m.removeSessionIfSame(session.ID, session)
 }
 
-// watchFirstFrame fails a session fast when the CLI spawns but never produces
-// any stdout — the signature of a child blocked on interactive
-// re-authentication or otherwise wedged at startup. Without it such a session
+// watchFirstFrame fails a session fast when the CLI was sent a request
+// (request is its method, normally the handshake's `initialize`) and has
+// produced no stdout frame within timeout of it. Without it such a session
 // sits at "started" until the optional per-session deadline (often none) or
-// the 6h stale GC.
+// the 6h stale GC. It is armed by the first request written to the child
+// (armFirstFrameWatchdog), never by the spawn: an idle child owes nothing.
 //
 // It blocks until one of three things happens:
 //   - session.firstFrame closes — the CLI emitted a frame; healthy, disarm.
 //   - session.done closes — the child already exited (e.g. immediate crash);
 //     waitForExit owns the terminal ended frame, so do nothing.
-//   - timeout elapses — declare the startup stalled, publish an actionable
-//     error frame, and kill the child so waitForExit emits the ended frame.
+//   - timeout elapses — publish an error that says what happened (and the
+//     CLI's own last stderr line, when it wrote one), and kill the child so
+//     waitForExit emits the ended frame.
 //
 // timeout is a parameter (rather than the package constant) so unit tests can
 // drive the fail-fast path with a sub-second budget and no real process.
@@ -1602,7 +1625,7 @@ func (m *ACPManager) waitForExit(session *ACPSession, publishFn PublishFunc) {
 // (atomic increment) BEFORE Kill and publish AFTER, so the watchdog error is
 // strictly ordered before the ended frame waitForExit allocates once the
 // killed child is reaped — the orchestrator therefore sees error → ended.
-func (m *ACPManager) watchFirstFrame(session *ACPSession, publishFn PublishFunc, timeout time.Duration) {
+func (m *ACPManager) watchFirstFrame(session *ACPSession, publishFn PublishFunc, timeout time.Duration, request string) {
 	p := m.profile
 	select {
 	case <-session.firstFrame:
@@ -1627,14 +1650,14 @@ func (m *ACPManager) watchFirstFrame(session *ACPSession, publishFn PublishFunc,
 	}
 
 	seq := atomic.AddInt64(&session.seq, 1)
-	fmt.Printf("%s%s Session %s produced no output within %v — assuming auth/startup stall, killing%s\n",
-		colorYellow, p.logTag, session.ID, timeout, colorReset)
+	fmt.Printf("%s%s Session %s did not answer %s within %v — killing%s\n",
+		colorYellow, p.logTag, session.ID, request, timeout, colorReset)
 	_ = m.forceKill(session)
 	publishFn(resultMsg{
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,
-		Output:      p.firstFrameStall(timeout),
+		Output:      acpFirstAnswerStall(p.cliName, request, timeout, session.lastStderr.Load()),
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
@@ -1643,4 +1666,23 @@ func (m *ACPManager) watchFirstFrame(session *ACPSession, publishFn PublishFunc,
 		SessionID:   session.ID,
 		Seq:         int(seq),
 	})
+}
+
+// acpFirstAnswerStall is the first-frame watchdog's error. It states only
+// what the device knows: which request went unanswered, for how long, and,
+// when the CLI wrote one, its last stderr line verbatim. It never guesses a
+// cause. Silence is not evidence of a sign-in: a CLI asked nothing writes
+// nothing, and Grok answers `initialize` even when it then needs a sign-in
+// (the grok 0.2.93 hang was at `authenticate`, after `initialize` was
+// answered). So the device's own words must never read as one (shared-resources
+// cliTurnCompletion.util.js CREDENTIAL_TEXT classifies the error text, and
+// voice says a sign-in on its `authRequired`); a sign-in can only reach that
+// classifier in the CLI's own quoted words.
+func acpFirstAnswerStall(cliName, request string, timeout time.Duration, lastStderr *string) string {
+	msg := fmt.Sprintf("%s did not answer `%s` within %v: it has written no protocol frame since it started. Session terminated.",
+		cliName, request, timeout)
+	if lastStderr != nil && *lastStderr != "" {
+		msg += fmt.Sprintf(" Its last line on stderr: \"%s\".", *lastStderr)
+	}
+	return msg + fmt.Sprintf(" To see what it is waiting for, run `%s` in a terminal on this computer.", cliName)
 }

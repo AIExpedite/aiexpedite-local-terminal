@@ -156,10 +156,6 @@ var museCodeMSPProfile = &acpAgentProfile{
 	fenceFrames:     true,
 	killProcessTree: true,
 	endedOutput:     func(exit int) string { return fmt.Sprintf("muse serve ended (exit code: %d)", exit) },
-	firstFrameStall: func(timeout time.Duration) string {
-		return fmt.Sprintf("muse produced no output within %v of starting — it is most likely wedged at startup "+
-			"(run `muse` in a terminal on this computer). Session terminated.", timeout)
-	},
 }
 
 func init() {

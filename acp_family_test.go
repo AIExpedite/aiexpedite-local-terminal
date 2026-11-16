@@ -22,6 +22,14 @@ import (
 // reply chunks and an answer for a prompt, and exits when stdin closes.
 const mockACPDriverMode = "acp-driver"
 
+// mockACPStallEnv, when set, makes the mock never answer `initialize`: a CLI
+// stalled in its handshake. Any value but mockACPStallSilent is first written
+// to its stderr as the CLI's one line.
+const (
+	mockACPStallEnv    = "TEST_MOCK_ACP_STALL"
+	mockACPStallSilent = "silent"
+)
+
 func runMockACPDriver() {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
@@ -34,6 +42,12 @@ func runMockACPDriver() {
 		id := msg["id"]
 		switch msg["method"] {
 		case "initialize":
+			if stall := os.Getenv(mockACPStallEnv); stall != "" {
+				if stall != mockACPStallSilent {
+					fmt.Fprintln(os.Stderr, stall)
+				}
+				continue
+			}
 			_ = enc.Encode(map[string]any{"jsonrpc": "2.0", "id": id, "result": map[string]any{
 				"protocolVersion": 1,
 				"_meta": map[string]any{"launch": map[string]any{
@@ -87,6 +101,13 @@ func (l *frameLog) ofType(typ string) []resultMsg {
 // as that CLI at version.
 func startMockACPDriver(t *testing.T, p *acpAgentProfile, version string) (*ACPManager, string, *frameLog) {
 	t.Helper()
+	return startMockACPDriverWith(t, p, version, nil)
+}
+
+// startMockACPDriverWith is startMockACPDriver with configure run on the
+// manager before the start.
+func startMockACPDriverWith(t *testing.T, p *acpAgentProfile, version string, configure func(*ACPManager)) (*ACPManager, string, *frameLog) {
+	t.Helper()
 	if runtime.GOOS != "windows" && runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("integration test only runs on win/linux/darwin")
 	}
@@ -109,6 +130,9 @@ func startMockACPDriver(t *testing.T, p *acpAgentProfile, version string) (*ACPM
 	t.Setenv(antigravityCSRFTokenEnv, "")
 
 	m := newACPManager(nil, p)
+	if configure != nil {
+		configure(m)
+	}
 	log := &frameLog{}
 	id := fmt.Sprintf("acp-test-%d", time.Now().UnixNano())
 	if err := m.Start(id, dir, nil, "ws", "uid", ACPStartOptions{}, log.publish); err != nil {
@@ -237,9 +261,6 @@ func TestGrokACPProfileIsUnchanged(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("profile[%d] = %q, want %q", i, got[i], want[i])
 		}
-	}
-	if !strings.HasPrefix(p.firstFrameStall(45*time.Second), "grok produced no output within 45s of starting — it is most likely not signed in") {
-		t.Errorf("first-frame stall = %q", p.firstFrameStall(45*time.Second))
 	}
 	if !p.mergeReplyChunks || p.fenceFrames {
 		t.Errorf("Grok merges its reply chunks and keeps its own setup-cwd gate; got merge=%v fence=%v", p.mergeReplyChunks, p.fenceFrames)
