@@ -600,8 +600,9 @@ func TestAMuseCodeFollowUpRedeliveredWhileItsAnswerIsPendingPublishesNothing(t *
 	wantAck(t, acks[0], followUpOutcomeWritten, "", followUpProcessedInCurrent)
 }
 
-// As shipped, Muse Code is not certified: a session gets no tracker and every
-// live attempt is refused notLiveKind, nothing written.
+// A Muse Code the device does not list as certified (the list pinned here
+// without it, as before its 1.4.20 run) gets no tracker, and every live
+// attempt is refused notLiveKind, nothing written.
 func TestAnUncertifiedMuseCodeSessionTakesNoLiveFollowUp(t *testing.T) {
 	h, s := newMSPLiveHarness(t)
 	startMSPTurn(t, h, s)
