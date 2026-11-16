@@ -86,6 +86,7 @@ second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="upsilon" method="post" action="/posted18"><label for="up">Upsilon</label><input id="up" name="upsilon" value="eighteen"><input type="hidden" name="item[]" value="A"><input type="hidden" id="q18a" name="qty[]" value="1"><input type="hidden" name="item[]" value="B"><input type="hidden" id="q18b" name="qty[]" value="2"><button id="send18" type="submit">Send upsilon</button></form>
 <form id="chi" method="post" action="/posted19"><label for="c1x">Chi first</label><input id="c1x" name="action" value="save"><label for="c2x">Chi second</label><input id="c2x" name="action" value="edit"><button type="submit" name="action" value="save">Save chi</button></form>
 <form id="phi"><label for="sa">Signed amount</label><input id="sa" name="signed"><label for="da">Decimal amount</label><input id="da" name="decimal"></form>
+<form id="omega"><label for="cw">Code word</label><input id="cw" name="codeword"><fieldset><legend>Answer</legend><label><input type="radio" name="ans" id="ansNo" value="no"> No</label><label><input type="radio" name="ans" id="ansNs" value="notsure"> Not sure</label></fieldset></form>
 <form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
 <div id="radios1"></div><div id="radios2"></div>
@@ -127,6 +128,8 @@ document.getElementById('pi').addEventListener('submit', function () { document.
 document.getElementById('send18').addEventListener('click', function () { var a = document.getElementById('q18a'), b = document.getElementById('q18b'), t = a.value; a.value = b.value; b.value = t; });
 document.getElementById('sa').addEventListener('blur', function () { this.value = this.value.replace('-', ''); });
 document.getElementById('da').addEventListener('blur', function () { this.value = this.value.replace('.', ','); });
+document.getElementById('cw').addEventListener('focus', function () { this.type = 'password'; });
+document.getElementById('ansNo').addEventListener('change', function () { document.getElementById('ansNs').checked = true; });
 document.getElementById('send20').addEventListener('click', function () {
   var f = document.getElementById('psi');
   HTMLFormElement.prototype.submit.call(f);
@@ -633,6 +636,28 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
 		t.Fatalf("1.234 shown as 1,234 must read as a mismatch: %+v", o)
+	}
+
+	// 4d13. A field that turns into a password field when focused: refused, nothing typed.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Code word", Value: "abc123"}}})
+	if err != nil {
+		t.Fatalf("fill code word: %v", err)
+	}
+	// Refused either as sensitive or because its identity changed (the type is part of its
+	// fingerprint): what matters is that nothing was typed into it.
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || (o[0].Outcome != "refused-sensitive" && o[0].Outcome != browserOutcomeFormChanged) {
+		t.Fatalf("a field that becomes a password on focus must be refused: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('cw').value)`); err != nil || v != `""` {
+		t.Fatalf("the refused field was written: %q %v", v, err)
+	}
+	// 4d14. A radio whose handler selects "Not sure" when "No" was asked: mismatch.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Answer", Value: "No"}}})
+	if err != nil {
+		t.Fatalf("fill answer: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a radio switched by the page must read as a mismatch: %+v", o)
 	}
 
 	// 4d9. A page that strips the minus sign of a filled amount: mismatch, not filled.

@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.16';
+  var VERSION = 'aix-1.0.17';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1333,6 +1333,13 @@
     if (kind === 'unsupported') return { done: true, outcome: 'unsupported', detail: f.type || f.tag };
     return null;
   }
+  // A focus handler can change what the field is (type="password", another name or autocomplete)
+  // after the start step checked it: check it again, as it is now, before anything is written.
+  function refusalAfterFocus(ref, value, opts) {
+    var now = fieldFor(ref);
+    if (!now) return { done: true, outcome: 'not-found' };
+    return writeRefusal(now.f, now.kind, value, opts);
+  }
   function fillStep(ref, value, step, opts) {
     opts = opts || {};
     var info = fieldFor(ref);
@@ -1385,6 +1392,8 @@
         el.focus({ preventScroll: true });
         var why = recheck(el, kind);
         if (why) return { done: true, outcome: 'refused-hidden', detail: why };
+        var wr1 = refusalAfterFocus(ref, value, opts);
+        if (wr1) return wr1;
         if (opts.trustedText) {
           try { if (typeof el.select === 'function') el.select(); else document.execCommand('selectAll'); } catch (e) { document.execCommand('selectAll'); }
           if (!isFocused(el)) return { done: true, outcome: 'failed', detail: 'field did not take focus for trusted typing' };
@@ -1396,6 +1405,8 @@
         el.focus({ preventScroll: true });
         var why2 = recheck(el, kind);
         if (why2) return { done: true, outcome: 'refused-hidden', detail: why2 };
+        var wr2 = refusalAfterFocus(ref, value, opts);
+        if (wr2) return wr2;
         setNativeValue(el, value); fireInput(el, value); fireChange(el);
         return { done: false, next: 'verify', waitMs: 80, method: 'setter' };
       }
@@ -1415,7 +1426,10 @@
         el.focus({ preventScroll: true });
         var why3 = recheck(el, kind);
         if (why3) return { done: true, outcome: 'refused-hidden', detail: why3 };
+        var wr3 = refusalAfterFocus(ref, value, opts);
+        if (wr3) return wr3;
         setNativeValue(el, m.match.value); fireInput(el, m.match.label); fireChange(el);
+        state.pending.set(ref, { chosen: m.match.label });   // verify checks exactly this option
         return { done: false, next: 'verify', waitMs: 80, method: 'setter', chosen: m.match.label };
       }
       if (kind === 'checkbox' || kind === 'switch') {
@@ -1434,6 +1448,7 @@
         var why5 = recheck(member, 'radio');
         if (why5) return { done: true, outcome: 'refused-hidden', detail: why5 };
         if (!clickToggle(member)) return { done: true, outcome: 'refused-submit-class' };
+        state.pending.set(ref, { chosen: mo.match.label });   // verify checks exactly this option
         return { done: false, next: 'verify', waitMs: 80, method: 'click', chosen: mo.match.label };
       }
       if (kind === 'combobox') {
@@ -1531,7 +1546,13 @@
       if (kind === 'text' || kind === 'datetime') { shown = el.value; ok = looksSame(shown, value); }
       else if (kind === 'select') { shown = currentValue(el, kind); ok = chosen ? lower(shown) === lower(chosen) : lower(shown).indexOf(lower(value)) >= 0; }
       else if (kind === 'checkbox' || kind === 'switch') { ok = isChecked(el) === toBool(value); shown = isChecked(el) ? 'checked' : 'unchecked'; }
-      else if (kind === 'radio-group') { var sel = info.members.filter(isChecked)[0]; shown = sel ? accName(sel) : ''; ok = !!sel && (lower(shown) === want2 || lower(shown).indexOf(lower(value)) >= 0); }
+      else if (kind === 'radio-group') {
+        var sel = info.members.filter(isChecked)[0];
+        shown = sel ? accName(sel) : '';
+        // The option the kit chose, exactly: a handler that selects "Not sure" for "No" must not
+        // pass a substring test. Without a recorded choice, the old lenient reading stays.
+        ok = !!sel && (chosen ? lower(shown) === lower(chosen) : (lower(shown) === want2 || lower(shown).indexOf(lower(value)) >= 0));
+      }
       else if (kind === 'combobox') {
         if (el.tagName === 'INPUT') {
           var iv = lower(el.value);
