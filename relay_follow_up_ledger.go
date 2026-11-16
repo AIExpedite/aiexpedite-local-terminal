@@ -136,7 +136,8 @@ const (
 // liveFollowUpCertified lists the CLIs whose installed version passed the
 // live follow-up certification (relay_follow_up_claude_certification_test.go,
 // relay_follow_up_codex_certification_test.go,
-// relay_follow_up_grok_certification_test.go) with the minimum version it
+// relay_follow_up_grok_certification_test.go,
+// relay_follow_up_agy_certification_test.go) with the minimum version it
 // passed at. A kind not listed answers every live attempt
 // notWritten/notLiveKind, so the broker queues.
 //
@@ -146,6 +147,14 @@ const (
 // them here makes a computer ADVERTISE them in liveAgents; nothing is written
 // live until the shared-constants broker row is certified too, because the
 // broker resolves the follow-up mode from that row before it publishes.
+//
+// Antigravity 1.5.9 passed its run on 2026-11-15, on its ACP driver only (a
+// one-shot `agy` has no running process to write into; the installed version
+// counts only where the driver runs it, acpDriverInstalledVersion): a
+// follow-up sent as a turn started and one sent mid-command were each taken
+// into the running turn once, the running prompt's answer handed the turn
+// over (acpHandoverAnswer), and over 10 rounds sent into short turns 9 were
+// handed over and 1 arrived after the turn, never into an idle session.
 //
 // Claude Code 2.1.322: a message spoken or typed while the agent is working is
 // written into the running CLI's stdin instead of waiting for the turn to end.
@@ -160,9 +169,10 @@ const (
 // open permission prompt can be read by the CLI as the ANSWER to it, which
 // would let an unrelated message approve an action nobody approved.
 var liveFollowUpCertified = map[string]string{
-	claudeCodeCliAgentID: "2.1.322",
-	codexCliAgentID:      "0.168.0",
-	grokCliAgentID:       "1.0.77",
+	claudeCodeCliAgentID:  "2.1.322",
+	codexCliAgentID:       "0.168.0",
+	grokCliAgentID:        "1.0.77",
+	antigravityCliAgentID: "1.5.9",
 }
 
 type relayFollowUpRow struct {
@@ -1215,8 +1225,10 @@ func writeJSONRPCLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollo
 		// agy processes every prompt written to it, as a steer or as the next
 		// turn, and answers it only when that turn ends: the write returning
 		// is the evidence (L3/L4 spec §2.6). The RUNNING prompt's answer says
-		// which: handed over (no `usage`) means this prompt carries the turn
-		// on, `current`; an ordinary end means agy runs it as the next turn,
+		// which: `end_turn` means agy handed the turn over and this prompt
+		// carries it on, `current` (acpHandoverAnswer: with or without
+		// `usage`); an error or another stopReason ended that turn for a
+		// reason of its own, so agy runs this prompt as the next turn,
 		// `next`, settled under this prompt's own id. No answer in time: the
 		// turn is still running with this prompt queued into it.
 		processedIn := followUpProcessedInCurrent
