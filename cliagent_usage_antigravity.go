@@ -220,7 +220,16 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		// The same evidence, acted on: a due retry, or an owe-ready run newer
 		// than the replayed reading, arms the bounded refresh so the next gather replays
 		// a reading taken after that run (cliagent_usage_antigravity_refresh_schedule.go).
-		nudgeAntigravityUsageRefreshFloor(now, antigravitySnapshotObservedMs(snap), owed)
+		//
+		// A gated build is also nudged by AGE: nothing else reads Google
+		// between its runs, so a reading older than
+		// antigravityGatedReadingMaxAge owes one read too.
+		observedMs := antigravitySnapshotObservedMs(snap)
+		floor := owed
+		if gatedBuild {
+			floor = antigravityAgedReadingFloor(now, observedMs, owed)
+		}
+		nudgeAntigravityUsageRefreshFloor(now, observedMs, floor)
 	}
 
 	usage.Metrics = antigravityQuotaMetrics(snap, now)

@@ -13,6 +13,14 @@
 //     timer runs a single attempt, and whatever that attempt keeps is
 //     scheduled again. A restart or self-update re-arms the persisted
 //     schedule (adoptAndPayOwedAntigravityRunDebt).
+//   - An age trigger for a gated build. On a build whose language server
+//     refuses loopback reads (every current `agy`), nothing but a run or a
+//     Refresh click ever reads Google, so between runs every gather replayed
+//     one reading, and the card and run routing showed it hours old, missing
+//     a window that reset and anything the Antigravity IDE or another
+//     computer spent on the same account. Once the replayed reading is older
+//     than antigravityGatedReadingMaxAge, the gather owes it one ordinary
+//     debt (antigravityAgedReadingFloor), paid by this same worker.
 //   - A state-independent nudge from the gather and the discovery tick. When
 //     the log index's newest OWE-READY run (a finished foreign run,
 //     cliagent_usage_antigravity_log_index.go) postdates the cached reading,
@@ -28,7 +36,10 @@
 // Cost: at most antigravityRefreshDebtMaxAttempts outbound Code Assist reads per
 // unpaid run, spaced by the ladder and by antigravityRefreshMinInterval; rungs
 // after a refusal that sent nothing (offline, expired login) are local checks
-// and spend no budget. A device with no unpaid run makes no request at all.
+// and spend no budget. With no unpaid run, a gated build reads at most once per
+// antigravityGatedReadingMaxAge, and only while the server keeps asking this
+// device for usage (gathers run only then). An ungated build, or a device that
+// has never had a reading, makes no request at all.
 //
 // Redaction: the only persisted addition is one epoch-millisecond int, and the
 // log lines below carry fixed labels, counters and durations — never a path, an
@@ -60,7 +71,26 @@ var (
 	// antigravityRefreshNudgeCooldown bounds how often a gather may arm the
 	// worker, on top of the minimum interval the worker itself honours.
 	antigravityRefreshNudgeCooldown = time.Minute
+	// antigravityGatedReadingMaxAge is how old a gated build's replayed
+	// reading may get before a gather owes it a read (antigravityAgedReadingFloor).
+	antigravityGatedReadingMaxAge = 10 * time.Minute
 )
+
+// antigravityAgedReadingFloor is the floor a gather on a GATED build hands the
+// nudge. A run floor the reading does not cover yet wins (it is the stronger
+// claim and keeps its own wording); otherwise a reading older than
+// antigravityGatedReadingMaxAge gets an aged floor at now, which the next Code
+// Assist reading satisfies. Never for a device that has no reading at all:
+// nothing says a login exists, and a run's settle owns that first read.
+func antigravityAgedReadingFloor(now time.Time, observedMs int64, owed antigravityOwedFloor) antigravityOwedFloor {
+	if !owed.At.IsZero() && (observedMs == 0 || owed.At.UnixMilli() > observedMs) {
+		return owed
+	}
+	if observedMs <= 0 || now.Sub(time.UnixMilli(observedMs)) < antigravityGatedReadingMaxAge {
+		return owed
+	}
+	return antigravityOwedFloor{At: now, Proven: true, Aged: true}
+}
 
 // antigravityRunDebtRetryTimer is the single pending retry. gen invalidates a
 // timer that was replaced or stopped after it had already fired but before its
@@ -353,14 +383,17 @@ func nudgeAntigravityUsageRefreshFloor(now time.Time, observedMs int64, owed ant
 		}
 		if state.RefreshOwedAtMs != 0 &&
 			(state.Attempts >= antigravityRefreshDebtMaxAttempts || state.Outcome == liveProbeOutcomeCodeAssistTokenExpired) &&
-			settled && !liveRun && owedLog.UnixMilli() > state.RefreshOwedFloorMs {
+			settled && !liveRun && !owed.Aged && owedLog.UnixMilli() > state.RefreshOwedFloorMs {
 			// A terminal debt (no_login, an exhausted ladder) and a settled run
 			// newer than its floor: that run — perhaps after the user signed
 			// in — owes its own refresh, exactly as a settle whose floor moved
 			// gets a fresh budget, instead of waiting out the age-out. An
 			// expired-login debt is replaced the same way: the newer run
 			// renewed the keyring token, so the read is payable now rather than
-			// at a free rung booked up to half an hour out.
+			// at a free rung booked up to half an hour out. An aged floor is
+			// not a run: it would replace the terminal debt on every gather and
+			// retry a missing or expired login forever, so it waits for the
+			// age-out like any other caller.
 			state.clearDebt()
 		}
 		if state.RefreshOwedAtMs != 0 {
@@ -381,14 +414,21 @@ func nudgeAntigravityUsageRefreshFloor(now time.Time, observedMs int64, owed ant
 		_, state.Gated = antigravityQuotaGateFor("", now)
 		// Published with the generation, as the settle publishes its account:
 		// a leaf lock, so no lock order is added.
-		noteAntigravityDebtRoute(state.debtID(), antigravityDebtRouteNudge)
+		route := antigravityDebtRouteNudge
+		if owed.Aged {
+			route = antigravityDebtRouteAged
+		}
+		noteAntigravityDebtRoute(state.debtID(), route)
 		start, created = true, true
 	})
 	if !start {
 		return false
 	}
 	n.lastAt = now
-	if created {
+	if created && owed.Aged {
+		fmt.Printf("%s[antigravity-freshness] The cached reading of a gated build is older than %s (age=%s); refresh owed%s\n",
+			colorCyan, antigravityGatedReadingMaxAge, antigravityBehindBy(observedMs, owedLog), colorReset)
+	} else if created {
 		fmt.Printf("%s[antigravity-freshness] A run finished after the cached reading with no refresh owed (behindBy=%s proven=%v); refresh owed%s\n",
 			colorYellow, antigravityBehindBy(observedMs, owedLog), owed.Proven, colorReset)
 	}
