@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.13';
+  var VERSION = 'aix-1.0.14';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -73,10 +73,13 @@
     return parseFloat(t.replace(/,/g, ''));
   }
   // Is what the field shows the value we meant? Masks may regroup punctuation, never digits.
+  // A minus before the first digit (ASCII or U+2212) is a sign, not formatting.
+  function leadingMinus(s) { return /^[^\d]*[-\u2212]/.test(s); }
   function looksSame(actual, expected) {
     var a = norm(actual), e = norm(expected);
     if (a === e || a.toLowerCase() === e.toLowerCase()) return true;
     if (!a || !e) return false;
+    if (leadingMinus(a) !== leadingMinus(e)) return false;   // -10 is not 10, whatever the page's mask did
     var runsA = (a.match(/\d+/g) || []).join(','), runsE = (e.match(/\d+/g) || []).join(',');
     var restA = a.replace(/[\d\s()+\-.\/,]/g, ''), restE = e.replace(/[\d\s()+\-.\/,]/g, '');
     if (runsE && runsA === runsE && restA === restE) return true;         // same digit groups, other punctuation
@@ -1900,7 +1903,10 @@
     for (var name in was) {
       var w = was[name];
       if (!w.some(function (v) { return v !== ''; })) continue;
-      var n = (now[name] || []).map(eol).sort(), ws = w.map(eol).sort();
+      // In order: a form that repeats names (item[]=A&qty[]=1&item[]=B&qty[]=2) pairs its values
+      // by position, so reordering one name's values changes what is submitted. The DOM reading
+      // and the submission are both in tree order.
+      var n = (now[name] || []).map(eol), ws = w.map(eol);
       if (n.length !== ws.length) return false;
       for (var i = 0; i < n.length; i++) if (n[i] !== ws[i]) return false;
     }
@@ -1917,11 +1923,15 @@
   function outgoingHolds(a, now) {
     if (entriesHold(a.payload.by, now)) return true;
     var c = a.el && a.el.deref && a.el.deref(), name = c && c.getAttribute && c.getAttribute('name');
-    if (!name || lower(c.getAttribute('type') || '') === 'image') return false;
-    var withSubmitter = Object.create(null);
-    for (var k in a.payload.by) withSubmitter[k] = a.payload.by[k].slice();
-    (withSubmitter[name] = withSubmitter[name] || []).push(c.getAttribute('value') || '');
-    return entriesHold(withSubmitter, now);
+    if (!name || lower(c.getAttribute('type') || '') === 'image' || !now || !now[name]) return false;
+    // The control's own pair sits at the control's place in tree order, which the approved
+    // reading cannot know: take exactly one occurrence of its value out, keep the rest in order.
+    var without = Object.create(null);
+    for (var k in now) without[k] = now[k].slice();
+    var i = without[name].map(eol).indexOf(eol(c.getAttribute('value') || ''));
+    if (i < 0) return false;
+    without[name].splice(i, 1);
+    return entriesHold(a.payload.by, without);
   }
   // What a navigation's form data carries, as name -> [values]; a file as name␟size, as
   // submittedData reads it. null when it cannot be read (then nothing is allowed).

@@ -83,6 +83,8 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
 <div id="shadowform2"></div>
 <form id="tau" method="get" action="/got16"><label for="tx">Tau notes</label><textarea id="tx" name="tau">first line
 second line</textarea><button id="send16" type="submit">Send tau</button></form>
+<form id="upsilon" method="post" action="/posted18"><label for="up">Upsilon</label><input id="up" name="upsilon" value="eighteen"><input type="hidden" name="item[]" value="A"><input type="hidden" id="q18a" name="qty[]" value="1"><input type="hidden" name="item[]" value="B"><input type="hidden" id="q18b" name="qty[]" value="2"><button id="send18" type="submit">Send upsilon</button></form>
+<form id="phi"><label for="sa">Signed amount</label><input id="sa" name="signed"></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
 <div id="radios1"></div><div id="radios2"></div>
 <form id="plans"><label for="plan">Plan</label><select id="plan" name="plan"><option value="">Choose</option><optgroup label="Old" disabled><option>Legacy</option></optgroup><option>Basic</option></select></form>
@@ -120,6 +122,8 @@ document.getElementById('send13').addEventListener('click', function (e) {
   HTMLFormElement.prototype.submit.call(fm);
 });
 document.getElementById('pi').addEventListener('submit', function () { document.getElementById('amt14').value = '9999.00'; });
+document.getElementById('send18').addEventListener('click', function () { var a = document.getElementById('q18a'), b = document.getElementById('q18b'), t = a.value; a.value = b.value; b.value = t; });
+document.getElementById('sa').addEventListener('blur', function () { this.value = this.value.replace('-', ''); });
 var sf2 = document.getElementById('shadowform2').attachShadow({ mode: 'open' });
 sf2.innerHTML = '<form method="post" action="/posted17" target="sink14"><label for="sg">Sigma</label><input id="sg" name="sigma" value="seventeen"><input type="hidden" id="amt17" name="amount" value="10.00"><button type="submit">Send sigma</button></form>';
 sf2.querySelector('form').addEventListener('submit', function () { sf2.getElementById('amt17').value = '9999.00'; });
@@ -552,6 +556,33 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
 		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d8. Repeated names pair by position: a click handler that swaps the two
+	// quantities (item[]=A qty[]=1, item[]=B qty[]=2 -> qty 2,1) is refused.
+	prep = prepare(refs["Send upsilon"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r18"})
+	time.Sleep(300 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted18") != 0 {
+		t.Fatalf("reordered repeated values: %v posted18=%d", err, hit("POST /posted18"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	// 4d9. A page that strips the minus sign of a filled amount: mismatch, not filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Signed amount", Value: "-10"}}})
+	if err != nil {
+		t.Fatalf("fill signed amount: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a stripped minus sign must read as a mismatch: %+v", o)
 	}
 	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
 	if err != nil {
