@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -60,6 +61,11 @@ var errASTimeout = errors.New("AppleScript call timed out")
 type asBridge struct {
 	turnOnce sync.Once
 	turn     chan struct{}
+
+	// procMu guards cmd and in, which close reads without the turn (an agent
+	// exit never waits for a request in flight); closed refuses everything after.
+	procMu sync.Mutex
+	closed atomic.Bool
 
 	cmd     *exec.Cmd
 	in      io.WriteCloser
@@ -116,10 +122,21 @@ func (b *asBridge) start(ctx context.Context) error {
 	}
 	eb := &capBuffer{max: 16 << 10}
 	cmd.Stderr = eb
+	if b.closed.Load() {
+		return errASClosed()
+	}
 	if err := cmd.Start(); err != nil {
 		return browserErr(browserErrChromeNotReachable, "could not start the AppleScript helper")
 	}
-	b.cmd, b.in, b.out, b.errBuf, b.next, b.broken, b.started = cmd, in, bufio.NewReaderSize(outp, 1<<20), eb, 0, nil, true
+	b.procMu.Lock()
+	b.cmd, b.in = cmd, in
+	b.procMu.Unlock()
+	b.out, b.errBuf, b.next, b.broken, b.started = bufio.NewReaderSize(outp, 1<<20), eb, 0, nil, true
+	if b.closed.Load() {
+		// close ran while this one started: it may have missed the new process.
+		b.kill()
+		return errASClosed()
+	}
 	if _, err := b.readReply(ctx, 0, 20*time.Second); err != nil {
 		b.kill()
 		b.broken = err
@@ -129,22 +146,37 @@ func (b *asBridge) start(ctx context.Context) error {
 }
 
 func (b *asBridge) kill() {
-	if b.cmd == nil || b.cmd.Process == nil {
+	b.procMu.Lock()
+	old := b.cmd
+	b.procMu.Unlock()
+	if old == nil || old.Process == nil {
 		return
 	}
-	_ = b.cmd.Process.Kill()
-	old := b.cmd
+	_ = old.Process.Kill()
 	go func() { _ = old.Wait() }()
 	b.started = false
 }
 
+func errASClosed() *browserError {
+	return browserErr(browserErrChromeNotReachable, "the desktop app is shutting down")
+}
+
+// close ends the helper at once, for the agent's exit. It never waits for the
+// turn: a request in flight can wait up to 150 s (a slow Apple Event, macOS's
+// first-use permission prompt), so it is interrupted instead. Killing the
+// process ends that request's reply read, so it returns an error and releases
+// the turn itself; nothing starts a helper again afterwards.
 func (b *asBridge) close() {
-	_ = b.acquire(context.Background())
-	defer b.release()
-	if b.in != nil {
-		_ = b.in.Close()
+	b.closed.Store(true)
+	b.procMu.Lock()
+	cmd, in := b.cmd, b.in
+	b.procMu.Unlock()
+	if in != nil {
+		_ = in.Close()
 	}
-	b.kill()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
 }
 
 type asReplyError struct {
@@ -228,6 +260,9 @@ func (b *asBridge) request(ctx context.Context, req map[string]any) (json.RawMes
 		return nil, err
 	}
 	defer b.release()
+	if b.closed.Load() {
+		return nil, errASClosed()
+	}
 	if !b.started || b.broken != nil {
 		if b.started {
 			b.kill()

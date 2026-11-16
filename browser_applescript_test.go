@@ -204,3 +204,72 @@ func TestBrowserChromeHelperDecodesSplitUTF8(t *testing.T) {
 		t.Fatalf("after invalid UTF-8: %+v", r)
 	}
 }
+
+// The agent's exit never waits for a request in flight (it can wait up to 150 s
+// for an Apple Event or macOS's permission prompt): close does not take the
+// turn, and nothing reaches a helper after it.
+func TestASBridgeCloseDoesNotWaitForTheTurn(t *testing.T) {
+	b, f := newFakeASBridge(t)
+	if err := b.acquire(context.Background()); err != nil { // a request in flight holds the helper
+		t.Fatalf("acquire: %v", err)
+	}
+	done := make(chan struct{})
+	go func() { b.close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("close waited for the request in flight")
+	}
+	b.release()
+	_, err := b.request(context.Background(), map[string]any{"op": "info", "tabId": "7"})
+	var be *browserError
+	if !errors.As(err, &be) || be.Code != browserErrChromeNotReachable {
+		t.Fatalf("a request after close: %v", err)
+	}
+	if w := f.written(); len(w) != 0 {
+		t.Fatalf("written after close: %q", w)
+	}
+}
+
+// With the real helper: close ends a reply read in flight at once and the
+// process exits, instead of the read waiting out its timeout.
+func TestBrowserChromeHelperCloseInterruptsARequestInFlight(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("osascript is macOS only")
+	}
+	b := &asBridge{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := b.acquire(ctx); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer b.release()
+	if err := b.start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	cmd := b.cmd
+	// A request waiting for a reply that does not come (nothing was sent).
+	read := make(chan error, 1)
+	go func() { _, err := b.readReply(ctx, 1, 150*time.Second); read <- err }()
+	time.Sleep(200 * time.Millisecond)
+	started := time.Now()
+	b.close()
+	if d := time.Since(started); d > time.Second {
+		t.Fatalf("close took %v", d)
+	}
+	select {
+	case err := <-read:
+		if err == nil {
+			t.Fatal("the read in flight returned no error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read in flight kept waiting after close")
+	}
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the helper kept running after close")
+	}
+}
