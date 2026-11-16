@@ -2096,6 +2096,10 @@ func antigravityDiscoveryTick() {
 type antigravityOwedFloor struct {
 	At     time.Time
 	Proven bool
+	// Aged marks a floor no run raised: the reading of a gated build simply
+	// got too old (antigravityAgedReadingFloor). It owes one ordinary debt,
+	// but it never replaces a terminal one — only a newer RUN may do that.
+	Aged bool
 }
 
 // antigravityDiscover runs one pass and applies its floors; returns the newest
