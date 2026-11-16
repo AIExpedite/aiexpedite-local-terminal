@@ -792,3 +792,42 @@ func (t *liveFollowUpTracker) mspWatched(rpcID string) bool {
 	defer t.mu.Unlock()
 	return t.msp != nil && t.msp.watches[rpcID] != nil
 }
+
+// The certification's mid-tool gate sends its wrong-turn probe while the
+// running steer's delivery still waits to see the steer run (the delivery
+// blocks until then). That probe is fenced at once, on its own: turnMismatch
+// while the turn runs, and noActiveTurn once the turn's final answer is done,
+// whichever turn it names. Nothing is written for either.
+func TestAWrongTurnFollowUpIsRefusedWhileAnotherSteerAwaitsPlacement(t *testing.T) {
+	h, s := newMSPLiveHarness(t)
+	startMSPTurn(t, h, s)
+	h.child.setRespond(mspHostAnswers(mspAcceptedFor))
+	steer := h.mspCmd("msp-held", "Also write TOOLSTEER.", mspTestTurn)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.handle(steer)
+	}()
+	waitForLive(t, "Muse's answer", func() bool { return s.liveFollowUps.mspWatched("relay-followup-msp-held") })
+	time.Sleep(50 * time.Millisecond)
+
+	h.handle(h.mspCmd("msp-wrong", "x", mspOtherTurn))
+	acks := h.acks.snapshot()
+	if len(acks) != 1 || acks[0].FollowUpAttemptID != "msp-wrong" {
+		t.Fatalf("acks %+v", acks)
+	}
+	wantAck(t, acks[0], followUpOutcomeNotWritten, followUpReasonTurnMismatch, "")
+
+	// Once the final answer is done the same probe reads noActiveTurn.
+	commandID, _ := mspFollowUpCommandID("msp-held", steer.Ts)
+	h.child.emit(mspUserMessage(commandID, mspTestTurn))
+	<-done
+	h.child.emit(mspAgentMessageCompleted(mspTestTurn, mspPhaseFinalAnswer))
+	waitForLive(t, "the final answer", func() bool { _, closing := s.liveFollowUps.mspTurn(); return closing })
+	h.handle(h.mspCmd("msp-wrong-late", "x", mspOtherTurn))
+	acks = h.acks.snapshot()
+	wantAck(t, acks[len(acks)-1], followUpOutcomeNotWritten, followUpReasonNoActiveTurn, "")
+	if n := len(h.child.framesWithMethod(mspMethodTurnSteer)); n != 1 {
+		t.Fatalf("%d steers written, want only the held one", n)
+	}
+}

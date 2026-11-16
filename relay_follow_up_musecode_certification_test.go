@@ -453,15 +453,53 @@ func (c *museCert) cmd(t *testing.T, attemptID, text, expectedTurn string) comma
 }
 
 // deliver hands a signed relay_follow_up to the device and returns its ack.
+// A steer Muse accepts is answered only once it is seen running, so this
+// returns only then; deliverAsync does not wait.
 func (c *museCert) deliver(t *testing.T, cmd commandMsg) resultMsg {
 	t.Helper()
 	seen := len(c.acks.snapshot())
 	if !handleSessionCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-cert"}) {
 		t.Fatal("the follow-up was handed back")
 	}
-	ack := lastAck(t, c.acks, seen)
-	c.note(fmt.Sprintf("ack %s %s/%s/%s", cmd.FollowUpAttemptID, ack.FollowUpOutcome, ack.FollowUpReason, ack.FollowUpProcessedIn))
-	return ack
+	return c.ackFor(t, cmd, seen)
+}
+
+// deliverAsync hands a signed relay_follow_up to the device on a goroutine of
+// its own, so the test can act while the device waits to see the steer run;
+// the returned func waits for that delivery and returns its ack.
+func (c *museCert) deliverAsync(cmd commandMsg) func(t *testing.T) resultMsg {
+	seen := len(c.acks.snapshot())
+	done := make(chan bool, 1)
+	go func() {
+		done <- handleSessionCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-cert"})
+	}()
+	return func(t *testing.T) resultMsg {
+		t.Helper()
+		select {
+		case ok := <-done:
+			if !ok {
+				t.Fatal("the follow-up was handed back")
+			}
+		case <-time.After(5 * time.Minute):
+			t.Fatal("the follow-up's delivery did not finish in 5 minutes")
+		}
+		return c.ackFor(t, cmd, seen)
+	}
+}
+
+// ackFor is the newest ack, published after the first seen, that answers
+// cmd's own attempt (another delivery may answer in between).
+func (c *museCert) ackFor(t *testing.T, cmd commandMsg, seen int) resultMsg {
+	t.Helper()
+	all := c.acks.snapshot()
+	for i := len(all) - 1; i >= seen; i-- {
+		if ack := all[i]; ack.FollowUpAttemptID == cmd.FollowUpAttemptID {
+			c.note(fmt.Sprintf("ack %s %s", cmd.FollowUpAttemptID, museAckString(ack)))
+			return ack
+		}
+	}
+	t.Fatalf("no ack was published for %s (have %d)", cmd.FollowUpAttemptID, len(all))
+	return resultMsg{}
 }
 
 func turnEvent(method, turn string) func(f jsonRPCFrame, _ string) bool {
@@ -703,7 +741,8 @@ func TestMuseCodeLiveFollowUpCertification(t *testing.T) {
 		t0 := time.Now()
 		ack := c.deliver(t, cmd)
 		took := time.Since(t0)
-		// Redelivery while the turn runs: the ledger answers.
+		// Redelivery once the attempt settled (the device answers a Muse steer
+		// only when it has seen it run): the ledger answers.
 		again := c.deliver(t, cmd)
 		end := c.completed(t, mark, turn, 10*time.Minute)
 		// And after it.
@@ -796,8 +835,14 @@ func TestMuseCodeLiveFollowUpCertification(t *testing.T) {
 		}
 		t.Logf("host endpoints while the command runs: %s", museCertEndpoints(c.session()))
 		cmd := c.cmd(t, "cert-3", museCertSteer("TOOLSTEER"), turn)
-		ack := c.deliver(t, cmd)
 		derived, _ := mspFollowUpCommandID("cert-3", cmd.Ts)
+		// The steer's delivery waits until Muse is seen running it (after the
+		// command, at the next model-call boundary), so it runs on its own
+		// goroutine and the probes below go in while the command still runs:
+		// once the turn's final answer is done, the device refuses every
+		// follow-up noActiveTurn, whichever turn it names.
+		waitSteer := c.deliverAsync(cmd)
+		c.client.waitFor("Muse's answer to the steer", mark, time.Minute, isResponseTo(strconv.Quote(relayLiveFollowUpRPCID("cert-3"))))
 		// S11: the identical steer resent raw while the turn runs.
 		dup, _ := mspSteerFrame("cert-raw-dup", c.msp, turn, derived, cmd.Input)
 		c.record("out", "raw", dup)
@@ -806,6 +851,10 @@ func TestMuseCodeLiveFollowUpCertification(t *testing.T) {
 		}
 		// Another turn named: refused, nothing written.
 		wrong := c.deliver(t, c.cmd(t, "cert-3w", "Reply with just the word WRONG.", newMuseCodeCommandID()))
+		if i := c.client.find(at, toolDone); i >= 0 {
+			t.Errorf("the command finished before the probes ran, so they did not test the running turn: %s", c.frame(i))
+		}
+		ack := waitSteer(t)
 		end := c.completed(t, mark, turn, 10*time.Minute)
 		stray := c.drainStray(t, end)
 		cmdDone := c.client.find(at, toolDone)
