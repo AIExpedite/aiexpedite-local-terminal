@@ -175,7 +175,7 @@ func startMockMSPDriver(t *testing.T) (*ACPManager, string, *frameLog, string) {
 	return m, id, log, dir
 }
 
-/* --- contract pins (shared-constants 3.23.580) --- */
+/* --- contract pins (shared-constants 3.23.588) --- */
 
 func TestMuseCodeMSPWireValuesMatchSharedConstants(t *testing.T) {
 	p := museCodeMSPProfile
@@ -186,7 +186,7 @@ func TestMuseCodeMSPWireValuesMatchSharedConstants(t *testing.T) {
 	want := []string{"museCode", "msp",
 		"musecode_msp_start", "musecode_msp_send", "musecode_msp_end",
 		"musecode_msp_started", "musecode_msp_message", "musecode_msp_stderr", "musecode_msp_error", "musecode_msp_ended",
-		"1.4.18", "promptUnmatched", "relay-msp-init", "1"}
+		"1.4.18", "promptUnmatched", "relay-msp-init", "2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("wire values = %v, want %v", got, want)
 	}

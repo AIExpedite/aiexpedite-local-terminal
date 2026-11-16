@@ -94,6 +94,7 @@ const (
 
 	mspApprovalApproved  = "approved"
 	mspApprovalDenied    = "denied"
+	mspApprovalAbort     = "abort"
 	mspApprovalScopeOnce = "once"
 
 	mspIfBusyQueue = "queue"

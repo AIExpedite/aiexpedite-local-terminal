@@ -28,8 +28,8 @@ func TestMSPDriversListMuseCodeOnlyWhenItQualifies(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			pinMSPDriverBinary(t, c.b)
 			got := newMSPDriversCapability()
-			if got.Protocol != 1 || got.Agents == nil || !reflect.DeepEqual(got.Agents, c.want) {
-				t.Fatalf("mspDrivers = %+v, want protocol 1 agents %v", got, c.want)
+			if got.Protocol != 2 || got.Agents == nil || !reflect.DeepEqual(got.Agents, c.want) {
+				t.Fatalf("mspDrivers = %+v, want protocol 2 agents %v", got, c.want)
 			}
 			caps := newMachineCapabilities()
 			if !reflect.DeepEqual(caps.MSPDrivers, got) {
@@ -40,7 +40,7 @@ func TestMSPDriversListMuseCodeOnlyWhenItQualifies(t *testing.T) {
 				t.Fatal("museCode was listed as an ACP driver")
 			}
 			raw, _ := json.Marshal(caps)
-			if !strings.Contains(string(raw), `"mspDrivers":{"protocol":1,"agents":[`) {
+			if !strings.Contains(string(raw), `"mspDrivers":{"protocol":2,"agents":[`) {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})

@@ -90,7 +90,7 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// Antigravity on their long-lived ACP drivers, and `mspDrivers` with
 			// Muse Code on `muse serve` (both always present, an empty list when
 			// no installed CLI qualifies).
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]},"mspDrivers":{"protocol":1,"agents":[]}}` {
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]},"mspDrivers":{"protocol":2,"agents":[]}}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})
