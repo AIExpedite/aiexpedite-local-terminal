@@ -52,9 +52,15 @@ func (c *capBuffer) Write(p []byte) (int, error) {
 var errASTimeout = errors.New("AppleScript call timed out")
 
 // asBridge is the one osascript helper process. Requests are serialized: one
-// Apple Event at a time.
+// Apple Event at a time, for every tab. The turn is a one-slot channel, not a
+// mutex, so that waiting for it ends with the caller's context: a request whose
+// deadline passes while another tab's Apple Event holds the helper is never
+// sent (it must not navigate or type after its command was reported as timed
+// out) and does not kill the helper the other call is using.
 type asBridge struct {
-	mu      sync.Mutex
+	turnOnce sync.Once
+	turn     chan struct{}
+
 	cmd     *exec.Cmd
 	in      io.WriteCloser
 	out     *bufio.Reader
@@ -67,7 +73,37 @@ type asBridge struct {
 
 var globalASBridge = &asBridge{}
 
-// start launches the helper and waits for its ready line. It sends no Apple Event.
+// errASNotSent: the command's time ran out before its request reached the
+// helper (another tab's call held it, or the helper was still starting).
+// Nothing was sent to Chrome.
+func errASNotSent() *browserError {
+	return browserErr(browserErrCommandTimeout, "the browser action's time ran out before it reached Chrome; nothing was sent")
+}
+
+// acquire takes the helper's turn, or gives up when ctx ends first. A context
+// that has already ended never takes the turn: select picks at random among
+// ready cases, so it is checked before and again after.
+func (b *asBridge) acquire(ctx context.Context) error {
+	b.turnOnce.Do(func() { b.turn = make(chan struct{}, 1) })
+	if ctx.Err() != nil {
+		return errASNotSent()
+	}
+	select {
+	case b.turn <- struct{}{}:
+		if ctx.Err() != nil {
+			<-b.turn
+			return errASNotSent()
+		}
+		return nil
+	case <-ctx.Done():
+		return errASNotSent()
+	}
+}
+
+func (b *asBridge) release() { <-b.turn }
+
+// start launches the helper and waits for its ready line. It sends no Apple
+// Event. The caller holds the turn.
 func (b *asBridge) start(ctx context.Context) error {
 	cmd := exec.Command("osascript", "-l", "JavaScript", "-e", browserChromeHelperJS)
 	in, err := cmd.StdinPipe()
@@ -103,8 +139,8 @@ func (b *asBridge) kill() {
 }
 
 func (b *asBridge) close() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	_ = b.acquire(context.Background())
+	defer b.release()
 	if b.in != nil {
 		_ = b.in.Close()
 	}
@@ -188,8 +224,10 @@ func (b *asBridge) readReply(ctx context.Context, want int, timeout time.Duratio
 }
 
 func (b *asBridge) request(ctx context.Context, req map[string]any) (json.RawMessage, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	if err := b.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer b.release()
 	if !b.started || b.broken != nil {
 		if b.started {
 			b.kill()
@@ -197,6 +235,10 @@ func (b *asBridge) request(ctx context.Context, req map[string]any) (json.RawMes
 		if err := b.start(ctx); err != nil {
 			return nil, err
 		}
+	}
+	// Starting the helper takes time; nothing reaches Chrome after the deadline.
+	if ctx.Err() != nil {
+		return nil, errASNotSent()
 	}
 	b.next++
 	req["id"] = b.next

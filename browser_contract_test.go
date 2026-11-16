@@ -169,9 +169,11 @@ func TestBrowserChromeHelperStartsAndExitsOnEOF(t *testing.T) {
 	b := &asBridge{}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	b.mu.Lock()
+	if err := b.acquire(ctx); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
 	err := b.start(ctx)
-	b.mu.Unlock()
+	b.release()
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
