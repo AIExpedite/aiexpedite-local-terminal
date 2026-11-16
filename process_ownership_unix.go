@@ -103,6 +103,39 @@ func processGroupEmpty(rec ledgerProcess) bool {
 	return errors.Is(err, syscall.ESRCH)
 }
 
+// leftoverWait bounds how long ending a session's leftovers waits for them
+// to go (killed members linger as zombies until reaped).
+var leftoverWait = 3 * time.Second
+
+// endLeftoverProcessTree SIGKILLs the process group a session's recorded
+// leader led, ONLY once that leader is gone (its own END stopped it): then
+// every member left is something the session started. A live leader is never
+// signalled here. A descendant that left the group (setsid / setpgid) is out
+// of reach: the agent does not enumerate processes (see
+// probeRecordedDescendants). Reports whether the group is empty afterwards.
+func endLeftoverProcessTree(rec ledgerProcess, job uintptr) bool {
+	if rec.PGID <= 0 || rec.PGID != rec.PID {
+		return processGroupEmpty(rec)
+	}
+	if probeRecordedProcess(rec) != processGone {
+		return false
+	}
+	if processGroupEmpty(rec) {
+		return true
+	}
+	// While any member is left the group id cannot be reused, so this
+	// reaches only what the session started.
+	_ = syscall.Kill(-rec.PGID, syscall.SIGKILL)
+	deadline := time.Now().Add(leftoverWait)
+	for !processGroupEmpty(rec) {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return true
+}
+
 // processTreeGone: an exited per-turn leader's process group is empty.
 func processTreeGone(p ledgerProcess, job uintptr) bool {
 	return processGroupEmpty(p)

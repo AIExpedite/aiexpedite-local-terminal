@@ -133,3 +133,48 @@ func TestUnixNeverVouchesForDescendants(t *testing.T) {
 		t.Fatalf("descendants = %v, want unknown", got)
 	}
 }
+
+// TestReleaseSession_EndsWhatTheSessionLeftInItsGroup: the CLI's own END
+// signals only the CLI's PID; a tool it started stayed in its process group
+// until the computer restarted. Releasing the session now ends the group.
+func TestReleaseSession_EndsWhatTheSessionLeftInItsGroup(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	cmd, stdin := startLedgerChild(t, "ledger-tree-on-stdin", mockSessionKillChildPidEnv, pidFile)
+	dir := t.TempDir()
+	l := newRealLedger(t, filepath.Join(dir, spawnLedgerFileName), "boot-leftover")
+	l.BeginSpawn("s-leftover")
+	l.TrackProcess("s-leftover", cmd.Process, startedSuspended(cmd))
+	root := recordedProcess(t, cmd.Process)
+	if _, err := stdin.Write([]byte("go\n")); err != nil {
+		t.Fatal(err)
+	}
+	childPID := readPIDFile(t, pidFile)
+	child := recordedProcess(t, proc(childPID))
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+
+	// What the END paths do: SIGKILL the CLI's PID only.
+	if err := syscall.Kill(root.PID, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	waitForProbe(t, root, processGone, 5*time.Second)
+	if got := probeRecordedProcess(child); got != processOurs {
+		t.Fatalf("the tool should still run before the release (probe = %v)", got)
+	}
+
+	l.ReleaseSession("s-leftover")
+	waitForProbe(t, child, processGone, 10*time.Second)
+}
+
+// TestEndLeftoverProcessTree_NeverTouchesALiveLeader: the CLI itself is
+// still running, so nothing in its group is a leftover yet.
+func TestEndLeftoverProcessTree_NeverTouchesALiveLeader(t *testing.T) {
+	cmd, _ := startLedgerChild(t, "grok-smoke-hang")
+	rec := recordedProcess(t, cmd.Process)
+	if endLeftoverProcessTree(rec, 0) {
+		t.Fatalf("a live leader's group read as ended")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := probeRecordedProcess(rec); got != processOurs {
+		t.Fatalf("a live leader was killed (probe = %v)", got)
+	}
+}

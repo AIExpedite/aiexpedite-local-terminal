@@ -288,3 +288,51 @@ func TestProcessTreeGone_JobWithAnEscapedToolIsNotEmpty(t *testing.T) {
 		t.Fatalf("no job: nothing can be proven")
 	}
 }
+
+// TestReleaseSession_EndsWhatTheSessionLeftInItsJob: the CLI's own END
+// stops only the CLI (Process.Kill); a tool it started was left running in
+// its job until the agent exited. Releasing the session now ends it.
+func TestReleaseSession_EndsWhatTheSessionLeftInItsJob(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	cmd, stdin := startOwnedChild(t, "ledger-tree-on-stdin", mockSessionKillChildPidEnv, pidFile)
+	dir := t.TempDir()
+	l := newRealLedger(t, filepath.Join(dir, spawnLedgerFileName), "boot-leftover")
+	l.BeginSpawn("s-leftover")
+	l.TrackProcess("s-leftover", cmd.Process, startedSuspended(cmd))
+	root := recordedProcess(t, cmd.Process)
+	if _, err := stdin.Write([]byte("go\n")); err != nil {
+		t.Fatal(err)
+	}
+	child := recordedProcess(t, proc(readPIDFile(t, pidFile)))
+
+	_ = cmd.Process.Kill() // what the END paths do: the CLI only
+	waitForProbe(t, root, processGone, 10*time.Second)
+	if got := probeRecordedProcess(child); got != processOurs {
+		t.Fatalf("the tool should still run before the release (probe = %v)", got)
+	}
+
+	l.ReleaseSession("s-leftover")
+	waitForProbe(t, child, processGone, 10*time.Second)
+	if e := readLedgerFile(t, dir).Entries; len(e) != 0 {
+		t.Fatalf("an emptied session kept its record: %+v", e)
+	}
+}
+
+// TestEndLeftoverProcessTree_NeverTouchesALiveRecordedProcess: the CLI
+// itself is still running, so nothing in its job is a leftover yet.
+func TestEndLeftoverProcessTree_NeverTouchesALiveRecordedProcess(t *testing.T) {
+	cmd, _ := startOwnedChild(t, "grok-smoke-hang")
+	job, _, err := attachSessionJob(cmd.Process, true)
+	if err != nil || job == 0 {
+		t.Fatalf("attachSessionJob: %v", err)
+	}
+	defer releaseSessionJob(job)
+	rec := recordedProcess(t, cmd.Process)
+	if endLeftoverProcessTree(rec, job) {
+		t.Fatalf("a live session's job read as ended")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := probeRecordedProcess(rec); got != processOurs {
+		t.Fatalf("a live recorded process was killed (probe = %v)", got)
+	}
+}

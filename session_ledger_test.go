@@ -27,6 +27,7 @@ func newTestLedger(t *testing.T, dir, bootID string) *spawnLedger {
 	l.groupOf = func(*os.Process) int { return 0 }
 	l.descendants = func(ledgerProcess) processProbeResult { return processGone }
 	l.treeGone = func(ledgerProcess, uintptr) bool { return true }
+	l.endLeftovers = func(ledgerProcess, uintptr) bool { return false }
 	l.acquireOwnership = func() bool { return true }
 	l.startToken = func(pid int) (string, error) { return fmt.Sprintf("tok-%d", pid), nil }
 	// Every test ledger runs under the same OS boot unless a test says
@@ -706,5 +707,41 @@ func TestUntrackWithoutDescendantProofMakesTheSessionIncomplete(t *testing.T) {
 	l2.RunBootReap()
 	if r := l2.Report(context.Background()); len(r.SessionsReaped) != 0 {
 		t.Fatalf("certified without descendant proof: %+v", r)
+	}
+}
+
+// TestReleaseEndsLeftoversBeforeDecidingWhatToKeep: a release asks every
+// recorded process whose tree is not empty to have its leftovers ended, and
+// keeps only what is still not gone afterwards.
+func TestReleaseEndsLeftoversBeforeDecidingWhatToKeep(t *testing.T) {
+	dir := t.TempDir()
+	l := newTestLedger(t, dir, "boot-1")
+	ended := map[int]bool{}
+	var asked []int
+	l.attachJob = func(p *os.Process, _ bool) (uintptr, bool, error) { return uintptr(p.Pid), true, nil }
+	l.treeGone = func(p ledgerProcess, _ uintptr) bool { return p.PID == 1 || ended[p.PID] }
+	l.endLeftovers = func(p ledgerProcess, job uintptr) bool {
+		asked = append(asked, p.PID)
+		if job != uintptr(p.PID) {
+			t.Fatalf("endLeftovers got job %v for PID %d", job, p.PID)
+		}
+		// PID 2's leftovers end; PID 3's survive (a live CLI, say).
+		if p.PID == 2 {
+			ended[2] = true
+			return true
+		}
+		return false
+	}
+	for _, pid := range []int{1, 2, 3} {
+		l.BeginSpawn("s")
+		l.TrackProcess("s", proc(pid), true)
+	}
+	l.ReleaseSession("s")
+	if !reflect.DeepEqual(asked, []int{2, 3}) {
+		t.Fatalf("asked to end leftovers of %v, want [2 3] (never an empty tree)", asked)
+	}
+	got := readLedgerFile(t, dir).Entries
+	if len(got) != 1 || len(got[0].PIDs) != 1 || got[0].PIDs[0].PID != 3 {
+		t.Fatalf("kept = %+v, want only PID 3", got)
 	}
 }

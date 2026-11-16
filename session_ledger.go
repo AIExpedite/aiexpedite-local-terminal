@@ -202,6 +202,11 @@ type spawnLedger struct {
 	attachJob   func(proc *os.Process, suspended bool) (job uintptr, contained bool, err error)
 	// treeGone: an exited process's group (Unix) / job (Windows) is empty.
 	treeGone func(p ledgerProcess, job uintptr) bool
+	// endLeftovers ends what a session left behind once its own process is
+	// gone: its process group (Unix) / everything in its Job Object
+	// (Windows). It never touches a recorded process that is still alive, and
+	// reports whether the tree is empty afterwards.
+	endLeftovers func(p ledgerProcess, job uintptr) bool
 	// acquireOwnership takes the ledger's lock file for this process's life.
 	// A second live agent on the same config dir (Linux has no instance
 	// guard) must never reap or rewrite the first one's ledger.
@@ -216,21 +221,22 @@ type spawnLedger struct {
 
 func newSpawnLedger(path func() string, bootID string) *spawnLedger {
 	l := &spawnLedger{
-		path:        path,
-		bootID:      bootID,
-		jobs:        make(map[int]uintptr),
-		reapDone:    make(chan struct{}),
-		now:         time.Now,
-		writeFile:   writeLedgerFileAtomic,
-		startToken:  processStartToken,
-		probe:       probeRecordedProcess,
-		end:         endRecordedProcess,
-		descendants: probeRecordedDescendants,
-		attachJob:   attachSessionJob,
-		treeGone:    processTreeGone,
-		releaseJob:  releaseSessionJob,
-		groupOf:     processGroupOf,
-		osBoot:      readOSBootStamp,
+		path:         path,
+		bootID:       bootID,
+		jobs:         make(map[int]uintptr),
+		reapDone:     make(chan struct{}),
+		now:          time.Now,
+		writeFile:    writeLedgerFileAtomic,
+		startToken:   processStartToken,
+		probe:        probeRecordedProcess,
+		end:          endRecordedProcess,
+		descendants:  probeRecordedDescendants,
+		attachJob:    attachSessionJob,
+		treeGone:     processTreeGone,
+		endLeftovers: endLeftoverProcessTree,
+		releaseJob:   releaseSessionJob,
+		groupOf:      processGroupOf,
+		osBoot:       readOSBootStamp,
 	}
 	l.acquireOwnership = func() bool {
 		f := acquireLedgerLock(l.path() + ".lock")
@@ -654,6 +660,12 @@ func (l *spawnLedger) ReleaseSession(sessionID string) {
 	if sessionID == "" {
 		return
 	}
+	// Ending a session ends everything it started: a CLI's shell commands,
+	// tool and MCP servers, a dev server it launched. The END paths stop the
+	// CLI's own process (most of them by PID only), so whatever it left in its
+	// group / job would otherwise run on, on Windows until the agent exits and
+	// on macOS / Linux until the computer restarts.
+	l.endLeftoversOf(sessionID)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.loadLocked()
@@ -686,6 +698,40 @@ func (l *spawnLedger) ReleaseSession(sessionID string) {
 		l.touch(e)
 	}
 	l.persistLocked()
+}
+
+// endLeftoversOf ends, outside the lock, the leftover tree of every recorded
+// process of this boot's entry for the session whose group / job still holds
+// processes. The bounded wait in endLeftovers must not hold the ledger lock
+// every spawn takes; the release that follows re-reads the entry and keeps
+// only what is still not gone.
+func (l *spawnLedger) endLeftoversOf(sessionID string) {
+	if l.endLeftovers == nil {
+		return
+	}
+	type target struct {
+		p   ledgerProcess
+		job uintptr
+	}
+	var targets []target
+	l.mu.Lock()
+	l.loadLocked()
+	if _, e := l.findLocked(sessionID, l.bootID); e != nil {
+		for _, p := range e.PIDs {
+			job := l.jobs[p.PID]
+			if l.treeGone(p, job) {
+				continue
+			}
+			targets = append(targets, target{p, job})
+		}
+	}
+	l.mu.Unlock()
+	for _, t := range targets {
+		if l.endLeftovers(t.p, t.job) {
+			fmt.Printf("%s[ledger] Session %s ended: stopped the processes PID %d left running%s\n",
+				colorYellow, sessionID, t.p.PID, colorReset)
+		}
+	}
 }
 
 // reopenLocked marks a retained entry as a live session again.
