@@ -157,3 +157,30 @@ func TestRunBrowserFill(t *testing.T) {
 		t.Fatalf("%+v", res.Outcomes)
 	}
 }
+
+// An option matched by its value ("DE") is shown by its label ("Germany"): the
+// label the kit chose travels to the verify step, which compares against it.
+func TestBrowserFillFieldForwardsChosenLabel(t *testing.T) {
+	var verifyOpts map[string]any
+	page := &fakePage{id: "d:T1", trusted: true}
+	page.kit = map[string]func([]json.RawMessage) any{
+		"fillStep": func(args []json.RawMessage) any {
+			var step string
+			_ = json.Unmarshal(args[2], &step)
+			if step == "start" {
+				return map[string]any{"done": false, "next": "verify", "waitMs": 1, "method": "setter", "chosen": "Germany"}
+			}
+			_ = json.Unmarshal(args[3], &verifyOpts)
+			return map[string]any{"done": true, "outcome": "filled", "readBack": "Germany"}
+		},
+		"ping": pingOK,
+	}
+	k := newKitRunner(page)
+	r, err := k.fillField(context.Background(), "f1_a", browserPlanValue{Field: "Country", Value: "DE"}, true, nil)
+	if err != nil || r.Outcome != "filled" {
+		t.Fatalf("%+v %v", r, err)
+	}
+	if verifyOpts["chosen"] != "Germany" {
+		t.Fatalf("verify step options %v, want chosen Germany", verifyOpts)
+	}
+}

@@ -13,7 +13,11 @@ package main
 //     submit event, no navigation) is NOT reported as unsent;
 //   - a hidden input changed after approval refuses the submit;
 //   - without trusted input (the AppleScript route's path), the approved
-//     control is clicked from the page, so its own onclick runs.
+//     control is clicked from the page, so its own onclick runs;
+//   - an option matched by its value ("DE") verifies against its label;
+//   - a control inside an open shadow root can be clicked;
+//   - an approved control whose onclick calls form.submit() (no submit event)
+//     posts the approved form, once.
 
 import (
 	"context"
@@ -45,7 +49,19 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
   <label for="d">Delta</label><input id="d" name="d" value="four">
   <button id="send4" type="submit">Send delta</button>
 </form>
+<form id="geo">
+  <label for="country">Country</label><select id="country" name="country"><option value="">Choose</option><option value="DE">Germany</option><option value="FR">France</option></select>
+</form>
+<div id="shadowhost"></div>
+<form id="scripted" method="post" action="/posted5">
+  <label for="e">Epsilon</label><input id="e" name="e" value="five">
+  <button id="send5" type="button">Send epsilon</button>
+</form>
 <script>
+var sr = document.getElementById('shadowhost').attachShadow({ mode: 'open' });
+sr.innerHTML = '<button id="toggle" type="button">Toggle details</button>';
+sr.getElementById('toggle').addEventListener('click', function () { document.getElementById('shadowhost').setAttribute('data-toggled', 'yes'); });
+document.getElementById('send5').addEventListener('click', function () { document.getElementById('scripted').submit(); });
 document.getElementById('send4').addEventListener('click', function (e) {
   e.preventDefault();
   fetch('/save2', { method: 'POST', body: document.getElementById('d').value });
@@ -115,6 +131,20 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if refs["Send alpha"] == "" || refs["Send beta"] == "" || refs["Save"] == "" {
 		t.Fatalf("buttons: %+v", res.(browserReadResult).Buttons)
+	}
+	if refs["Toggle details"] == "" || refs["Send epsilon"] == "" {
+		t.Fatalf("buttons: %+v", res.(browserReadResult).Buttons)
+	}
+
+	// An option matched by its value is shown by its label. The fill's closing
+	// message lingers over the top of the page; the next steps act right away,
+	// so they also prove it no longer reads as covering the controls under it.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Country", Value: "DE"}}})
+	if err != nil {
+		t.Fatalf("fill select: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFilled {
+		t.Fatalf("fill select by value: %+v", o)
 	}
 	_, raw, _ := parseBrowserTabID(tab)
 	pg, err := be.Page(ctx, raw)
@@ -212,6 +242,25 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if hit("POST /save2") != 1 || hit("POST /native") != 0 {
 		t.Fatalf("script click: save2=%d native=%d (%+v)", hit("POST /save2"), hit("POST /native"), res)
+	}
+
+	// 5. A control inside an open shadow root is clicked, not reported covered.
+	if _, err := run(browserParams{Op: browserOpClick, TabID: tab, Ref: refs["Toggle details"]}); err != nil {
+		t.Fatalf("shadow click: %v", err)
+	}
+	if v, err := pg.Eval(ctx, `document.getElementById('shadowhost').getAttribute('data-toggled') || 'no'`); err != nil || !strings.Contains(v, "yes") {
+		t.Fatalf("shadow click had no effect: %q %v", v, err)
+	}
+
+	// 6. The approved control's onclick calls form.submit(): no submit event,
+	// yet the approved form posts to its own action, once.
+	prep = prepare(refs["Send epsilon"])
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r6"})
+	if err != nil {
+		t.Fatalf("scripted submit: %v", err)
+	}
+	if cr := res.(browserClickResult); !cr.Navigated || cr.Title != "Posted" || hit("POST /posted5") != 1 {
+		t.Fatalf("scripted submit: %+v posted5=%d", cr, hit("POST /posted5"))
 	}
 }
 

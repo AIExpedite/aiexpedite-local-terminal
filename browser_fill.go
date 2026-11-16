@@ -283,7 +283,11 @@ func (k *kitRunner) fillField(ctx context.Context, ref string, pv browserPlanVal
 			return acc, err
 		}
 		if r.Chosen != "" {
+			// The option the kit picked, by its displayed label: the verify step
+			// compares what the field shows against it, not against the value
+			// asked for (an option matched by its value, "DE" for "Germany").
 			acc.Chosen = r.Chosen
+			opts["chosen"] = r.Chosen
 		}
 		if r.InsertText != nil {
 			// Trusted typing through the DevTools Input domain. Check one last time

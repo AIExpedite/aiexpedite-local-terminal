@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.2';
+  var VERSION = 'aix-1.0.3';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -944,14 +944,31 @@
   // After the approved submission (or the approved click on a control outside any form), the
   // page may navigate: to where the form posts (once), or anywhere without form data (a
   // script-driven page that saved by fetch and then shows its "thank you" page).
+  //
+  // A control whose onclick calls form.submit() fires no submit event: once the approved control
+  // was pressed, the approved form's own post (to its own action, once) goes through as well, and
+  // so does a navigation without form data (a script that saved and shows its confirmation).
   function approvedNavigation(e) {
     var a = state.approved;
     if (!a || Date.now() > a.until + APPROVED_MS) return false;
-    if (!(a.used || a.virtual)) return false;
+    if (!(a.used || a.virtual || a.pressed)) return false;
     if (!e.formData) return true;
     if (a.navUsed) return false;
+    if (!(a.used || a.virtual)) {
+      var dest = e.destination && e.destination.url;
+      if (!dest || a.actions.indexOf(String(dest).split('#')[0]) < 0) return false;
+      a.used = true;
+    }
     a.navUsed = true;
     return true;
+  }
+  // The approved control was pressed (the agent's trusted click, or its click() on the AppleScript
+  // route). Only that unlocks the script-driven submission above.
+  function onClickCapture(e) {
+    var a = state.approved;
+    if (!a || state.mode !== 'submit' || Date.now() > a.until) return;
+    var el = a.el.deref();
+    if (el && e.target && (e.target === el || composedContains(el, e.target))) a.pressed = true;
   }
   function onSubmitCapture(e) {
     var s = e.submitter;
@@ -1017,6 +1034,7 @@
     if (state.guardsInstalled) return;
     window.addEventListener('submit', onSubmitCapture, true);
     window.addEventListener('invalid', onInvalidCapture, true);
+    window.addEventListener('click', onClickCapture, true);
     window.addEventListener('pointerdown', onGesture, true);
     window.addEventListener('keydown', onGesture, true);
     if (globalThis.navigation && navigation.addEventListener) navigation.addEventListener('navigate', onNavigate);
@@ -1039,6 +1057,7 @@
     if (!state.guardsInstalled) return;
     window.removeEventListener('submit', onSubmitCapture, true);
     window.removeEventListener('invalid', onInvalidCapture, true);
+    window.removeEventListener('click', onClickCapture, true);
     window.removeEventListener('pointerdown', onGesture, true);
     window.removeEventListener('keydown', onGesture, true);
     if (globalThis.navigation && navigation.removeEventListener) navigation.removeEventListener('navigate', onNavigate);
@@ -1583,15 +1602,30 @@
   // Where to click so the press lands on el itself: its centre, after scrolling it into view.
   // null (with why) when it cannot be seen or something else is on top of it.
   function clickTarget(el) {
+    // A fill's closing message lingers over the page for a few seconds; the agent acting again
+    // ends it, or it would cover (and take the press meant for) a control beneath it.
+    Array.prototype.forEach.call(document.querySelectorAll('#' + HOST_ID), function (n) { if (n !== state.host) n.remove(); });
     el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
     var vis = visibilityOf(el, 'button', el);
     if (!vis.visible) return { why: vis.reason || 'hidden' };
     if (!vis.inViewport) return { why: 'off-screen' };
     var r = el.getBoundingClientRect();
     var x = r.left + r.width / 2, y = r.top + r.height / 2;
+    // A control inside an open shadow root: the document only sees its outermost host, so the
+    // host chain must be on top there, and the control itself on top inside its own root.
     var top = document.elementFromPoint(x, y);
+    var rn = el.getRootNode ? el.getRootNode() : document;
+    if (top && rn !== document && rn.elementFromPoint) {
+      if (!composedContains(top, el)) return { why: 'covered' };
+      top = rn.elementFromPoint(x, y);
+    }
     if (!top || !(top === el || el.contains(top))) return { why: 'covered' };
     return { x: x, y: y };
+  }
+  // Is b inside a, crossing shadow boundaries (a shadow root's parent is its host)?
+  function composedContains(a, b) {
+    for (var n = b; n; n = n.parentNode || n.host) { if (n === a) return true; }
+    return false;
   }
   // The agent is about to click a link or a control that does not submit: guard the page, so
   // the only thing that may leave it is the link's own navigation.
@@ -1785,8 +1819,15 @@
     if (t.why) return { ok: false, reason: 'hidden', detail: t.why };
     openGuard('submit');
     state.allowNavHref = null;
+    // Where the approved form may post when a script submits it: its own action, or the
+    // control's formaction (the digest just confirmed both are the approved ones).
+    var actions = [];
+    if (r.form) {
+      actions.push(submitUrl(r.form.getAttribute('action')));
+      if (r.control.hasAttribute('formaction')) actions.push(submitUrl(r.control.getAttribute('formaction')));
+    }
     state.approved = { el: new WeakRef(r.control), form: r.form ? new WeakRef(r.form) : null, virtual: !r.form,
-      until: Date.now() + APPROVED_MS, used: false, navUsed: false };
+      until: Date.now() + APPROVED_MS, used: false, navUsed: false, pressed: false, actions: actions };
     state.agentActingUntil = Date.now() + AGENT_ACT_MS;
     if (how === 'scriptClick') {
       // Activate the control as a press would: its own click handlers run (a page that saves by
