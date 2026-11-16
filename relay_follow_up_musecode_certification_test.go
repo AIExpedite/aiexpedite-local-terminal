@@ -29,18 +29,25 @@ import (
 //
 // One host, one conversation, one verdict per gate (a subtest each):
 //
-//  1. turnStart: a follow-up sent as a turn starts goes into THAT turn, once;
-//     its redelivery (while the turn runs and after it) is answered from the
+//  1. turnStart: a follow-up sent as a turn starts runs once, and the
+//     device says truthfully where: `current` only when its userMessage is
+//     in that turn, `next` naming the turn Muse ran it as (Muse 1.4.20 runs
+//     it as the next turn when the turn makes no further model call); its
+//     redelivery (while the turn runs and after it) is answered from the
 //     device's ledger and nothing is written again.
 //  2. idle: with no turn running the device writes nothing (noActiveTurn).
 //  3. midTool: a follow-up sent while a shell command runs goes into that
 //     turn, once; one naming another turn is refused (turnMismatch). Also
 //     recorded: what Muse answers to the identical steer resent while the
 //     turn runs (S11).
-//  4. nearEnd: the final-answer window (§4.6, O5). Follow-ups sent while the
-//     turn's final answer streams. Any steer Muse ACCEPTED that no turn acted
-//     on is LOST, and so is one the device reported written into the
-//     running turn that ran as a later turn: either fails the gate.
+//  4. nearEnd: the final-answer window (§4.6, O5). Follow-ups sent from the
+//     moment the turn's final answer starts streaming to just past its end.
+//     Each must be queued (refused before a byte is written: the device
+//     closes the turn at the final answer's item/completed), handled in the
+//     turn and reported `current`, or run as the next turn and reported
+//     `next` naming that turn. Any steer Muse ACCEPTED that no turn acted on
+//     is LOST, and any report that does not match where it went is
+//     MISREPORTED: either fails the gate.
 //  5. stranded: after `turn/foregroundCompleted` the device writes nothing;
 //     a steer written there anyway (the device's race) is recorded, and the
 //     device's reading of Muse's answer must never be "written" for a steer
@@ -608,6 +615,42 @@ func mustParseMuseFrame(t *testing.T, line string) jsonRPCFrame {
 	return f
 }
 
+// museReportTrue says whether the device's answer for a steer tells the
+// truth about where it went (whereWent): written `current` naming the turn
+// for one handled in the turn, written `next` naming the later turn for one
+// Muse ran as a turn of its own.
+func museReportTrue(ack resultMsg, where, turn string) bool {
+	if ack.FollowUpOutcome != followUpOutcomeWritten {
+		return false
+	}
+	switch {
+	case where == "turn":
+		return ack.FollowUpProcessedIn == followUpProcessedInCurrent && ack.FollowUpMSPTurnID == turn
+	case strings.HasPrefix(where, "later:"):
+		return ack.FollowUpProcessedIn == followUpProcessedInNext && ack.FollowUpMSPTurnID == strings.TrimPrefix(where, "later:")
+	}
+	return false
+}
+
+// museSameAnswer: a redelivery is answered exactly as the attempt was.
+func museSameAnswer(t *testing.T, step string, got, want resultMsg) {
+	t.Helper()
+	if got.FollowUpOutcome != want.FollowUpOutcome || got.FollowUpReason != want.FollowUpReason ||
+		got.FollowUpProcessedIn != want.FollowUpProcessedIn || got.FollowUpMSPTurnID != want.FollowUpMSPTurnID {
+		t.Errorf("%s: ack {%s %s %s %s}, want the attempt's {%s %s %s %s}", step,
+			got.FollowUpOutcome, got.FollowUpReason, got.FollowUpProcessedIn, got.FollowUpMSPTurnID,
+			want.FollowUpOutcome, want.FollowUpReason, want.FollowUpProcessedIn, want.FollowUpMSPTurnID)
+	}
+}
+
+func museAckString(a resultMsg) string {
+	s := a.FollowUpOutcome + "/" + a.FollowUpReason + "/" + a.FollowUpProcessedIn
+	if a.FollowUpMSPTurnID != "" {
+		s += " in " + a.FollowUpMSPTurnID
+	}
+	return s
+}
+
 func museWantAck(t *testing.T, step string, ack resultMsg, outcome, reason, processedIn string) bool {
 	t.Helper()
 	if ack.FollowUpOutcome != outcome || ack.FollowUpReason != reason || ack.FollowUpProcessedIn != processedIn {
@@ -663,22 +706,33 @@ func TestMuseCodeLiveFollowUpCertification(t *testing.T) {
 		after := c.deliver(t, cmd)
 		stray := c.drainStray(t, end)
 		derived, _ := mspFollowUpCommandID("cert-1", cmd.Ts)
-		t.Logf("turn start: steer sent %d frames after turn/started, answered in %s: %s", c.frames()-startedAt, took, c.answerTo(mark, strconv.Quote(relayLiveFollowUpRPCID("cert-1"))))
-		museWantAck(t, "live attempt", ack, followUpOutcomeWritten, "", followUpProcessedInCurrent)
-		museWantAck(t, "redelivery during the turn", again, followUpOutcomeWritten, "", followUpProcessedInCurrent)
-		museWantAck(t, "redelivery after the turn", after, followUpOutcomeWritten, "", followUpProcessedInCurrent)
+		where := c.whereWent(mark, c.frames(), turn, derived, "STEERED")
+		t.Logf("turn start: steer sent %d frames after turn/started, settled in %s as %s; Muse answered %s; it went: %s",
+			c.frames()-startedAt, took, museAckString(ack), c.answerTo(mark, strconv.Quote(relayLiveFollowUpRPCID("cert-1"))), where)
+		if !museReportTrue(ack, where, turn) {
+			t.Errorf("the device answered %s for a steer that went %s", museAckString(ack), where)
+		}
+		museSameAnswer(t, "redelivery during the turn", again, ack)
+		museSameAnswer(t, "redelivery after the turn", after, ack)
 		if n := c.writes(mark, "cert-1"); n != 1 {
 			t.Errorf("one attempt reached Muse %d times", n)
 		}
 		um := c.steered(mark, c.frames(), derived)
-		if len(um) != 1 || um[0].TurnID != turn {
-			t.Errorf("the steer's userMessage (commandId %s): %+v, want once in turn %s", derived, um, turn)
+		if len(um) != 1 || (where == "turn" && um[0].TurnID != turn) || (where != "turn" && "later:"+um[0].TurnID != where) {
+			t.Errorf("the steer's userMessage (commandId %s): %+v, want once, where it went (%s)", derived, um, where)
 		}
-		if where := c.whereWent(mark, c.frames(), turn, derived, "STEERED"); where != "turn" {
-			t.Errorf("the steer was not acted on in its turn (%s); reply: %q", where, c.agentText(mark, c.frames(), turn))
+		ranIn := turn
+		if strings.HasPrefix(where, "later:") {
+			ranIn = strings.TrimPrefix(where, "later:")
 		}
-		if len(stray) != 0 {
+		if reply := c.agentText(mark, c.frames(), ranIn); !strings.Contains(reply, "STEERED") {
+			t.Errorf("the turn the steer ran in (%s) did not act on it; reply: %q", ranIn, reply)
+		}
+		switch {
+		case where == "turn" && len(stray) != 0:
 			t.Errorf("turns started after the turn: %v, want none", stray)
+		case where != "turn" && (len(stray) != 1 || "later:"+stray[0] != where):
+			t.Errorf("turns started after the turn: %v, want only the steer's own (%s)", stray, where)
 		}
 	})
 
@@ -754,7 +808,11 @@ func TestMuseCodeLiveFollowUpCertification(t *testing.T) {
 		um := c.steered(mark, c.frames(), derived)
 		t.Logf("mid-tool: steer answered %s", c.answerTo(mark, strconv.Quote(relayLiveFollowUpRPCID("cert-3"))))
 		t.Logf("S11: the identical steer resent while the turn ran answered %s; userMessages with its commandId: %d", c.answerTo(mark, `"cert-raw-dup"`), len(um))
-		museWantAck(t, "mid-tool attempt", ack, followUpOutcomeWritten, "", followUpProcessedInCurrent)
+		midWhere := c.whereWent(mark, c.frames(), turn, derived, "TOOLSTEER")
+		t.Logf("mid-tool: the device answered %s; it went: %s", museAckString(ack), midWhere)
+		if !museReportTrue(ack, midWhere, turn) {
+			t.Errorf("mid-tool: the device answered %s for a steer that went %s", museAckString(ack), midWhere)
+		}
 		museWantAck(t, "wrong turn", wrong, followUpOutcomeNotWritten, followUpReasonTurnMismatch, "")
 		if n := c.writes(mark, "cert-3"); n != 1 {
 			t.Errorf("one attempt reached Muse %d times", n)
@@ -779,10 +837,12 @@ func TestMuseCodeLiveFollowUpCertification(t *testing.T) {
 	t.Run("4 nearEnd", func(t *testing.T) {
 		c.bind(t)
 		rounds := museCertRounds("MUSE_LIVE_CERT_RACE_N", 10)
-		var handled, queued, lost, misreported, unknownHandled, unknownLater int
+		var handled, handedOver, queued, lost, misreported, unknownHandled, unknownLater int
 		// The rounds' offsets after the final answer starts streaming span
 		// that stream: round 0 at its start, the last just past its end,
-		// scaled to the stream round 0 measured.
+		// scaled to the stream round 0 measured, but never under 250 ms (a
+		// short answer can stream in 6 ms, which would put every round at the
+		// same instant).
 		stream := time.Second
 		for k := 0; k < rounds; k++ {
 			c.settle(t)
@@ -826,7 +886,7 @@ func TestMuseCodeLiveFollowUpCertification(t *testing.T) {
 			if doneAt >= 0 {
 				streamed = c.at(doneAt).Sub(c.at(first))
 				if k == 0 && streamed > 0 {
-					stream = streamed
+					stream = max(streamed, 250*time.Millisecond)
 				}
 			}
 			fgAt := c.client.find(mark, turnEvent(mspNotifyTurnForegroundCompleted, turn))
@@ -845,11 +905,14 @@ func TestMuseCodeLiveFollowUpCertification(t *testing.T) {
 			case accepted && where == "none":
 				outcome = "LOST"
 				lost++
-			case ack.FollowUpOutcome == followUpOutcomeWritten && where == "turn":
+			case ack.FollowUpOutcome == followUpOutcomeWritten && museReportTrue(ack, where, turn) && where == "turn":
 				outcome = "handled in the turn"
 				handled++
+			case ack.FollowUpOutcome == followUpOutcomeWritten && museReportTrue(ack, where, turn):
+				outcome = "ran as the next turn, reported so (" + where + ")"
+				handedOver++
 			case ack.FollowUpOutcome == followUpOutcomeWritten:
-				outcome = "MISREPORTED: written/current but " + where
+				outcome = "MISREPORTED: " + museAckString(ack) + " but " + where
 				misreported++
 			case where == "turn":
 				outcome = "unknown, handled in the turn"
@@ -864,11 +927,11 @@ func TestMuseCodeLiveFollowUpCertification(t *testing.T) {
 				timeline += fmt.Sprintf("; foreground %s and completion %s after the first delta",
 					c.at(fgAt).Sub(c.at(first)).Round(time.Millisecond), c.at(end).Sub(c.at(first)).Round(time.Millisecond))
 			}
-			t.Logf("round %d (+%s): ack %s/%s; Muse answered %s; %s [%s]",
-				k, offset.Round(time.Millisecond), ack.FollowUpOutcome, ack.FollowUpReason, answer, outcome, timeline)
+			t.Logf("round %d (+%s): ack %s; Muse answered %s; %s [%s]",
+				k, offset.Round(time.Millisecond), museAckString(ack), answer, outcome, timeline)
 		}
-		t.Logf("near-end window over %d rounds: handled in the turn %d, queued %d, LOST %d, misreported %d, unknown-but-handled %d, unknown-and-later %d",
-			rounds, handled, queued, lost, misreported, unknownHandled, unknownLater)
+		t.Logf("near-end window over %d rounds: handled in the turn %d, ran as the next turn and reported so %d, queued %d, LOST %d, misreported %d, unknown-but-handled %d, unknown-and-later %d",
+			rounds, handled, handedOver, queued, lost, misreported, unknownHandled, unknownLater)
 		if lost > 0 || misreported > 0 {
 			t.Errorf("%d steers Muse accepted were never acted on and %d were misreported: do not certify (O5)", lost, misreported)
 		}
