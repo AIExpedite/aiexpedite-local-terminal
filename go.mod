@@ -3,24 +3,24 @@ module github.com/AIExpedite/aiexpedite-local-terminal
 go 1.26.0
 
 require (
-	cloud.google.com/go/pubsub/v2 v2.8.1 // direct
+	cloud.google.com/go/pubsub/v2 v2.9.0 // direct
 	cloud.google.com/go/storage v1.70.0 // direct
 	github.com/BurntSushi/toml v1.6.0 // direct
 	github.com/getlantern/systray v1.2.2 // direct
-	golang.org/x/mod v0.42.0 // semver‑compare helper
-	golang.org/x/sys v0.49.0 // direct
+	golang.org/x/mod v0.43.0 // semver‑compare helper
+	golang.org/x/sys v0.50.0 // direct
 )
 
 require (
 	github.com/creack/pty v1.1.24
 	github.com/shirou/gopsutil/v4 v4.26.10
 	go.mau.fi/whatsmeow v0.0.0-20261017175727-b2b1e71d45e2
-	golang.org/x/oauth2 v0.37.0
+	golang.org/x/oauth2 v0.38.0
 	golang.org/x/sync v0.25.0
 	golang.org/x/time v0.16.0
-	google.golang.org/api v0.311.0
+	google.golang.org/api v0.314.0
 	google.golang.org/protobuf v1.36.12
-	modernc.org/sqlite v1.61.1
+	modernc.org/sqlite v1.62.0
 )
 
 require (
@@ -51,7 +51,7 @@ require (
 	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/google/s2a-go v0.1.11 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/googleapis/enterprise-certificate-proxy v0.3.24 // indirect
+	github.com/googleapis/enterprise-certificate-proxy v0.3.25 // indirect
 	github.com/googleapis/gax-go/v2 v2.27.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
@@ -86,9 +86,9 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/genproto v0.0.0-20261012220534-4341edf3f941 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20261012220534-4341edf3f941 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20261026165753-2ffab32bce7e // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261104224025-d1e00e9f33ab // indirect
 	google.golang.org/grpc v1.85.0 // indirect
-	modernc.org/libc v1.79.0 // indirect
+	modernc.org/libc v1.80.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
