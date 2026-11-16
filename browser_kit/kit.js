@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.17';
+  var VERSION = 'aix-1.0.18';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -67,10 +67,19 @@
     return (h >>> 0).toString(16);
   }
   function digits(s) { return String(s == null ? '' : s).replace(/\D/g, ''); }
+  // A number written plainly or with thousands separators, as canonical decimal text
+  // ("1,200.50" -> "1200.5"), or null. It is compared as text, never as a float: a long
+  // identifier must keep every digit (9007199254740993 is not 9007199254740992).
   function toNumber(s) {
     var t = String(s == null ? '' : s).replace(/[$€£¥\s]/g, '');
     if (!/^-?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?$/.test(t)) return null;
-    return parseFloat(t.replace(/,/g, ''));
+    t = t.replace(/,/g, '');
+    var neg = t.charAt(0) === '-';
+    if (neg) t = t.slice(1);
+    var parts = t.split('.');
+    var whole = parts[0].replace(/^0+(?=\d)/, ''), frac = (parts[1] || '').replace(/0+$/, '');
+    var out = whole + (frac ? '.' + frac : '');
+    return (neg && out !== '0' ? '-' : '') + out;
   }
   // Is what the field shows the value we meant? Masks may regroup punctuation, never digits.
   // A minus before the first digit (ASCII or U+2212) is a sign, not formatting.
@@ -756,13 +765,16 @@
     if (!n) n = nearbyText(container);
     return cleanLabel(n);
   }
+  // A radio's label: its accessible name, else its value. The option list shows it clipped; the
+  // verify step compares the full text (or, better, the very member the kit clicked).
+  function memberLabel(m) { return norm(accName(m) || m.value); }
   function describeGroup(key, container, members) {
     var ref = state.groupKeyRef.get(key);
     if (!ref) { ref = 'r' + (state.nextGroup++) + '_' + TAG; state.groupKeyRef.set(key, ref); }
     state.groups.set(ref, { key: key, container: new WeakRef(container), members: members.map(function (m) { return new WeakRef(m); }) });
     state.refs.set(ref, new WeakRef(container));
     var options = members.map(function (m) {
-      return { label: clip(accName(m) || m.value, 80), value: m.value || null, selected: isChecked(m),
+      return { label: clip(memberLabel(m), 80), value: m.value || null, selected: isChecked(m),
         disabled: !!(m.disabled || m.getAttribute('aria-disabled') === 'true') };
     });
     var vis = { visible: false, reason: 'no-visible-option' };
@@ -1448,7 +1460,8 @@
         var why5 = recheck(member, 'radio');
         if (why5) return { done: true, outcome: 'refused-hidden', detail: why5 };
         if (!clickToggle(member)) return { done: true, outcome: 'refused-submit-class' };
-        state.pending.set(ref, { chosen: mo.match.label });   // verify checks exactly this option
+        // Verify checks exactly this member (the label in `chosen` is clipped for display).
+        state.pending.set(ref, { chosen: mo.match.label, chosenMember: new WeakRef(member), chosenFull: memberLabel(member) });
         return { done: false, next: 'verify', waitMs: 80, method: 'click', chosen: mo.match.label };
       }
       if (kind === 'combobox') {
@@ -1548,10 +1561,16 @@
       else if (kind === 'checkbox' || kind === 'switch') { ok = isChecked(el) === toBool(value); shown = isChecked(el) ? 'checked' : 'unchecked'; }
       else if (kind === 'radio-group') {
         var sel = info.members.filter(isChecked)[0];
-        shown = sel ? accName(sel) : '';
+        shown = sel ? memberLabel(sel) : '';
         // The option the kit chose, exactly: a handler that selects "Not sure" for "No" must not
-        // pass a substring test. Without a recorded choice, the old lenient reading stays.
-        ok = !!sel && (chosen ? lower(shown) === lower(chosen) : (lower(shown) === want2 || lower(shown).indexOf(lower(value)) >= 0));
+        // pass a substring test. The member the kit clicked is the answer; its full label when that
+        // member is gone; the displayed (clipped) label only when nothing else was kept; and
+        // without any recorded choice, the old lenient reading stays.
+        var picked = pend.chosenMember && pend.chosenMember.deref();
+        if (picked && picked.isConnected) ok = !!sel && sel === picked;
+        else if (pend.chosenFull) ok = !!sel && lower(shown) === lower(pend.chosenFull);
+        else if (chosen) ok = !!sel && lower(clip(shown, 80)) === lower(chosen);
+        else ok = !!sel && (lower(shown) === want2 || lower(shown).indexOf(lower(value)) >= 0);
       }
       else if (kind === 'combobox') {
         if (el.tagName === 'INPUT') {

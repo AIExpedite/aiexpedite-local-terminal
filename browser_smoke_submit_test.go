@@ -85,8 +85,8 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
 second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="upsilon" method="post" action="/posted18"><label for="up">Upsilon</label><input id="up" name="upsilon" value="eighteen"><input type="hidden" name="item[]" value="A"><input type="hidden" id="q18a" name="qty[]" value="1"><input type="hidden" name="item[]" value="B"><input type="hidden" id="q18b" name="qty[]" value="2"><button id="send18" type="submit">Send upsilon</button></form>
 <form id="chi" method="post" action="/posted19"><label for="c1x">Chi first</label><input id="c1x" name="action" value="save"><label for="c2x">Chi second</label><input id="c2x" name="action" value="edit"><button type="submit" name="action" value="save">Save chi</button></form>
-<form id="phi"><label for="sa">Signed amount</label><input id="sa" name="signed"><label for="da">Decimal amount</label><input id="da" name="decimal"></form>
-<form id="omega"><label for="cw">Code word</label><input id="cw" name="codeword"><fieldset><legend>Answer</legend><label><input type="radio" name="ans" id="ansNo" value="no"> No</label><label><input type="radio" name="ans" id="ansNs" value="notsure"> Not sure</label></fieldset></form>
+<form id="phi"><label for="sa">Signed amount</label><input id="sa" name="signed"><label for="da">Decimal amount</label><input id="da" name="decimal"><label for="acct">Tracking reference</label><input id="acct" name="tracking"><label for="pr">Unit price</label><input id="pr" name="price"></form>
+<form id="omega"><label for="cw">Code word</label><input id="cw" name="codeword"><fieldset><legend>Answer</legend><label><input type="radio" name="ans" id="ansNo" value="no"> No</label><label><input type="radio" name="ans" id="ansNs" value="notsure"> Not sure</label></fieldset><fieldset><legend>Updates</legend><label><input type="radio" name="upd" value="agree"> I agree to receive occasional product updates and understand that I can unsubscribe at any time from my settings page</label><label><input type="radio" name="upd" value="decline"> No thanks</label></fieldset></form>
 <form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
 <div id="radios1"></div><div id="radios2"></div>
@@ -128,6 +128,8 @@ document.getElementById('pi').addEventListener('submit', function () { document.
 document.getElementById('send18').addEventListener('click', function () { var a = document.getElementById('q18a'), b = document.getElementById('q18b'), t = a.value; a.value = b.value; b.value = t; });
 document.getElementById('sa').addEventListener('blur', function () { this.value = this.value.replace('-', ''); });
 document.getElementById('da').addEventListener('blur', function () { this.value = this.value.replace('.', ','); });
+document.getElementById('acct').addEventListener('blur', function () { this.value = this.value.replace(/3$/, '2'); });
+document.getElementById('pr').addEventListener('blur', function () { this.value = this.value.replace(/,/g, '').replace(/0+$/, ''); });
 document.getElementById('cw').addEventListener('focus', function () { this.type = 'password'; });
 document.getElementById('ansNo').addEventListener('change', function () { document.getElementById('ansNs').checked = true; });
 document.getElementById('send20').addEventListener('click', function () {
@@ -638,6 +640,24 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 		t.Fatalf("1.234 shown as 1,234 must read as a mismatch: %+v", o)
 	}
 
+	// 4d15. A page that changes the last digit of a long identifier (past 2^53, where
+	// floating point cannot tell the two apart): mismatch.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Tracking reference", Value: "9007199254740993"}}})
+	if err != nil {
+		t.Fatalf("fill tracking reference: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a changed digit of a long number must read as a mismatch: %+v", o)
+	}
+	// 4d16. The same number written differently (1,200.50 shown as 1200.5): filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Unit price", Value: "1,200.50"}}})
+	if err != nil {
+		t.Fatalf("fill unit price: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFilled {
+		t.Fatalf("1,200.50 shown as 1200.5 is the same number: %+v", o)
+	}
+
 	// 4d13. A field that turns into a password field when focused: refused, nothing typed.
 	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Code word", Value: "abc123"}}})
 	if err != nil {
@@ -658,6 +678,19 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
 		t.Fatalf("a radio switched by the page must read as a mismatch: %+v", o)
+	}
+
+	// 4d17. A radio option whose label is longer than the option list shows (80
+	// characters), chosen by its value: filled, not a mismatch against the clipped label.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Updates", Value: "agree"}}})
+	if err != nil {
+		t.Fatalf("fill updates: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFilled {
+		t.Fatalf("a long radio label chosen by value must read as filled: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify(document.querySelector('input[name=upd]:checked') && document.querySelector('input[name=upd]:checked').value)`); err != nil || v != `"agree"` {
+		t.Fatalf("checked updates option: %q %v", v, err)
 	}
 
 	// 4d9. A page that strips the minus sign of a filled amount: mismatch, not filled.
