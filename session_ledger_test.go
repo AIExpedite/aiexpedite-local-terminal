@@ -27,7 +27,7 @@ func newTestLedger(t *testing.T, dir, bootID string) *spawnLedger {
 	l.groupOf = func(*os.Process) int { return 0 }
 	l.descendants = func(ledgerProcess) processProbeResult { return processGone }
 	l.treeGone = func(ledgerProcess, uintptr) bool { return true }
-	l.endLeftovers = func(ledgerProcess, uintptr) bool { return false }
+	l.endLeftovers = func(ledgerProcess, uintptr, string) bool { return false }
 	l.acquireOwnership = func() bool { return true }
 	l.startToken = func(pid int) (string, error) { return fmt.Sprintf("tok-%d", pid), nil }
 	// Every test ledger runs under the same OS boot unless a test says
@@ -720,8 +720,11 @@ func TestReleaseEndsLeftoversBeforeDecidingWhatToKeep(t *testing.T) {
 	var asked []int
 	l.attachJob = func(p *os.Process, _ bool) (uintptr, bool, error) { return uintptr(p.Pid), true, nil }
 	l.treeGone = func(p ledgerProcess, _ uintptr) bool { return p.PID == 1 || ended[p.PID] }
-	l.endLeftovers = func(p ledgerProcess, job uintptr) bool {
+	l.endLeftovers = func(p ledgerProcess, job uintptr, owner string) bool {
 		asked = append(asked, p.PID)
+		if owner != sessionOwnerValue("boot-1", "s") {
+			t.Fatalf("endLeftovers got owner %q", owner)
+		}
 		if job != uintptr(p.PID) {
 			t.Fatalf("endLeftovers got job %v for PID %d", job, p.PID)
 		}

@@ -206,7 +206,7 @@ type spawnLedger struct {
 	// gone: its process group (Unix) / everything in its Job Object
 	// (Windows). It never touches a recorded process that is still alive, and
 	// reports whether the tree is empty afterwards.
-	endLeftovers func(p ledgerProcess, job uintptr) bool
+	endLeftovers func(p ledgerProcess, job uintptr, owner string) bool
 	// acquireOwnership takes the ledger's lock file for this process's life.
 	// A second live agent on the same config dir (Linux has no instance
 	// guard) must never reap or rewrite the first one's ledger.
@@ -727,7 +727,7 @@ func (l *spawnLedger) endLeftoversOf(sessionID string) {
 	}
 	l.mu.Unlock()
 	for _, t := range targets {
-		if l.endLeftovers(t.p, t.job) {
+		if l.endLeftovers(t.p, t.job, sessionOwnerValue(l.bootID, sessionID)) {
 			fmt.Printf("%s[ledger] Session %s ended: stopped the processes PID %d left running%s\n",
 				colorYellow, sessionID, t.p.PID, colorReset)
 		}
@@ -1089,6 +1089,9 @@ func (l *spawnLedger) AckReaped(sessionIDs []string) {
 
 func beginSessionSpawn(sessionID string, cmd *exec.Cmd) {
 	if cmd != nil {
+		// Everything this CLI starts inherits the marker, which is how the
+		// session's leftovers are proven ours before they are ended.
+		stampSessionOwner(cmd, sessionOwnerValue(globalSpawnLedger.bootID, sessionID))
 		prepareOwnedStart(cmd)
 	}
 	globalSpawnLedger.BeginSpawn(sessionID)

@@ -328,7 +328,7 @@ func TestEndLeftoverProcessTree_NeverTouchesALiveRecordedProcess(t *testing.T) {
 	}
 	defer releaseSessionJob(job)
 	rec := recordedProcess(t, cmd.Process)
-	if endLeftoverProcessTree(rec, job) {
+	if endLeftoverProcessTree(rec, job, "") {
 		t.Fatalf("a live session's job read as ended")
 	}
 	time.Sleep(200 * time.Millisecond)

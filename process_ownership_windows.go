@@ -91,7 +91,9 @@ var leftoverWait = 3 * time.Second
 // the session started. A live recorded process is never touched here, and a
 // process outside any job (job == 0, an assignment that failed) is out of
 // reach. Reports whether the job is empty afterwards.
-func endLeftoverProcessTree(rec ledgerProcess, job uintptr) bool {
+// owner is unused here: the Job Object is the kernel's own proof that a
+// process belongs to the session.
+func endLeftoverProcessTree(rec ledgerProcess, job uintptr, owner string) bool {
 	if job == 0 {
 		return false
 	}
