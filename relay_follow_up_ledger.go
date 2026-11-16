@@ -137,7 +137,8 @@ const (
 // live follow-up certification (relay_follow_up_claude_certification_test.go,
 // relay_follow_up_codex_certification_test.go,
 // relay_follow_up_grok_certification_test.go,
-// relay_follow_up_agy_certification_test.go) with the minimum version it
+// relay_follow_up_agy_certification_test.go,
+// relay_follow_up_musecode_certification_test.go) with the minimum version it
 // passed at. A kind not listed answers every live attempt
 // notWritten/notLiveKind, so the broker queues.
 //
@@ -156,6 +157,16 @@ const (
 // over (acpHandoverAnswer), and over 10 rounds sent into short turns 9 were
 // handed over and 1 arrived after the turn, never into an idle session.
 //
+// Muse Code 1.4.20 passed its run on 2026-11-16, on its MSP driver only (a
+// one-shot `muse exec` has no running process to write into;
+// mspDriverInstalledVersion). Muse's answer to a steer does not say where it
+// goes, so the device settles one from what Muse does
+// (relay_follow_up_msp.go): a follow-up sent as a turn started was run as the
+// next turn and answered `next` naming it; one sent mid-command joined the
+// running turn, `current`; over 10 near-end rounds 3 were run as the next
+// turn and answered so and 7 were refused before a byte was written (the turn
+// closes at its final answer), none lost and none misreported.
+//
 // Claude Code 2.1.322: a message spoken or typed while the agent is working is
 // written into the running CLI's stdin instead of waiting for the turn to end.
 // Queued delivery was the behaviour the owner asked to remove — a message sat
@@ -173,6 +184,7 @@ var liveFollowUpCertified = map[string]string{
 	codexCliAgentID:       "0.168.0",
 	grokCliAgentID:        "1.0.77",
 	antigravityCliAgentID: "1.5.9",
+	museCodeCliAgentID:    "1.4.20",
 }
 
 type relayFollowUpRow struct {
