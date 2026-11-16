@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.21';
+  var VERSION = 'aix-1.0.22';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1305,9 +1305,9 @@
     var sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
   }
   // Model-backed editors (Slate, Draft, Lexical) listen for beforeinput, which execCommand
-  // does not fire: give them the chance to apply the text themselves first.
+  // does not fire: give them the chance to apply the text themselves first. The caller has
+  // focused the editor, selected its contents (selectContents) and checked it again.
   function fillContentEditable(el, value) {
-    selectContents(el);
     var bi = new InputEvent('beforeinput', { inputType: 'insertReplacementText', data: value, bubbles: true, cancelable: true, composed: true });
     if (!el.dispatchEvent(bi)) return 'beforeinput (handled by the editor)';
     var ok = false;
@@ -1515,7 +1515,9 @@
         if (isChecked(el) === want) return { done: true, outcome: 'already-set' };
         var why4 = recheck(el, kind);
         if (why4) return { done: true, outcome: 'refused-hidden', detail: why4 };
-        if (!clickToggle(el)) return { done: true, outcome: 'refused-submit-class' };
+        // Verify checks what it submits too: a handler may rewrite the box's own value.
+        state.pending.set(ref, { chosenValue: el.tagName === 'INPUT' ? el.value : null });
+        if (!clickToggle(el)) { stopPending(ref); return { done: true, outcome: 'refused-submit-class' }; }
         return { done: false, next: 'verify', waitMs: 80, method: el.tagName === 'INPUT' ? 'click' : 'pointer' };
       }
       if (kind === 'radio-group') {
@@ -1525,9 +1527,11 @@
         if (isChecked(member)) return { done: true, outcome: 'already-set' };
         var why5 = recheck(member, 'radio');
         if (why5) return { done: true, outcome: 'refused-hidden', detail: why5 };
+        // Verify checks exactly this member, its value and its full label, all as they were BEFORE
+        // the click (its handlers may rewrite them; the label in `chosen` is clipped for display).
+        var chosenR = { chosen: mo.match.label, chosenMember: new WeakRef(member), chosenFull: memberLabel(member), chosenValue: member.value };
         if (!clickToggle(member)) return { done: true, outcome: 'refused-submit-class' };
-        // Verify checks exactly this member (the label in `chosen` is clipped for display).
-        state.pending.set(ref, { chosen: mo.match.label, chosenMember: new WeakRef(member), chosenFull: memberLabel(member) });
+        state.pending.set(ref, chosenR);
         return { done: false, next: 'verify', waitMs: 80, method: 'click', chosen: mo.match.label };
       }
       if (kind === 'combobox') {
@@ -1560,8 +1564,14 @@
       if (kind === 'contenteditable') {
         var why7 = recheck(el, kind);
         if (why7) return { done: true, outcome: 'refused-hidden', detail: why7 };
+        // Focus and select first, then check the editor again, as it is now: a focus handler may
+        // repurpose it (another label, a secret field, hidden) before any text lands.
+        selectContents(el);
+        var why7b = recheck(el, kind);
+        if (why7b) return { done: true, outcome: 'refused-hidden', detail: why7b };
+        var wr7 = refusalAfterFocus(ref, value, opts);
+        if (wr7) return wr7;
         if (opts.trustedText) {
-          selectContents(el);
           if (!isFocused(el) && !el.contains(document.activeElement)) return { done: true, outcome: 'failed', detail: 'editor did not take focus' };
           return { done: false, next: 'verify', waitMs: 250, insertText: value };
         }
@@ -1639,7 +1649,11 @@
         else if (pend.chosenValue != null) ok = !!cur && cur.value === pend.chosenValue && lower(shown) === lower(chosen);
         else ok = chosen ? lower(shown) === lower(chosen) : lower(shown).indexOf(lower(value)) >= 0;
       }
-      else if (kind === 'checkbox' || kind === 'switch') { ok = isChecked(el) === toBool(value); shown = isChecked(el) ? 'checked' : 'unchecked'; }
+      else if (kind === 'checkbox' || kind === 'switch') {
+        var wantOn = toBool(value);
+        ok = isChecked(el) === wantOn && !(wantOn && pend.chosenValue != null && el.value !== pend.chosenValue);
+        shown = isChecked(el) ? 'checked' : 'unchecked';
+      }
       else if (kind === 'radio-group') {
         var sel = info.members.filter(isChecked)[0];
         shown = sel ? memberLabel(sel) : '';
@@ -1648,7 +1662,8 @@
         // member is gone; the displayed (clipped) label only when nothing else was kept; and
         // without any recorded choice, the old lenient reading stays.
         var picked = pend.chosenMember && pend.chosenMember.deref();
-        if (picked && picked.isConnected) ok = !!sel && sel === picked;
+        // Identity AND what it submits: a handler may also rewrite the chosen radio itself.
+        if (picked && picked.isConnected) ok = !!sel && sel === picked && sel.value === pend.chosenValue && lower(shown) === lower(pend.chosenFull);
         else if (pend.chosenFull) ok = !!sel && lower(shown) === lower(pend.chosenFull);
         else if (chosen) ok = !!sel && lower(clip(shown, 80)) === lower(chosen);
         else ok = !!sel && (lower(shown) === want2 || lower(shown).indexOf(lower(value)) >= 0);
@@ -1742,12 +1757,17 @@
     return { exists: true, fp: info.f.fp, visible: info.f.visible, hiddenReason: info.f.hiddenReason, sensitive: info.f.sensitive };
   }
   // Right before trusted typing: the field must still be visible and hold the focus.
-  function check(ref) {
+  // The agent's last look before it types through DevTools: still visible, focused, and still
+  // the field that was checked (identity, sensitivity, editable). fp and sensitiveConfirmed are
+  // the fill's own; outcome names a refusal other than a hidden field.
+  function check(ref, fp, sensitiveConfirmed) {
     var info = fieldFor(ref);
-    if (!info) return { ok: false, why: 'not-found' };
+    if (!info) return { ok: false, why: 'not-found', outcome: 'not-found' };
     var why = recheck(info.el, info.kind);
     if (why) return { ok: false, why: why };
     if (!isFocused(info.el) && !info.el.contains(document.activeElement)) return { ok: false, why: 'lost focus' };
+    var wr = writeRefusal(info.f, info.kind, '', { fp: fp, sensitiveConfirmed: !!sensitiveConfirmed });
+    if (wr) return { ok: false, why: wr.outcome, outcome: wr.outcome, detail: wr.detail || null };
     return { ok: true };
   }
   function read(ref) {

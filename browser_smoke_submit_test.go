@@ -95,6 +95,9 @@ second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="phi2" method="post" action="/posted24"><label for="p24">Phi two</label><input id="p24" name="phi" value="twentyfour"><button type="submit" id="send24">Send phi two</button></form>
 <form id="phi3" method="post" action="/posted25"><label for="p25">Phi three</label><input id="p25" name="phi" value="twentyfive"><button type="submit" id="send25">Send phi three</button></form>
 <form id="tiers2"><label for="tier2">Tier two</label><select id="tier2" name="tier2"><option value="">Choose</option><option value="cheap">Standard</option><option value="premium">Premium</option></select></form>
+<div id="ce26" contenteditable="true" role="textbox" aria-label="Notes one" style="min-height:24px;border:1px solid #888"></div>
+<div id="ce27" contenteditable="true" role="textbox" aria-label="Notes two" style="min-height:24px;border:1px solid #888"></div>
+<form id="plans2"><fieldset><legend>Plan choice</legend><label><input type="radio" name="pc" id="pc1" value="cheap"> Standard</label><label><input type="radio" name="pc" value="premium"> Premium</label></fieldset><label><input type="checkbox" id="cb28" name="extras" value="none"> Add extras</label><label for="t29">Delivery note</label><input id="t29" name="dnote"></form>
 <form id="tiers"><label for="tier">Tier</label><select id="tier" name="tier"><option value="">Choose</option><option value="cheap">Standard</option><option value="expensive">Standard</option></select></form>
 <form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
 <form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
@@ -159,6 +162,10 @@ document.getElementById('send25').addEventListener('click', function (e) {
   HTMLFormElement.prototype.submit.call(fm);
 });
 document.getElementById('tier2').addEventListener('change', function () { if (this.value === 'cheap') this.selectedOptions[0].value = 'expensive'; });
+['ce26', 'ce27'].forEach(function (id) { document.getElementById(id).addEventListener('focus', function () { this.setAttribute('aria-label', 'Password'); }); });
+document.getElementById('pc1').addEventListener('change', function () { this.value = 'expensive'; });
+document.getElementById('cb28').addEventListener('change', function () { this.value = 'all'; });
+document.getElementById('t29').addEventListener('focus', function () { var el = this; setTimeout(function () { el.type = 'password'; }, 0); });
 document.getElementById('send20').addEventListener('click', function () {
   var f = document.getElementById('psi');
   HTMLFormElement.prototype.submit.call(f);
@@ -764,6 +771,52 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
 		t.Fatalf("a chosen option whose value the page rewrote must read as a mismatch: %+v", o)
+	}
+
+	// 4d26. An editor whose focus handler repurposes it (relabelled "Password"): refused,
+	// nothing typed, on the trusted path and on the script path (the AppleScript route's).
+	for _, c := range []struct {
+		label, id string
+		be        browserBackend
+	}{{"Notes one", "ce26", be}, {"Notes two", "ce27", ub}} {
+		res, err = (&browserOpRun{p: browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: c.label, Value: "hello"}}}, be: c.be, stop: stop}).run(ctx)
+		if err != nil {
+			t.Fatalf("fill %s: %v", c.label, err)
+		}
+		if o := res.(browserFillResult).Outcomes; len(o) != 1 || (o[0].Outcome != "refused-sensitive" && o[0].Outcome != browserOutcomeFormChanged) {
+			t.Fatalf("an editor repurposed on focus must be refused (%s): %+v", c.label, o)
+		}
+		if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('`+c.id+`').textContent)`); err != nil || v != `""` {
+			t.Fatalf("the refused editor %s was written: %q %v", c.id, v, err)
+		}
+	}
+	// 4d27. A radio whose change handler rewrites its own value: mismatch, not filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Plan choice", Value: "cheap"}}})
+	if err != nil {
+		t.Fatalf("fill plan choice: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a radio whose value the page rewrote must read as a mismatch: %+v", o)
+	}
+	// 4d28. A checkbox whose change handler rewrites its own value: mismatch, not filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Add extras", Value: "yes"}}})
+	if err != nil {
+		t.Fatalf("fill add extras: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a checkbox whose value the page rewrote must read as a mismatch: %+v", o)
+	}
+	// 4d29. A field that turns into a password field just after it is focused (a timer): the
+	// agent's last check before it types refuses it, nothing typed (trusted path).
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Delivery note", Value: "leave at door"}}})
+	if err != nil {
+		t.Fatalf("fill delivery note: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || (o[0].Outcome != "refused-sensitive" && o[0].Outcome != browserOutcomeFormChanged) {
+		t.Fatalf("a field repurposed after focus must be refused: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('t29').value)`); err != nil || v != `""` {
+		t.Fatalf("the refused field was written: %q %v", v, err)
 	}
 
 	// 4d23. An approved POST form whose button's click handler switches it to GET and submits

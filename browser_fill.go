@@ -304,15 +304,26 @@ func (k *kitRunner) fillField(ctx context.Context, ref, fp string, pv browserPla
 				return acc, nil
 			}
 			// Trusted typing through the DevTools Input domain. Check one last time
-			// that the field is still visible and focused: a page can hide it on focus.
+			// that the field is still visible, focused and the field that was
+			// checked (identity, sensitivity, editable): a page can hide or
+			// repurpose it on focus, or on a timer after.
 			var chk struct {
-				OK  bool   `json:"ok"`
-				Why string `json:"why"`
+				OK      bool    `json:"ok"`
+				Why     string  `json:"why"`
+				Outcome string  `json:"outcome"`
+				Detail  *string `json:"detail"`
 			}
-			if _, err := k.call(ctx, "check", &chk, ref); err != nil {
+			if _, err := k.call(ctx, "check", &chk, ref, fp, pv.Confirmed); err != nil {
 				return acc, err
 			}
 			if !chk.OK {
+				if chk.Outcome != "" {
+					out := kitStepResult{Done: true, Outcome: chk.Outcome}
+					if chk.Detail != nil {
+						out.Detail, _ = json.Marshal(*chk.Detail)
+					}
+					return out, nil
+				}
 				d, _ := json.Marshal(chk.Why)
 				return kitStepResult{Done: true, Outcome: browserOutcomeRefusedHidden, Detail: d}, nil
 			}
