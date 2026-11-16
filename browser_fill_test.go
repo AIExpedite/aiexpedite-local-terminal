@@ -97,9 +97,9 @@ func TestRunBrowserFill(t *testing.T) {
 			case step == "start":
 				return map[string]any{"done": false, "next": "apply", "waitMs": 1}
 			case step == "apply":
-				stop.Store(true) // the person says stop while the first field is being typed
 				return map[string]any{"done": false, "next": "verify", "waitMs": 1, "insertText": insert}
 			}
+			stop.Store(true) // the person says stop once the first field's value is typed
 			return map[string]any{"done": true, "outcome": "filled", "readBack": "Ada"}
 		},
 		"check":  func([]json.RawMessage) any { return map[string]any{"ok": true} },
@@ -182,5 +182,51 @@ func TestBrowserFillFieldForwardsChosenLabel(t *testing.T) {
 	}
 	if verifyOpts["chosen"] != "Germany" {
 		t.Fatalf("verify step options %v, want chosen Germany", verifyOpts)
+	}
+}
+
+// A stop that arrives while the kit waits (the highlight delay before apply) or
+// while it prepares a field for typing leaves that field alone: no apply runs
+// after the wait, and no text is typed.
+func TestBrowserFillFieldHonoursStopBeforeWriting(t *testing.T) {
+	stop := &atomic.Bool{}
+	page := &fakePage{id: "d:T1", trusted: true}
+	page.kit = map[string]func([]json.RawMessage) any{
+		"fillStep": func(args []json.RawMessage) any {
+			var step string
+			_ = json.Unmarshal(args[2], &step)
+			if step == "start" {
+				go func() { time.Sleep(10 * time.Millisecond); stop.Store(true) }()
+				return map[string]any{"done": false, "next": "apply", "waitMs": 80}
+			}
+			return map[string]any{"done": false, "next": "verify", "waitMs": 1, "insertText": "Ada"}
+		},
+		"check": func([]json.RawMessage) any { return map[string]any{"ok": true} },
+		"ping":  pingOK,
+	}
+	r, err := newKitRunner(page).fillField(context.Background(), "f1_a", browserPlanValue{Field: "Name", Value: "Ada"}, true, stop)
+	if err != nil || r.Outcome != browserOutcomeStoppedMidField {
+		t.Fatalf("stop during the wait: %+v %v", r, err)
+	}
+	for _, c := range page.called("fillStep") {
+		if string(c.args[2]) == `"apply"` {
+			t.Fatal("apply ran after a stop arrived during the wait")
+		}
+	}
+
+	// The stop lands while apply prepares the field: nothing is typed.
+	stop.Store(false)
+	page2 := &fakePage{id: "d:T1", trusted: true}
+	page2.kit = map[string]func([]json.RawMessage) any{
+		"fillStep": func(args []json.RawMessage) any {
+			stop.Store(true)
+			return map[string]any{"done": false, "next": "verify", "waitMs": 1, "insertText": "Ada"}
+		},
+		"check": func([]json.RawMessage) any { return map[string]any{"ok": true} },
+		"ping":  pingOK,
+	}
+	r, err = newKitRunner(page2).fillField(context.Background(), "f1_a", browserPlanValue{Field: "Name", Value: "Ada"}, true, stop)
+	if err != nil || r.Outcome != browserOutcomeStoppedMidField || len(page2.inserted) != 0 {
+		t.Fatalf("stop before typing: %+v %v inserted=%v", r, err, page2.inserted)
 	}
 }

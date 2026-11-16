@@ -188,6 +188,28 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 		t.Fatalf("%d post(s) after a refused submit", n)
 	}
 
+	// 1a. The destination and identities reach the digest whole, never as a
+	// 32-bit fingerprint two destinations could share; and an arm needs the
+	// exact reading its check kept.
+	if _, err := pg.Eval(ctx, `document.getElementById('go').setAttribute('formaction', '/pay?recipient=329599'); 'ok'`); err != nil {
+		t.Fatal(err)
+	}
+	kr := newKitRunner(pg)
+	var chk kitSubmitCheck
+	if _, err := kr.call(ctx, "submitCheck", &chk, refs["Send alpha"]); err != nil || !chk.OK {
+		t.Fatalf("submitCheck: %+v %v", chk, err)
+	}
+	if !strings.Contains(chk.Parts.Submit, "/pay?recipient=329599") || !strings.Contains(chk.Parts.Form, "/elsewhere") {
+		t.Fatalf("destinations not kept whole: form %q submit %q", chk.Parts.Form, chk.Parts.Submit)
+	}
+	var arm kitArm
+	if _, err := kr.call(ctx, "armSubmit", &arm, refs["Send alpha"], "not-the-token", "click"); err != nil || arm.OK {
+		t.Fatalf("arm with a foreign token: %+v %v", arm, err)
+	}
+	if _, err := pg.Eval(ctx, `document.getElementById('go').removeAttribute('formaction'); 'ok'`); err != nil {
+		t.Fatal(err)
+	}
+
 	// 1b. A hidden input changes after approval: refused.
 	if _, err := pg.Eval(ctx, `document.getElementById('dest').setAttribute('action', '/submit'); 'ok'`); err != nil {
 		t.Fatal(err)

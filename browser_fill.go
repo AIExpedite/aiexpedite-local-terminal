@@ -290,6 +290,12 @@ func (k *kitRunner) fillField(ctx context.Context, ref string, pv browserPlanVal
 			opts["chosen"] = r.Chosen
 		}
 		if r.InsertText != nil {
+			// A stop that arrived while the kit prepared the field leaves it
+			// alone: the text is typed by the agent, so nothing is written yet.
+			if k.lastStop || (stop != nil && stop.Load()) {
+				acc.Outcome = browserOutcomeStoppedMidField
+				return acc, nil
+			}
 			// Trusted typing through the DevTools Input domain. Check one last time
 			// that the field is still visible and focused: a page can hide it on focus.
 			var chk struct {
@@ -326,6 +332,12 @@ func (k *kitRunner) fillField(ctx context.Context, ref string, pv browserPlanVal
 		sleepCtx(ctx, r.WaitMs)
 		if ctx.Err() != nil {
 			return acc, ctx.Err()
+		}
+		// A stop that arrived during the wait (the highlight delay, a dropdown
+		// opening) is honoured before the next step can write anything.
+		if stop != nil && stop.Load() && r.Next != "verify" {
+			acc.Outcome = browserOutcomeStoppedMidField
+			return acc, nil
 		}
 		step = r.Next
 	}
@@ -516,12 +528,21 @@ func runBrowserFill(ctx context.Context, k *kitRunner, values []browserPlanValue
 	}
 	res.Stopped = stopped && !pageChanged
 
-	// Close the window: guards stay armed for the kit's grace period.
+	// Close the window: guards stay armed for the kit's grace period, and so
+	// does the network backstop. A submit a timer started by the last change
+	// can still fire in the grace (form.submit() into an iframe created then,
+	// which neither the kit's submit nor its navigation guard sees); only
+	// DevTools' request interception stops that. It is released after the
+	// grace, or on any early return.
 	endCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*pageCallTimeout)
 	defer cancel()
-	if guardOn {
-		_ = k.tr.Guard(endCtx, false)
+	releaseGuard := func() {
+		if guardOn {
+			guardOn = false
+			_ = k.tr.Guard(endCtx, false)
+		}
 	}
+	defer releaseGuard()
 	var e kitEnd
 	if !k.hung {
 		_, _ = k.call(endCtx, "end", &e, map[string]any{"message": res.EndMessage, "lingerMs": 6000})
@@ -543,6 +564,7 @@ func runBrowserFill(ctx context.Context, k *kitRunner, values []browserPlanValue
 			}
 		}
 	}
+	releaseGuard()
 	res.BlockedSubmits = blocked + len(k.tr.GuardLog())
 	res.BackgroundRequests = requests
 	if p, err := k.ping(endCtx); err == nil {

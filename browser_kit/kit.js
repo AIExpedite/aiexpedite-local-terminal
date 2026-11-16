@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.4';
+  var VERSION = 'aix-1.0.5';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -50,7 +50,7 @@
     active: false, guardUntil: 0, guardsInstalled: false, teardownTimer: 0,
     stopRequested: false, stopAt: 0, stopTrusted: null,
     lastGestureAt: 0, lastCallAt: 0, watchdog: 0, mode: null, agentActingUntil: 0,
-    allowNavHref: null, approved: null, sawInvalid: false, shadowGuards: [],
+    allowNavHref: null, approved: null, sawInvalid: false, shadowGuards: [], submitCheck: null,
     blockedSubmits: [], allowedByPerson: [], allowedByAgent: [], requests: [], perf: null,
     retargeted: [],
     host: null, outline: null, msg: null, outlineTarget: null, raf: 0,
@@ -729,7 +729,9 @@
     f.formRef = el.form ? refFor(el.form) : null;
     f.rect = rectOf(vt);
     // Identity, not state: options and "required" may change legitimately after another fill.
-    f.fp = fnv([kind, f.type, f.name, f.id, f.autocomplete, f.label].join('␟'));
+    // ident is the same identity kept whole, for the submit digest (a 32-bit fp can collide).
+    f.ident = [kind, f.type, f.name, f.id, f.autocomplete, f.label].join('␟');
+    f.fp = fnv(f.ident);
     return f;
   }
 
@@ -765,7 +767,7 @@
       vis = mv;
     }
     var label = groupLabel(container, members);
-    return {
+    var g = {
       ref: ref, kind: 'radio-group', tag: container.tagName.toLowerCase(), type: null, role: container.getAttribute('role') || null,
       label: clip(label, 120), labelSource: 'group', visibleLabel: clip(label, 120) || null, labelMismatch: false,
       description: null, placeholder: null,
@@ -776,8 +778,10 @@
       sensitive: null, options: options, hasValue: options.some(function (o) { return o.selected; }),
       value: (options.filter(function (o) { return o.selected; })[0] || {}).label || '',
       formRef: members[0].form ? refFor(members[0].form) : null, rect: rectOf(container),
-      fp: fnv(['radio-group', label, options.map(function (o) { return o.label; }).join('|')].join('␟'))
+      ident: ['radio-group', label, options.map(function (o) { return o.label; }).join('|')].join('␟')
     };
+    g.fp = fnv(g.ident);
+    return g;
   }
 
   function scan() {
@@ -1787,10 +1791,12 @@
     // formtarget overrides (any activation of the control honours them). Attributes,
     // never the form's IDL properties, which a field named "action" or "method" shadows. The
     // form's target is left out: the guard itself retargets forms to _self while it runs.
-    parts.form = fnv([formEl.tagName, r.form ? 'form' : 'virtual', formEl.id || '', formEl.getAttribute('name') || '',
+    // Kept whole (never reduced to a 32-bit fingerprint, where two destinations can collide): the
+    // agent hashes the parts with SHA-256.
+    parts.form = ([formEl.tagName, r.form ? 'form' : 'virtual', formEl.id || '', formEl.getAttribute('name') || '',
       r.form ? (r.form.getAttribute('action') || '') : '', r.form ? lower(r.form.getAttribute('method') || 'get') : '',
       r.form ? submitUrl(r.form.getAttribute('action')) : '', r.form ? lower(r.form.getAttribute('enctype') || '') : ''].join('␟'));
-    parts.submit = fnv([c.tagName, lower(c.type || ''), c.getAttribute('name') || '', c.getAttribute('value') || '', c.id || '', controlText(c),
+    parts.submit = ([c.tagName, lower(c.type || ''), c.getAttribute('name') || '', c.getAttribute('value') || '', c.id || '', controlText(c),
       c.hasAttribute('formaction') ? submitUrl(c.getAttribute('formaction')) : '', lower(c.getAttribute('formmethod') || ''),
       lower(c.getAttribute('formenctype') || ''), c.getAttribute('formtarget') || ''].join('␟'));
     var sensitiveEls = new Set();
@@ -1800,7 +1806,7 @@
       var raw = rawValue(info);
       var sensitive = !!f.sensitive;
       if (sensitive) (info.members || [info.el]).forEach(function (m) { if (m) sensitiveEls.add(m); });
-      parts.fields.push({ fp: f.fp, value: sensitive ? '' : raw, len: sensitive ? raw.length : 0, sensitive: sensitive });
+      parts.fields.push({ fp: f.ident || f.fp, value: sensitive ? '' : raw, len: sensitive ? raw.length : 0, sensitive: sensitive });
       var shown = (f.kind === 'checkbox' || f.kind === 'switch') ? (raw === 'true' ? 'checked' : 'unchecked') : (sensitive ? (raw ? '•••' : '') : clip(raw, 500));
       if (!f.visible && !norm(raw)) return;    // an empty field nobody can see sends nothing worth showing
       var row = { label: clip(f.visibleLabel || f.label || f.name || f.kind, 120), kind: f.kind, value: shown, required: !!f.required };
@@ -1820,8 +1826,13 @@
     return {
       ok: true, docId: DOC_ID, url: location.href, origin: location.origin, title: document.title,
       submitRef: refFor(r.control), submitText: controlText(r.control), formName: r.form ? formName(r.form) : clip(document.title, 80),
-      parts: sp.parts, token: fnv(JSON.stringify(sp.parts)), fields: sp.summary
+      parts: sp.parts, fields: sp.summary
     };
+  }
+  function randomToken() {
+    var b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    return Array.prototype.map.call(b, function (x) { return (x < 16 ? '0' : '') + x.toString(16); }).join('');
   }
   // Re-reads what prepareSubmit read, for the approved control, so the agent can compare digests.
   function submitCheck(ref) {
@@ -1830,16 +1841,22 @@
     var r = resolveSubmit(ref);
     if (r.error) return { ok: false, reason: r.error };
     var sp = submitParts(r);
-    return { ok: true, docId: DOC_ID, parts: sp.parts, token: fnv(JSON.stringify(sp.parts)) };
+    // The token names this exact reading, kept here whole: armSubmit compares the form against it
+    // byte for byte (a hash of it could collide).
+    var token = randomToken();
+    state.submitCheck = { token: token, ref: ref, parts: JSON.stringify(sp.parts) };
+    return { ok: true, docId: DOC_ID, parts: sp.parts, token: token };
   }
   // The person approved this submit and the agent checked the digest: lift the guard for exactly
-  // this control, once. token is the cheap hash submitCheck returned; anything that changed in
+  // this control, once. token names the reading submitCheck kept; anything that changed in
   // between refuses. With how = 'scriptClick' (AppleScript) the kit clicks the control right here;
   // otherwise it returns the point for the agent's trusted click.
   function armSubmit(ref, token, how) {
     var r = resolveSubmit(ref);
     if (r.error) return { ok: false, reason: r.error };
-    if (fnv(JSON.stringify(submitParts(r).parts)) !== token) return { ok: false, reason: 'changed' };
+    var chk = state.submitCheck;
+    state.submitCheck = null;   // one arm per check
+    if (!chk || chk.token !== token || chk.ref !== ref || JSON.stringify(submitParts(r).parts) !== chk.parts) return { ok: false, reason: 'changed' };
     var t = clickTarget(r.control);
     if (t.why) return { ok: false, reason: 'hidden', detail: t.why };
     openGuard('submit');
