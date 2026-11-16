@@ -327,6 +327,9 @@ func (p *asPage) InsertText(ctx context.Context, text string) error { return err
 func (p *asPage) Click(ctx context.Context, x, y float64) error     { return errBrowserUnsupported }
 func (p *asPage) Guard(ctx context.Context, on bool) error          { return errBrowserUnsupported }
 func (p *asPage) GuardLog() []map[string]any                        { return nil }
+func (p *asPage) GuardWrites(ctx context.Context, on bool) error {
+	return errBrowserUnsupported
+}
 func (p *asPage) Screenshot(ctx context.Context, full bool) (browserShot, error) {
 	return browserShot{}, browserErr(browserErrScreenshotUnsupport, "screenshots need Chrome's remote debugging: turn it on at chrome://inspect/#remote-debugging")
 }

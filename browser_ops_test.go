@@ -33,6 +33,8 @@ type fakePage struct {
 	busy     atomic.Int32
 	maxBusy  atomic.Int32
 	evalWait time.Duration
+	// writeGuards records GuardWrites calls (true = on).
+	writeGuards []bool
 }
 
 func (p *fakePage) TabID() string      { return p.id }
@@ -91,6 +93,12 @@ func (p *fakePage) Click(ctx context.Context, x, y float64) error {
 }
 func (p *fakePage) Guard(ctx context.Context, on bool) error { return nil }
 func (p *fakePage) GuardLog() []map[string]any               { return nil }
+func (p *fakePage) GuardWrites(ctx context.Context, on bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.writeGuards = append(p.writeGuards, on)
+	return nil
+}
 func (p *fakePage) Navigate(ctx context.Context, url string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -154,9 +162,9 @@ func newOpRun(page *fakePage, route string, p browserParams) *browserOpRun {
 // fastSettle shortens the post-click watch for tests.
 func fastSettle(t *testing.T) {
 	t.Helper()
-	c, s := browserClickQuiet, browserSubmitQuiet
-	browserClickQuiet, browserSubmitQuiet = 50*time.Millisecond, 50*time.Millisecond
-	t.Cleanup(func() { browserClickQuiet, browserSubmitQuiet = c, s })
+	c, s, g := browserClickQuiet, browserSubmitQuiet, browserClickGrace
+	browserClickQuiet, browserSubmitQuiet, browserClickGrace = 50*time.Millisecond, 50*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { browserClickQuiet, browserSubmitQuiet, browserClickGrace = c, s, g })
 }
 
 func browserCode(err error) string {
@@ -318,6 +326,10 @@ func TestBrowserClick(t *testing.T) {
 	if cr := res.(browserClickResult); cr.Navigated || cr.URL != "https://example.com/" {
 		t.Fatalf("%+v", cr)
 	}
+	// The write backstop is on around the click and off again afterwards.
+	if g := page.writeGuards; len(g) != 2 || !g[0] || g[1] {
+		t.Fatalf("write guard calls %v, want [true false]", g)
+	}
 	page = newPage("", false)
 	if _, err := newOpRun(page, browserRouteAppleScript, browserParams{Op: browserOpClick, TabID: "a:T1", Ref: "f1_a"}).run(context.Background()); err != nil {
 		t.Fatal(err)
@@ -376,6 +388,7 @@ func TestBrowserSubmit(t *testing.T) {
 		check    any
 		arm      any
 		used     bool
+		changed  bool
 		invalid  bool
 		requests int
 		trusted  bool
@@ -385,7 +398,7 @@ func TestBrowserSubmit(t *testing.T) {
 			"submitCheck": func([]json.RawMessage) any { return s.check },
 			"armSubmit":   func([]json.RawMessage) any { return s.arm },
 			"submitEnd": func([]json.RawMessage) any {
-				return map[string]any{"ok": true, "used": s.used, "invalid": s.invalid, "requests": s.requests}
+				return map[string]any{"ok": true, "used": s.used, "changed": s.changed, "invalid": s.invalid, "requests": s.requests}
 			},
 			"ping": pingOK,
 		}}
@@ -436,6 +449,12 @@ func TestBrowserSubmit(t *testing.T) {
 	_, _, err = run(setup{check: okCheck, arm: okArm, used: false, invalid: true, trusted: true}, approved)
 	if browserCode(err) != browserErrSubmitFormChanged || !strings.Contains(err.Error(), "validation") {
 		t.Fatalf("refused: %v", err)
+	}
+	// The control's own click handler changed the data or destination after
+	// the digest check: the kit stopped it, and nothing was submitted.
+	_, _, err = run(setup{check: okCheck, arm: okArm, used: false, changed: true, trusted: true}, approved)
+	if browserCode(err) != browserErrSubmitFormChanged || !strings.Contains(err.Error(), "while it was being submitted") {
+		t.Fatalf("changed during activation: %v", err)
 	}
 	// A validation refusal while the page sent a request of its own (a script
 	// that checks validity and saves by fetch anyway) proves nothing either.

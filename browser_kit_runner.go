@@ -53,6 +53,10 @@ type browserPage interface {
 	InsertText(ctx context.Context, text string) error
 	Click(ctx context.Context, x, y float64) error
 	Guard(ctx context.Context, on bool) error
+	// GuardWrites: the backstop around an unapproved click. Every document
+	// request that is not a GET (a form posted anywhere, a main-frame or an
+	// iframe POST) is failed and logged; GETs (a link, an iframe loading) go on.
+	GuardWrites(ctx context.Context, on bool) error
 	GuardLog() []map[string]any
 	Navigate(ctx context.Context, url string) error
 	History(ctx context.Context, action string) error

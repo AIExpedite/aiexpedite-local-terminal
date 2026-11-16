@@ -34,6 +34,9 @@ var browserLoadWait = 15 * time.Second
 var (
 	browserClickQuiet  = 900 * time.Millisecond
 	browserSubmitQuiet = 2500 * time.Millisecond
+	// browserClickGrace: how long the write backstop outlasts a click that did
+	// not navigate (the kit's own guard grace after clickEnd).
+	browserClickGrace = time.Second
 )
 
 func (r *browserOpRun) run(ctx context.Context) (any, error) {
@@ -358,6 +361,21 @@ func (r *browserOpRun) click(ctx context.Context) (any, error) {
 		}
 		return nil, browserErr(browserErrCommandInvalid, "no element with that ref on the page; read the page again")
 	}
+	// The network backstop (DevTools): a handler of the clicked control could
+	// build a form aimed at a hidden iframe and call form.submit(), which fires
+	// no submit event and no main-document navigation the kit could stop. Any
+	// non-GET document request is failed until the click has settled and the
+	// kit's own grace has passed. Released on every exit.
+	guardOn := pg.GuardWrites(ctx, true) == nil
+	releaseGuard := func() {
+		if guardOn {
+			guardOn = false
+			gctx, gcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_ = pg.GuardWrites(gctx, false)
+			gcancel()
+		}
+	}
+	defer releaseGuard()
 	if pg.TrustedInput() {
 		err = pg.Click(ctx, b.X, b.Y)
 	} else {
@@ -385,7 +403,14 @@ func (r *browserOpRun) click(ctx context.Context) (any, error) {
 		_, _ = k.call(endCtx, "clickEnd", &e)
 		cancel()
 		out.BlockedSubmits = len(e.BlockedSubmits)
+		// The kit keeps its guard for a grace after clickEnd (a handler's
+		// timer); the backstop stays on as long.
+		if guardOn && ctx.Err() == nil {
+			sleepCtx(ctx, int(browserClickGrace/time.Millisecond))
+		}
 	}
+	releaseGuard()
+	out.BlockedSubmits += len(pg.GuardLog())
 	if out.URL == "" {
 		if info, ierr := r.tabInfo(ctx, pg); ierr == nil {
 			out.URL, out.Title = info.URL, info.Title
@@ -704,12 +729,18 @@ func (r *browserOpRun) submit(ctx context.Context) (any, error) {
 	if !navigated && !k.hung {
 		var e struct {
 			Used     bool `json:"used"`
+			Changed  bool `json:"changed"`
 			Invalid  bool `json:"invalid"`
 			Requests int  `json:"requests"`
 		}
 		endCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		_, endErr := k.call(endCtx, "submitEnd", &e)
 		cancel()
+		if endErr == nil && e.Changed && !e.Used {
+			// The control's own click handler changed what would be sent (or
+			// where), after the digest was checked: the kit stopped it.
+			return nil, formChanged("The page changed the form while it was being submitted, so it was stopped.")
+		}
 		if endErr == nil && !e.Used && e.Invalid && e.Requests == 0 {
 			// The browser's own validation refused it (it fired `invalid`, no
 			// submit event, and the page sent no request of its own meanwhile):

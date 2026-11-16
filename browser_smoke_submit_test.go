@@ -21,7 +21,11 @@ package main
 //   - an approved submit button in a form inside an open shadow root submits
 //     (its click and submit events are retargeted or not composed);
 //   - a form with a control named "elements" still lists its submit button;
-//   - a field the page repurposes during the highlight delay is not filled.
+//   - a field the page repurposes during the highlight delay is not filled;
+//   - an approved button whose own click handler changes a value it sends is
+//     stopped, while a token written into an empty hidden input is allowed;
+//   - an unapproved click whose handler posts a new form into a hidden iframe
+//     is blocked by the network backstop.
 
 import (
 	"context"
@@ -58,6 +62,9 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
 </form>
 <form id="shadowed" method="post" action="/posted8"><label for="el">Elements</label><input id="el" name="elements" value="x"><button type="submit">Send eta</button></form>
 <form id="retheta"><label for="th">Theta</label><input id="th" name="theta"></form>
+<form id="tamper" method="post" action="/posted9"><label for="io">Iota</label><input id="io" name="iota" value="nine"><input type="hidden" id="amt9" name="amount" value="10.00"><button id="send9" type="submit">Send iota</button></form>
+<form id="token" method="post" action="/posted10"><label for="ka">Kappa</label><input id="ka" name="kappa" value="ten"><input type="hidden" id="tok10" name="captcha" value=""><button id="send10" type="submit">Send kappa</button></form>
+<button id="sneaky" type="button">Show more</button>
 <div id="shadowhost"></div>
 <div id="shadowform"></div>
 <form id="scripted" method="post" action="/posted5">
@@ -65,6 +72,14 @@ const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title><
   <button id="send5" type="button">Send epsilon</button>
 </form>
 <script>
+document.getElementById('send9').addEventListener('click', function () { document.getElementById('amt9').value = '1000.00'; });
+document.getElementById('send10').addEventListener('click', function () { document.getElementById('tok10').value = 'tok-abc'; });
+document.getElementById('sneaky').addEventListener('click', function () {
+  var f = document.createElement('iframe'); f.name = 'sink'; f.style.display = 'none'; document.body.appendChild(f);
+  var fm = document.createElement('form'); fm.method = 'post'; fm.action = '/sneaky'; fm.target = 'sink';
+  var i = document.createElement('input'); i.name = 'x'; i.value = 'y'; fm.appendChild(i); document.body.appendChild(fm);
+  fm.submit();
+});
 var sr = document.getElementById('shadowhost').attachShadow({ mode: 'open' });
 sr.innerHTML = '<button id="toggle" type="button">Toggle details</button>';
 var sf = document.getElementById('shadowform').attachShadow({ mode: 'open' });
@@ -311,6 +326,30 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 		t.Fatalf("script click: save2=%d native=%d (%+v)", hit("POST /save2"), hit("POST /native"), res)
 	}
 
+	// 4b. The approved button's own click handler changes a value it sends.
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+	prep = prepare(refs["Send iota"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r9"})
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted9") != 0 {
+		t.Fatalf("changed during activation: %v posted9=%d", err, hit("POST /posted9"))
+	}
+
+	// 4c. An unapproved click whose handler posts a new form into a hidden
+	// iframe: the network backstop fails it.
+	if _, err := run(browserParams{Op: browserOpClick, TabID: tab, Ref: refs["Show more"]}); err != nil {
+		t.Fatalf("click show more: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := hit("POST /sneaky"); n != 0 {
+		t.Fatalf("an unapproved click posted a form %d time(s)", n)
+	}
+
 	// 5. A control inside an open shadow root is clicked, not reported covered.
 	if _, err := run(browserParams{Op: browserOpClick, TabID: tab, Ref: refs["Toggle details"]}); err != nil {
 		t.Fatalf("shadow click: %v", err)
@@ -354,6 +393,30 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if cr := res.(browserClickResult); !cr.Navigated || cr.Title != "Posted" || hit("POST /posted7") != 1 {
 		t.Fatalf("shadow-root submit: %+v posted7=%d", cr, hit("POST /posted7"))
+	}
+
+	// 8. An anti-bot token written into an empty hidden input on the way out
+	// is allowed: the approved values are unchanged.
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kappa := ""
+	for _, b := range res.(browserReadResult).Buttons {
+		if b.Text == "Send kappa" {
+			kappa = b.Ref
+		}
+	}
+	prep = prepare(kappa)
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r10"})
+	if err != nil {
+		t.Fatalf("token submit: %v", err)
+	}
+	if cr := res.(browserClickResult); !cr.Navigated || hit("POST /posted10") != 1 {
+		t.Fatalf("token submit: %+v posted10=%d", cr, hit("POST /posted10"))
 	}
 }
 

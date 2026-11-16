@@ -487,6 +487,9 @@ type cdpPage struct {
 	detached  atomic.Bool
 	guardMu   sync.Mutex
 	guardLog  []map[string]any
+	// allowGET: the interception is the click backstop (GuardWrites), which
+	// lets every GET through, not the fill guard.
+	allowGET bool
 }
 
 func (p *cdpPage) TabID() string      { return makeBrowserTabID(browserRouteDevTools, p.targetID) }
@@ -680,6 +683,13 @@ func (p *cdpPage) Screenshot(ctx context.Context, fullPage bool) (browserShot, e
 // iframe sent somewhere, a main-frame POST) is failed and logged. Chrome drops
 // the interception by itself if this connection goes away.
 func (p *cdpPage) Guard(ctx context.Context, on bool) error {
+	return p.intercept(ctx, on, false)
+}
+
+func (p *cdpPage) intercept(ctx context.Context, on, allowGET bool) error {
+	p.guardMu.Lock()
+	p.allowGET = on && allowGET
+	p.guardMu.Unlock()
 	if on {
 		return p.conn.c.Call(ctx, p.sessionID, "Fetch.enable", map[string]any{
 			"patterns": []map[string]any{{"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}},
@@ -688,13 +698,21 @@ func (p *cdpPage) Guard(ctx context.Context, on bool) error {
 	return p.conn.c.Call(ctx, p.sessionID, "Fetch.disable", nil, nil)
 }
 
+// GuardWrites turns on the click backstop: see browserPage.
+func (p *cdpPage) GuardWrites(ctx context.Context, on bool) error {
+	return p.intercept(ctx, on, true)
+}
+
 func (p *cdpPage) answerPaused(id, frameID, method, rawURL string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	p.worldMu.Lock()
 	mainFrame := frameID != "" && frameID == p.frameID
 	p.worldMu.Unlock()
-	if mainFrame && method == "GET" {
+	p.guardMu.Lock()
+	allowGET := p.allowGET
+	p.guardMu.Unlock()
+	if method == "GET" && (mainFrame || allowGET) {
 		_ = p.conn.c.Call(ctx, p.sessionID, "Fetch.continueRequest", map[string]any{"requestId": id}, nil)
 		return
 	}

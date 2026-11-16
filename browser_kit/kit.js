@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.6';
+  var VERSION = 'aix-1.0.7';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -936,7 +936,7 @@
   // submits its form without being the submitter, that form. Used once.
   function approvedSubmit(e) {
     var a = state.approved;
-    if (!a || a.used || Date.now() > a.until) return false;
+    if (!a || a.used || a.changed || Date.now() > a.until) return false;
     var el = a.el.deref(), form = a.form && a.form.deref();
     if (!el) return false;
     if (e.submitter === el || (!e.submitter && form && e.target === form) || (a.virtual && !e.submitter)) {
@@ -956,11 +956,17 @@
     var a = state.approved;
     if (!a || Date.now() > a.until + APPROVED_MS) return false;
     if (!(a.used || a.virtual || a.pressed)) return false;
+    if (a.changed) return false;
     if (!e.formData) return true;
     if (a.navUsed) return false;
-    if (!(a.used || a.virtual)) {
+    if (!a.virtual) {
+      // Form data leaves only for the approved form: to an approved destination, carrying what
+      // was approved (checked again here, after every handler ran).
       var dest = e.destination && e.destination.url;
-      if (!dest || a.actions.indexOf(String(dest).split('#')[0]) < 0) return false;
+      if (!dest || a.actions.indexOf(String(dest).split('#')[0]) < 0 || !approvedPayloadHolds(a)) {
+        a.changed = true;
+        return false;
+      }
       a.used = true;
     }
     a.navUsed = true;
@@ -1001,6 +1007,15 @@
   function onSubmitCapture(e) {
     var s = e.submitter;
     if (approvedSubmit(e)) {
+      if (!approvedPayloadHolds(state.approved, e.target)) {
+        // The click handler changed what would be sent: stop it; the person approved something else.
+        state.approved.used = false;
+        state.approved.changed = true;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        record('approved-changed', { submitter: s ? clip(accName(s) || s.innerText || s.value, 60) : null });
+        return;
+      }
       state.allowedByAgent.push({ at: Date.now(), kind: 'approved-submit' });
       return;
     }
@@ -1757,7 +1772,8 @@
   // The controls come from the form's own `elements` getter (a control named "elements" shadows
   // the property) or, for a control outside any form, from its container.
   var FORM_ELEMENTS = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'elements').get;
-  function submittedData(r, sensitiveEls) {
+  // raw: keep sensitive values too (only for comparisons that never leave the page).
+  function submittedData(r, sensitiveEls, raw) {
     var els = r.form ? Array.prototype.slice.call(FORM_ELEMENTS.call(r.form))
       : Array.prototype.slice.call(r.container.querySelectorAll('input, select, textarea'));
     var out = [];
@@ -1773,7 +1789,7 @@
       if (disabled) return;
       var push = function (v) {
         v = v == null ? '' : String(v);
-        var sens = sensitiveEls.has(el) || type === 'password';
+        var sens = !raw && (sensitiveEls.has(el) || type === 'password');
         out.push({ name: name, value: sens ? '' : v, len: sens ? v.length : 0, sensitive: sens });
       };
       if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) { if (el.checked) push(el.value); return; }
@@ -1788,6 +1804,42 @@
       push(el.value);
     });
     return out;
+  }
+  // What the submission itself carries, read again at the moment it happens: the click handlers
+  // of the approved control run AFTER armSubmit compared the digest, and could change the data
+  // or where it goes. Kept in the page only (sensitive values included, never sent anywhere).
+  function payloadOf(r) {
+    var c = r.control, by = Object.create(null);
+    var dest = r.form ? [submitUrl(r.form.getAttribute('action')), lower(r.form.getAttribute('method') || 'get'),
+      lower(r.form.getAttribute('enctype') || ''), c.hasAttribute('formaction') ? submitUrl(c.getAttribute('formaction')) : '',
+      lower(c.getAttribute('formmethod') || ''), lower(c.getAttribute('formenctype') || ''), c.getAttribute('formtarget') || '',
+      c.getAttribute('name') || '', c.getAttribute('value') || ''].join('␟') : '';
+    submittedData(r, new Set(), true).forEach(function (d) { (by[d.name] = by[d.name] || []).push(d.value); });
+    return { dest: dest, by: by };
+  }
+  // Does the submission still carry what the person approved? The destination must be the same,
+  // and every name that held a value then must hold exactly the same value(s) now. A name that
+  // was empty or absent may gain one: anti-bot and CSRF scripts write their token into an empty
+  // hidden input on the way out, and refusing that would refuse most protected forms.
+  // target: the form a submit event is for (it must be the approved one).
+  function approvedPayloadHolds(a, target) {
+    if (!a || a.virtual || !a.payload) return true;
+    // The approved control and form themselves, not a fresh resolve: a handler that relabels its
+    // button ("Sending…") must not make the control unrecognisable.
+    var c = a.el.deref(), form = a.form && a.form.deref();
+    if (!c || !form || !c.isConnected || !form.isConnected) return false;
+    if (target && target !== form) return false;
+    if (c.form != null && c.form !== form) return false;
+    var now = payloadOf({ control: c, form: form, container: form }), was = a.payload;
+    if (now.dest !== was.dest) return false;
+    for (var name in was.by) {
+      var w = was.by[name];
+      if (!w.some(function (v) { return v !== ''; })) continue;
+      var n = (now.by[name] || []).slice().sort(), ws = w.slice().sort();
+      if (n.length !== ws.length) return false;
+      for (var i = 0; i < n.length; i++) if (n[i] !== ws[i]) return false;
+    }
+    return true;
   }
   // What the digest covers, in DOM order: the page, the form's identity, every field's identity
   // and current value, and the submit control. A sensitive value (a password the person typed)
@@ -1882,7 +1934,8 @@
       if (r.control.hasAttribute('formaction')) actions.push(submitUrl(r.control.getAttribute('formaction')));
     }
     state.approved = { el: new WeakRef(r.control), form: r.form ? new WeakRef(r.form) : null, virtual: !r.form,
-      until: Date.now() + APPROVED_MS, used: false, navUsed: false, pressed: false, actions: actions };
+      until: Date.now() + APPROVED_MS, used: false, navUsed: false, pressed: false, actions: actions,
+      ref: ref, payload: payloadOf(r), changed: false };
     state.agentActingUntil = Date.now() + AGENT_ACT_MS;
     if (how === 'scriptClick') {
       // Activate the control as a press would: its own click handlers run (a page that saves by
@@ -1894,14 +1947,16 @@
     }
     return { ok: true, docId: DOC_ID, x: t.x, y: t.y };
   }
-  // used: the approved submission fired its submit event. invalid: the browser's validation
+  // used: the approved submission fired its submit event. changed: a handler changed what it
+  // would send, so it was stopped. invalid: the browser's validation
   // refused it. requests: fetch / XHR the page made meanwhile (a script-driven save sends one).
   function submitEnd() {
     var used = !!(state.approved && state.approved.used);
+    var changed = !!(state.approved && state.approved.changed);
     var invalid = state.mode === 'submit' && !!state.sawInvalid;
     var requests = state.requests.length;
     if (state.mode === 'submit') { state.approved = null; closeGuard(0); }
-    return { ok: true, docId: DOC_ID, used: used, invalid: invalid, requests: requests, blockedSubmits: state.blockedSubmits.slice() };
+    return { ok: true, docId: DOC_ID, used: used, changed: changed, invalid: invalid, requests: requests, blockedSubmits: state.blockedSubmits.slice() };
   }
 
   var API = {
