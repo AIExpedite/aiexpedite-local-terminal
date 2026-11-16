@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.26';
+  var VERSION = 'aix-1.0.27';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1290,6 +1290,7 @@
     var proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : el.tagName === 'SELECT' ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
     Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, value);
   }
+  var SET_SELECTED_INDEX = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'selectedIndex').set;
   function fireInput(el, data) {
     el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: data }));
   }
@@ -1522,7 +1523,16 @@
         if (why3) return { done: true, outcome: 'refused-hidden', detail: why3 };
         var wr3 = refusalAfterFocus(ref, value, opts);
         if (wr3) return wr3;
-        setNativeValue(el, m.match.value); fireInput(el, m.match.label); fireChange(el);
+        // Select exactly the option that matched, by its place in the list, never by its value:
+        // the value setter takes the FIRST option with that value, and two options may share one
+        // ("First branch" and "Second branch", both "shared"). It must still be there as it was
+        // matched: a focus handler that rebuilt or relabelled the list changed the field, and
+        // nothing is selected (no change handler runs for an option nobody asked for).
+        var at = Array.prototype.indexOf.call(el.options, m.match.el);
+        if (at < 0 || optionDisabled(m.match.el) || m.match.el.value !== m.match.value || norm(m.match.el.label || m.match.el.text) !== m.match.label) {
+          return { done: true, outcome: 'form-changed', detail: 'the options changed' };
+        }
+        SET_SELECTED_INDEX.call(el, at); fireInput(el, m.match.label); fireChange(el);
         // Verify checks exactly this option: two options may share a label (or a value).
         state.pending.set(ref, { chosen: m.match.label, chosenOption: new WeakRef(m.match.el), chosenValue: m.match.value });
         return { done: false, next: 'verify', waitMs: 80, method: 'setter', chosen: m.match.label };

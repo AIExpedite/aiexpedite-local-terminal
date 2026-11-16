@@ -36,7 +36,9 @@ package main
 //   - an option inside a disabled <optgroup> is never chosen;
 //   - an image button (left out of form.elements) is its form's submit control,
 //     inside the form or tied to it with form=, and its press's x / y never
-//     make an unchanged form read as changed.
+//     make an unchanged form read as changed;
+//   - a select's option is chosen by itself, never by a value it shares with
+//     another option, and only while the list is as it was matched.
 
 import (
 	"context"
@@ -97,6 +99,7 @@ second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="cities"><label for="cb24">Shipping city</label><input id="cb24" name="shipcity" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="lb24"><ul id="lb24" role="listbox" style="display:none"><li role="option">Boston</li><li role="option">Denver</li></ul></form>
 <form id="phi2" method="post" action="/posted24"><label for="p24">Phi two</label><input id="p24" name="phi" value="twentyfour"><button type="submit" id="send24">Send phi two</button></form>
 <form id="phi3" method="post" action="/posted25"><label for="p25">Phi three</label><input id="p25" name="phi" value="twentyfive"><button type="submit" id="send25">Send phi three</button></form>
+<form id="branches"><label for="br39">Branch</label><select id="br39" name="branch" onchange="this.dataset.seen = (this.dataset.seen || '') + this.selectedOptions[0].text + ';'"><option value="">Choose</option><option value="shared">First branch</option><option value="shared">Second branch</option></select><label for="br40">Office</label><select id="br40" name="office" onfocus="if (!this.dataset.done) { this.dataset.done = '1'; this.options[2].text = 'Third office'; }" onchange="this.dataset.changed = '1'"><option value="">Choose</option><option value="north">North office</option><option value="south">South office</option></select></form>
 <form id="tiers2"><label for="tier2">Tier two</label><select id="tier2" name="tier2"><option value="">Choose</option><option value="cheap">Standard</option><option value="premium">Premium</option></select></form>
 <div id="ce26" contenteditable="true" role="textbox" aria-label="Notes one" style="min-height:24px;border:1px solid #888"></div>
 <div id="ce27" contenteditable="true" role="textbox" aria-label="Notes two" style="min-height:24px;border:1px solid #888"></div>
@@ -809,6 +812,31 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
 		t.Fatalf("a chosen option whose value the page rewrote must read as a mismatch: %+v", o)
+	}
+
+	// 4d39. Two options with one value, told apart by their labels: the requested one is
+	// selected (never the first with that value), and the page's change handler sees it.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Branch", Value: "Second branch"}}})
+	if err != nil {
+		t.Fatalf("fill branch: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFilled || o[0].ReadBack != "Second branch" {
+		t.Fatalf("the second of two options sharing a value: %+v", o)
+	}
+	if v, _ := pg.Eval(ctx, `document.getElementById('br39').dataset.seen || 'none'`); !strings.Contains(v, "Second branch;") || strings.Contains(v, "First branch") {
+		t.Fatalf("the change handler saw another option: %q", v)
+	}
+	// 4d40. A focus handler relabels the matched option: the field changed, nothing is
+	// selected and no change handler runs.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Office", Value: "South office"}}})
+	if err != nil {
+		t.Fatalf("fill office: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFormChanged {
+		t.Fatalf("an option relabelled on focus must read as form-changed: %+v", o)
+	}
+	if v, _ := pg.Eval(ctx, `(document.getElementById('br40').value || 'empty') + '|' + (document.getElementById('br40').dataset.changed ? 'changed' : 'quiet')`); !strings.Contains(v, "empty|quiet") {
+		t.Fatalf("an option was selected after the list changed: %q", v)
 	}
 
 	// 4d26. An editor whose focus handler repurposes it (relabelled "Password"): refused,
