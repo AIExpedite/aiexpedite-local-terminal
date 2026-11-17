@@ -97,19 +97,6 @@ var antigravityFailureRows = map[string]antigravityFailureRow{
 	antigravityFailureUnknown:             {"Send the message again; if it repeats, check Antigravity on that computer.", true},
 }
 
-// antigravityFailureCategoryIDs lists every category id, in table order.
-var antigravityFailureCategoryIDs = []string{
-	antigravityFailureSignedOut,
-	antigravityFailureEntitlement,
-	antigravityFailureQuota,
-	antigravityFailureInvalidLaunchOption,
-	antigravityFailureCwdProject,
-	antigravityFailureInteraction,
-	antigravityFailureStalled,
-	antigravityFailureCLIDefect,
-	antigravityFailureUnknown,
-}
-
 // antigravityEvidenceSource names where a reason came from, highest first.
 type antigravityEvidenceSource int
 

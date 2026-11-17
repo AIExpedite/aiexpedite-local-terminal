@@ -540,7 +540,7 @@ func (m *AntigravityNativeManager) SendTurn(id, text string, publishFn PublishFu
 	}
 
 	run := m.runOneShot(session, runDir, executable, promptToSend, nativeID, turnTimeout, "antigravity-native:"+id)
-	if done, err := m.settleRunPreconditions(session, publishFn, run, ""); done {
+	if done, err := m.settleRunPreconditions(session, publishFn, run, false); done {
 		return err
 	}
 
@@ -562,7 +562,7 @@ func (m *AntigravityNativeManager) SendTurn(id, text string, publishFn PublishFu
 		beforeIDs = listAntigravityConversationIDs()
 
 		run = m.runOneShot(session, runDir, executable, replayPrompt, "", turnTimeout, "antigravity-native:"+id+":replay")
-		if done, err := m.settleRunPreconditions(session, publishFn, run, "replay "); done {
+		if done, err := m.settleRunPreconditions(session, publishFn, run, true); done {
 			return err
 		}
 		usedReplay = true
@@ -576,7 +576,7 @@ func (m *AntigravityNativeManager) SendTurn(id, text string, publishFn PublishFu
 	// step + closing sentence (antigravity_turn_failure.go). It never becomes
 	// an assistant turn, and the native conversation id is not adopted.
 	if run.failed() {
-		return m.publishClassifiedFailure(session, publishFn, run, runDir)
+		return m.publishClassifiedFailure(session, publishFn, run)
 	}
 	if run.streamErr != nil {
 		return m.publishTurnError(session, publishFn, run.streamErr.Error())
@@ -717,7 +717,9 @@ func containedCwd(cwd, workspaceRoot string) (string, error) {
 // antigravityTurnRun is what one `agy` run left: its stdout events, stderr,
 // exit, the driver's own stop (if any) and the failure lines in its own log.
 type antigravityTurnRun struct {
-	args        []string
+	args []string
+	// cwd is the resolved folder the run was started in (runDir).
+	cwd         string
 	rawStdout   string
 	stdoutLines []string
 	stderr      string
@@ -869,7 +871,7 @@ func (m *AntigravityNativeManager) runOneShot(
 	// (buildAntigravityNativeGateArgs) so the two never drift. The START's
 	// model and effort ride on every turn, whichever conversation it runs in.
 	args := buildAntigravityNativeTurnArgs(nativeID, session.LaunchArgs)
-	run := antigravityTurnRun{args: args}
+	run := antigravityTurnRun{args: args, cwd: runDir}
 
 	if !m.awaitLingeringTurn(session) {
 		run.shuttingDown = true
@@ -1122,17 +1124,19 @@ func (m *AntigravityNativeManager) runOneShot(
 // settleRunPreconditions publishes the outcomes that end a turn before its
 // result is read: shutting down, nothing spawned, truncation, a session ended
 // mid-turn, the driver's own stop, the turn timeout. done is false when the
-// run's result is still to be read. label prefixes the replay's messages.
-func (m *AntigravityNativeManager) settleRunPreconditions(session *AntigravityNativeSession, publishFn PublishFunc, run antigravityTurnRun, label string) (bool, error) {
+// run's result is still to be read. replay: the run is the transcript-replay
+// recovery, whose messages say so.
+func (m *AntigravityNativeManager) settleRunPreconditions(session *AntigravityNativeSession, publishFn PublishFunc, run antigravityTurnRun, replay bool) (bool, error) {
 	if run.shuttingDown {
+		err := m.publishTurnFailure(session, publishFn, antigravityShuttingDownText, "")
 		recordAntigravityTurnFailure(antigravityTurnDiagnostics{
 			SessionID: session.ID, At: time.Now().UTC().Format(time.RFC3339), AgyVersion: antigravityCapabilityVersion(),
-			Source: "shutting_down", Argv: antigravityRedactedArgv(run.args), Cwd: session.Cwd,
+			Source: "shutting_down", Argv: antigravityRedactedArgv(run.args), Cwd: run.cwd,
 		})
-		return true, m.publishTurnFailure(session, publishFn, antigravityShuttingDownText, "")
+		return true, err
 	}
 	if run.startErr != nil {
-		if label != "" {
+		if replay {
 			return true, m.publishTurnError(session, publishFn, fmt.Sprintf("replay failed: %v", run.startErr))
 		}
 		if session.Status() == "ended" {
@@ -1150,20 +1154,20 @@ func (m *AntigravityNativeManager) settleRunPreconditions(session *AntigravityNa
 		return true, fmt.Errorf("session ended during turn")
 	}
 	if run.stopCause != "" {
-		return true, m.publishClassifiedFailure(session, publishFn, run, session.Cwd)
+		return true, m.publishClassifiedFailure(session, publishFn, run)
 	}
 	if run.truncated {
 		// Requirements: oversize output must not be silently dropped/truncated
 		// as if it were a complete assistant answer.
 		msg := "Antigravity output exceeded the maximum capture size"
-		if label != "" {
+		if replay {
 			msg = "Antigravity replay output exceeded the maximum capture size"
 		}
 		return true, m.publishTurnError(session, publishFn, msg)
 	}
 	if run.timedOut {
 		msg := "Antigravity turn timed out"
-		if label != "" {
+		if replay {
 			msg = "Antigravity replay recovery timed out"
 		}
 		return true, m.publishTurnError(session, publishFn, msg)
@@ -1171,10 +1175,11 @@ func (m *AntigravityNativeManager) settleRunPreconditions(session *AntigravityNa
 	return false, nil
 }
 
-// publishClassifiedFailure classifies a failed turn, keeps its diagnostics
-// locally and publishes exactly one error frame. The transcript and the
-// native conversation id are left as they were.
-func (m *AntigravityNativeManager) publishClassifiedFailure(session *AntigravityNativeSession, publishFn PublishFunc, run antigravityTurnRun, cwd string) error {
+// publishClassifiedFailure classifies a failed turn, publishes exactly one
+// error frame and then keeps its diagnostics locally (after the publish, so
+// disk I/O never delays the person's error). The transcript and the native
+// conversation id are left as they were.
+func (m *AntigravityNativeManager) publishClassifiedFailure(session *AntigravityNativeSession, publishFn PublishFunc, run antigravityTurnRun) error {
 	logReasons := run.logReasons
 	if run.quotaReason != "" {
 		logReasons = append([]string{run.quotaReason}, logReasons...)
@@ -1182,10 +1187,11 @@ func (m *AntigravityNativeManager) publishClassifiedFailure(session *Antigravity
 	ev := collectAntigravityTurnEvidence(run.stdoutLines, run.stderr, logReasons)
 	failure := classifyAntigravityTurnFailure(ev, run.stopCause, run.stopDetail, antigravityFailureContext{
 		computer: getDeviceName(),
-		cwd:      cwd,
+		cwd:      run.cwd,
 		model:    antigravityLaunchModel(session.LaunchArgs),
 		exitCode: run.exitCode,
 	})
+	err := m.publishTurnFailure(session, publishFn, composeAntigravityFailureText(failure), failure.category)
 	recordAntigravityTurnFailure(antigravityTurnDiagnostics{
 		SessionID:    session.ID,
 		At:           time.Now().UTC().Format(time.RFC3339),
@@ -1194,14 +1200,14 @@ func (m *AntigravityNativeManager) publishClassifiedFailure(session *Antigravity
 		Category:     failure.category,
 		Source:       failure.source.String(),
 		Argv:         antigravityRedactedArgv(run.args),
-		Cwd:          cwd,
+		Cwd:          run.cwd,
 		PID:          run.pid,
 		AgyLog:       run.agyLog,
 		FailureLines: logReasons,
 		Stderr:       run.stderr,
 		StdoutTail:   antigravityDiagnosticEvents(run.stdoutLines),
 	})
-	return m.publishTurnFailure(session, publishFn, composeAntigravityFailureText(failure), failure.category)
+	return err
 }
 
 // publishStderrIfAny publishes a turn's stderr (redacted). exitCode is the

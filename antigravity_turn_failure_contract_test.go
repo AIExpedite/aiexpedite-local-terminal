@@ -24,12 +24,13 @@ func TestAntigravityTurnFailureCategoryContractPins(t *testing.T) {
 			t.Errorf("category id %q drifted from shared-constants %q", p[0], p[1])
 		}
 	}
-	if len(antigravityFailureCategoryIDs) != len(pins) || len(antigravityFailureRows) != len(pins) {
-		t.Fatalf("ids=%d rows=%d, want %d", len(antigravityFailureCategoryIDs), len(antigravityFailureRows), len(pins))
+	// Every id has exactly one row (next step + same-session column).
+	if len(antigravityFailureRows) != len(pins) {
+		t.Fatalf("rows=%d, want %d", len(antigravityFailureRows), len(pins))
 	}
-	for i, p := range pins {
-		if antigravityFailureCategoryIDs[i] != p[1] {
-			t.Errorf("table order [%d] = %q, want %q", i, antigravityFailureCategoryIDs[i], p[1])
+	for _, p := range pins {
+		if _, ok := antigravityFailureRows[p[1]]; !ok {
+			t.Errorf("no row for %q", p[1])
 		}
 	}
 	// shared-constants ANTIGRAVITY_TURN_FAILURE_NEXT_STEPS: voice speaks the
