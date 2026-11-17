@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.27';
+  var VERSION = 'aix-1.0.28';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -1222,6 +1222,20 @@
     state.retargeted.push({ el: new WeakRef(el), attr: attr, had: el.hasAttribute(attr), value: el.getAttribute(attr) });
     el.setAttribute(attr, '_self');
   }
+  // An attribute as the page has it. While the guard points an element at the page itself
+  // (retargetTo: '_self' until the guard is torn down, which comes a moment after a submit ends),
+  // the value restoreForms will put back: a reading taken in that moment must equal one taken
+  // after it (a digest made right after a submit would otherwise differ from the next one).
+  // The first record is the page's own value; restoreForms puts back exactly that one.
+  function pageAttr(el, attr) {
+    var v = el.getAttribute(attr);
+    if (v !== '_self') return v || '';
+    for (var i = 0; i < state.retargeted.length; i++) {
+      var r = state.retargeted[i];
+      if (r.attr === attr && r.el.deref() === el) return r.had ? (r.value || '') : '';
+    }
+    return v;
+  }
   function restoreForms() {
     state.retargeted.forEach(function (r) {
       var f = r.el.deref();
@@ -1322,12 +1336,36 @@
     var range = document.createRange(); range.selectNodeContents(el);
     var sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
   }
+  // Does the editor el itself hold the focus: el, or an editable part of it, never a form control
+  // inside it (a password input in the editor would take the text)? Read in el's own tree, then
+  // through any open shadow root the focus is inside.
+  function editorHoldsFocus(el) {
+    var r = el.getRootNode(), a = r && r.activeElement;
+    while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+    return !!a && (a === el || (el.contains(a) && a.isContentEditable && !/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)));
+  }
+  // Is the selection (where execCommand writes) inside el? A selection in a shadow root is read
+  // from that root: the document's reading of it is moved out to the host.
+  function selectionInside(el) {
+    var root = el.getRootNode();
+    var sel = (root !== document && typeof root.getSelection === 'function') ? root.getSelection() : getSelection();
+    if (!sel || !sel.rangeCount) return false;
+    var r = sel.getRangeAt(0);
+    return el.contains(r.startContainer) && el.contains(r.endContainer);
+  }
   // Model-backed editors (Slate, Draft, Lexical) listen for beforeinput, which execCommand
   // does not fire: give them the chance to apply the text themselves first. The caller has
-  // focused the editor, selected its contents (selectContents) and checked it again.
-  function fillContentEditable(el, value) {
+  // focused the editor, selected its contents (selectContents) and checked it again. The page's
+  // beforeinput handlers run inside that dispatch, and execCommand then writes wherever the focus
+  // and the selection are NOW (a handler may have focused a password field): afterHandlers checks
+  // the editor once more first, and its refusal, if any, is returned instead of writing.
+  // (On the DevTools route the text goes in as Chrome's own typing: the page's beforeinput
+  // handlers run inside Chrome's insertion, as when the person types, and verify reads the field.)
+  function fillContentEditable(el, value, afterHandlers) {
     var bi = new InputEvent('beforeinput', { inputType: 'insertReplacementText', data: value, bubbles: true, cancelable: true, composed: true });
     if (!el.dispatchEvent(bi)) return 'beforeinput (handled by the editor)';
+    var refusal = afterHandlers();
+    if (refusal) return refusal;
     var ok = false;
     try { ok = document.execCommand('insertText', false, value); } catch (e) { ok = false; }
     return ok ? 'execCommand' : 'failed';
@@ -1602,7 +1640,15 @@
           if (!isFocused(el) && !el.contains(document.activeElement)) return { done: true, outcome: 'failed', detail: 'editor did not take focus' };
           return { done: false, next: 'verify', waitMs: 250, insertText: value };
         }
-        return { done: false, next: 'verify', waitMs: 250, method: fillContentEditable(el, value) };
+        var r7 = fillContentEditable(el, value, function () {
+          if (!editorHoldsFocus(el)) return { done: true, outcome: 'form-changed', detail: 'the focus left the field' };
+          if (!selectionInside(el)) return { done: true, outcome: 'form-changed', detail: 'the selection left the field' };
+          var why7c = recheck(el, kind);
+          if (why7c) return { done: true, outcome: 'refused-hidden', detail: why7c };
+          return refusalAfterFocus(ref, value, opts);
+        });
+        if (typeof r7 !== 'string') return r7;
+        return { done: false, next: 'verify', waitMs: 250, method: r7 };
       }
       return { done: true, outcome: 'unsupported', detail: kind };
     }
@@ -1796,7 +1842,11 @@
     if (!info) return { ok: false, why: 'not-found', outcome: 'not-found' };
     var why = recheck(info.el, info.kind);
     if (why) return { ok: false, why: why };
-    if (!isFocused(info.el) && !info.el.contains(document.activeElement)) return { ok: false, why: 'lost focus' };
+    // Chrome's typing goes where the focus and the selection are: an editor must hold both itself
+    // (a focus handler may have focused a password input inside it, now or on a timer).
+    var held = info.kind === 'contenteditable' ? editorHoldsFocus(info.el) && selectionInside(info.el)
+      : isFocused(info.el) || info.el.contains(document.activeElement);
+    if (!held) return { ok: false, why: 'lost focus' };
     var wr = writeRefusal(info.f, info.kind, '', { fp: fp, sensitiveConfirmed: !!sensitiveConfirmed });
     if (wr) return { ok: false, why: wr.outcome, outcome: wr.outcome, detail: wr.detail || null };
     return { ok: true };
@@ -2218,7 +2268,7 @@
       r.form ? submitUrl(r.form.getAttribute('action')) : '', r.form ? lower(r.form.getAttribute('enctype') || '') : ''].join('␟'));
     parts.submit = ([c.tagName, lower(c.type || ''), c.getAttribute('name') || '', c.getAttribute('value') || '', c.id || '', controlText(c),
       c.hasAttribute('formaction') ? submitUrl(c.getAttribute('formaction')) : '', lower(c.getAttribute('formmethod') || ''),
-      lower(c.getAttribute('formenctype') || ''), c.getAttribute('formtarget') || ''].join('␟'));
+      lower(c.getAttribute('formenctype') || ''), pageAttr(c, 'formtarget')].join('␟'));
     var sensitiveEls = new Set();
     sc.fields.forEach(function (f) {
       var info = fieldFor(f.ref);

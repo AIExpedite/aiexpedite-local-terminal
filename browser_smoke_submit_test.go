@@ -38,7 +38,12 @@ package main
 //     inside the form or tied to it with form=, and its press's x / y never
 //     make an unchanged form read as changed;
 //   - a select's option is chosen by itself, never by a value it shares with
-//     another option, and only while the list is as it was matched.
+//     another option, and only while the list is as it was matched;
+//   - on the script path, an editor whose beforeinput handler moves the focus
+//     or the selection, or repurposes it, is not written (nor is the field
+//     the focus or the selection moved to);
+//   - trusted typing into an editor never lands in a password input inside it
+//     that a focus handler focused, at once or on a timer.
 
 import (
 	"context"
@@ -103,6 +108,14 @@ second line</textarea><button id="send16" type="submit">Send tau</button></form>
 <form id="tiers2"><label for="tier2">Tier two</label><select id="tier2" name="tier2"><option value="">Choose</option><option value="cheap">Standard</option><option value="premium">Premium</option></select></form>
 <div id="ce26" contenteditable="true" role="textbox" aria-label="Notes one" style="min-height:24px;border:1px solid #888"></div>
 <div id="ce27" contenteditable="true" role="textbox" aria-label="Notes two" style="min-height:24px;border:1px solid #888"></div>
+<div id="ce41" contenteditable="true" role="textbox" aria-label="Notes three" style="min-height:24px;border:1px solid #888"></div><input type="password" id="pw41" aria-label="Decoy secret">
+<div id="ce42" contenteditable="true" role="textbox" aria-label="Notes four" style="min-height:24px;border:1px solid #888"></div>
+<div id="ce43" contenteditable="true" role="textbox" aria-label="Notes five" style="min-height:24px;border:1px solid #888"></div><div id="ce43b" contenteditable="true" role="textbox" aria-label="Notes decoy" style="min-height:24px;border:1px solid #888"></div>
+<div id="ce44" contenteditable="true" role="textbox" aria-label="Notes six" style="min-height:24px;border:1px solid #888"><input type="password" id="pw44" aria-label="Inner secret"></div>
+<div id="ce45" contenteditable="true" role="textbox" aria-label="Notes seven" style="min-height:24px;border:1px solid #888"></div><p id="p45">After notes seven</p>
+<div id="ce46" contenteditable="true" role="textbox" aria-label="Notes eight" style="min-height:24px;border:1px solid #888"><input type="password" id="pw46" aria-label="Inner secret two"></div>
+<div id="ce47" contenteditable="true" role="textbox" aria-label="Notes nine" style="min-height:24px;border:1px solid #888"><input type="password" id="pw47" aria-label="Inner secret three"></div>
+<div id="ce48" contenteditable="true" role="textbox" aria-label="Notes ten" style="min-height:24px;border:1px solid #888"></div><p id="p48">After notes ten</p>
 <form id="plans2"><fieldset><legend>Plan choice</legend><label><input type="radio" name="pc" id="pc1" value="cheap"> Standard</label><label><input type="radio" name="pc" value="premium"> Premium</label></fieldset><label><input type="checkbox" id="cb28" name="extras" value="none"> Add extras</label><label for="t29">Delivery note</label><input id="t29" name="dnote"></form>
 <form id="seats"><fieldset><legend>Seat class</legend><label><input type="radio" name="sc" id="sc1" value="cheap"> Standard</label><label><input type="radio" name="sc" id="sc2" value="expensive"> Standard</label></fieldset></form>
 <form id="omega2" method="post" action="/posted31"><label for="r31">Required thing</label><input id="r31" name="req" required><button type="submit" id="send31">Send required</button></form>
@@ -177,6 +190,14 @@ document.getElementById('send25').addEventListener('click', function (e) {
 });
 document.getElementById('tier2').addEventListener('change', function () { if (this.value === 'cheap') this.selectedOptions[0].value = 'expensive'; });
 ['ce26', 'ce27'].forEach(function (id) { document.getElementById(id).addEventListener('focus', function () { this.setAttribute('aria-label', 'Password'); }); });
+document.getElementById('ce41').addEventListener('beforeinput', function () { document.getElementById('pw41').focus(); });
+document.getElementById('ce42').addEventListener('beforeinput', function () { this.setAttribute('aria-label', 'Password'); });
+document.getElementById('ce43').addEventListener('beforeinput', function () { var r = document.createRange(); r.selectNodeContents(document.getElementById('ce43b')); var sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); });
+document.getElementById('ce44').addEventListener('beforeinput', function () { document.getElementById('pw44').focus(); });
+document.getElementById('ce45').addEventListener('beforeinput', function () { getSelection().extend(document.getElementById('p45').firstChild, 5); });
+document.getElementById('ce46').addEventListener('focus', function () { if (!this.dataset.moved) { this.dataset.moved = '1'; document.getElementById('pw46').focus(); } });
+document.getElementById('ce47').addEventListener('focus', function () { if (!this.dataset.moved) { this.dataset.moved = '1'; setTimeout(function () { document.getElementById('pw47').focus(); }, 0); } });
+document.getElementById('ce48').addEventListener('focus', function () { if (!this.dataset.moved) { this.dataset.moved = '1'; setTimeout(function () { getSelection().extend(document.getElementById('p48').firstChild, 5); }, 0); } });
 document.getElementById('pc1').addEventListener('change', function () { this.value = 'expensive'; });
 document.getElementById('ex33').addEventListener('blur', function () { this.value = this.value.replace('e-', 'e'); });
 document.getElementById('co34').addEventListener('blur', function () { this.value = this.value.replace(', -', ', '); });
@@ -856,6 +877,82 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 			t.Fatalf("the refused editor %s was written: %q %v", c.id, v, err)
 		}
 	}
+	// 4d41. Script path (the AppleScript route's): the editor's beforeinput handler focuses a
+	// password field without cancelling the event. Nothing is written, there or in the editor.
+	res, err = (&browserOpRun{p: browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Notes three", Value: "hello"}}}, be: ub, stop: stop}).run(ctx)
+	if err != nil {
+		t.Fatalf("fill notes three: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFormChanged {
+		t.Fatalf("an editor whose beforeinput handler moves the focus must read as form-changed: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify([document.getElementById('ce41').textContent, document.getElementById('pw41').value])`); err != nil || v != `["",""]` {
+		t.Fatalf("text landed after the focus moved: %q %v", v, err)
+	}
+	// 4d42. Script path: the editor's beforeinput handler relabels it "Password". Refused,
+	// nothing written.
+	res, err = (&browserOpRun{p: browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Notes four", Value: "hello"}}}, be: ub, stop: stop}).run(ctx)
+	if err != nil {
+		t.Fatalf("fill notes four: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || (o[0].Outcome != "refused-sensitive" && o[0].Outcome != browserOutcomeFormChanged) {
+		t.Fatalf("an editor repurposed in its beforeinput handler must be refused: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('ce42').textContent)`); err != nil || v != `""` {
+		t.Fatalf("the repurposed editor was written: %q %v", v, err)
+	}
+	// 4d43. Script path: the editor's beforeinput handler moves the selection into another
+	// editor. Nothing is written, there or in the editor.
+	res, err = (&browserOpRun{p: browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Notes five", Value: "hello"}}}, be: ub, stop: stop}).run(ctx)
+	if err != nil {
+		t.Fatalf("fill notes five: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFormChanged {
+		t.Fatalf("an editor whose beforeinput handler moves the selection must read as form-changed: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify([document.getElementById('ce43').textContent, document.getElementById('ce43b').textContent])`); err != nil || v != `["",""]` {
+		t.Fatalf("text landed after the selection moved: %q %v", v, err)
+	}
+	// 4d44. Script path: the beforeinput handler focuses a password input INSIDE the editor
+	// (the selection is still in the editor, the focus is not on it). Nothing is written.
+	// 4d45. Script path: the handler extends the selection past the editor (the focus stays).
+	// Nothing is written.
+	for _, c := range []struct{ label, read string }{
+		{"Notes six", `JSON.stringify([document.getElementById('ce44').innerText.trim(), document.getElementById('pw44').value])`},
+		{"Notes seven", `JSON.stringify([document.getElementById('ce45').textContent, document.getElementById('p45').textContent === 'After notes seven' ? '' : 'changed'])`},
+	} {
+		res, err = (&browserOpRun{p: browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: c.label, Value: "hello"}}}, be: ub, stop: stop}).run(ctx)
+		if err != nil {
+			t.Fatalf("fill %s: %v", c.label, err)
+		}
+		if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFormChanged {
+			t.Fatalf("%s: an editor whose beforeinput handler moves the focus or the selection must read as form-changed: %+v", c.label, o)
+		}
+		if v, err := pg.Eval(ctx, c.read); err != nil || v != `["",""]` {
+			t.Fatalf("%s: text landed: %q %v", c.label, v, err)
+		}
+	}
+	// 4d46. Trusted typing (DevTools): the editor's focus handler focuses a password input
+	// inside it. 4d47. The same, on a timer just after the editor took the focus. Chrome's
+	// typing would land in the password input: nothing is typed anywhere.
+	// 4d48. Trusted typing: a timer extends the selection past the editor just after it took
+	// the focus. Nothing is typed.
+	for _, c := range []struct{ label, read string }{
+		{"Notes eight", `JSON.stringify([document.getElementById('ce46').innerText.trim(), document.getElementById('pw46').value])`},
+		{"Notes nine", `JSON.stringify([document.getElementById('ce47').innerText.trim(), document.getElementById('pw47').value])`},
+		{"Notes ten", `JSON.stringify([document.getElementById('ce48').textContent, document.getElementById('p48').textContent === 'After notes ten' ? '' : 'changed'])`},
+	} {
+		res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: c.label, Value: "hello"}}})
+		if err != nil {
+			t.Fatalf("fill %s: %v", c.label, err)
+		}
+		if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome == browserOutcomeFilled {
+			t.Fatalf("%s: an editor that lost the focus or the selection before typing must not be filled: %+v", c.label, o)
+		}
+		if v, err := pg.Eval(ctx, c.read); err != nil || v != `["",""]` {
+			t.Fatalf("%s: text landed: %q %v", c.label, v, err)
+		}
+	}
 	// 4d27. A radio whose change handler rewrites its own value: mismatch, not filled.
 	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Plan choice", Value: "cheap"}}})
 	if err != nil {
@@ -1066,8 +1163,11 @@ func TestBrowserSmokeSubmit(t *testing.T) {
 	}
 	// Trusted click: the pin observer undoes the re-aiming as soon as the handler returns, so the
 	// approved data posts to the page itself and the page navigates.
+	// The script click above ended with the button pinned to _self, and the guard restores it a
+	// moment later: a prepare inside that moment must still match the submit after it.
 	before23 := hit("POST /posted23")
 	prep = prepare(refs["Send kappa three"])
+	time.Sleep(300 * time.Millisecond)
 	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r23b"})
 	if err != nil || hit("POST /posted23") != before23+1 || !res.(browserClickResult).Navigated {
 		t.Fatalf("re-aimed with the event stopped (trusted): %v posted23 %d -> %d %+v", err, before23, hit("POST /posted23"), res)
