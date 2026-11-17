@@ -55,6 +55,11 @@ const (
 	antigravityMonitorMaxLine = 256 * 1024
 	// Bytes of new log read per tick.
 	antigravityMonitorLogChunk = 256 * 1024
+	// Ticks spent looking for the run's own log block before giving up. agy
+	// writes it at startup, so a block not found by then is not coming (a
+	// build that logs elsewhere); each search lists the log directory and may
+	// read up to antigravityWatchedNewest logs, so it is not repeated forever.
+	antigravityMonitorLogSearchMax = 30
 )
 
 // Package vars so tests can shorten them.
@@ -79,7 +84,14 @@ var antigravityPendingInteractionLogLine = regexp.MustCompile(`(?i)\b(ask_questi
 type antigravityTurnMonitor struct {
 	sessionID string
 	spawnedAt time.Time
-	mode      string
+	// The bounds and log base this turn runs under, read once at its start
+	// (the package vars are test seams; the monitor's goroutines never read
+	// them again).
+	mode       string
+	stallBound time.Duration
+	permSettle time.Duration
+	tickEvery  time.Duration
+	logBase    string
 	// onStop interrupts the turn and force-kills its tree; onQuota records a
 	// quota reason from the log. Both are called at most once.
 	onStop  func()
@@ -96,11 +108,12 @@ type antigravityTurnMonitor struct {
 	pendingPerm map[int]time.Time
 	observed    map[string]bool
 
-	pid        int
-	logPath    string
-	logOffset  int64
-	logForeign bool // a later run's block started in the same file
-	quotaSeen  bool
+	pid         int
+	logPath     string
+	logOffset   int64
+	logForeign  bool // a later run's block started in the same file
+	logSearches int  // ticks spent looking for the run's block
+	quotaSeen   bool
 
 	stopped    atomic.Bool
 	stopCh     chan struct{}
@@ -115,6 +128,10 @@ func newAntigravityTurnMonitor(sessionID string, spawnedAt time.Time, limit int,
 		sessionID:   sessionID,
 		spawnedAt:   spawnedAt,
 		mode:        antigravityInteractionStopMode,
+		stallBound:  antigravityStallBound,
+		permSettle:  antigravityPermissionSettle,
+		tickEvery:   antigravityMonitorTick,
+		logBase:     antigravityRunLogBase(),
 		onStop:      onStop,
 		onQuota:     onQuota,
 		limit:       limit,
@@ -221,7 +238,7 @@ func (mon *antigravityTurnMonitor) onLine(line string) {
 					mon.pendingPerm[idx] = now
 					label := s.interactionLabel()
 					first := now
-					time.AfterFunc(antigravityPermissionSettle, func() { mon.settlePermission(idx, first, label) })
+					time.AfterFunc(mon.permSettle, func() { mon.settlePermission(idx, first, label) })
 				}
 			} else {
 				fire = s.interactionLabel()
@@ -263,6 +280,13 @@ func (mon *antigravityTurnMonitor) interactionSignal(label string, firstSeen tim
 
 // stop fires the turn's stop once.
 func (mon *antigravityTurnMonitor) stop(cause, detail string, signalAt time.Time) {
+	// A finished turn is never stopped: a permission settle timer can fire
+	// after the run returned, and its process is gone by then.
+	select {
+	case <-mon.doneCh:
+		return
+	default:
+	}
 	if !mon.stopped.CompareAndSwap(false, true) {
 		return
 	}
@@ -290,7 +314,7 @@ func (mon *antigravityTurnMonitor) run(pid int) {
 	mon.mu.Lock()
 	mon.pid = pid
 	mon.mu.Unlock()
-	ticker := time.NewTicker(antigravityMonitorTick)
+	ticker := time.NewTicker(mon.tickEvery)
 	defer ticker.Stop()
 	for {
 		select {
@@ -316,7 +340,7 @@ func (mon *antigravityTurnMonitor) tick(now time.Time) {
 	}
 	mon.followLog(now)
 	mon.mu.Lock()
-	stalled := !mon.initAt.IsZero() && !mon.afterIni && now.Sub(mon.initAt) >= antigravityStallBound
+	stalled := !mon.initAt.IsZero() && !mon.afterIni && now.Sub(mon.initAt) >= mon.stallBound
 	mon.mu.Unlock()
 	if stalled {
 		mon.stop(antigravityFailureStalled, "", now)
@@ -328,13 +352,17 @@ func (mon *antigravityTurnMonitor) tick(now time.Time) {
 func (mon *antigravityTurnMonitor) followLog(now time.Time) {
 	mon.mu.Lock()
 	pid, path, offset, foreign := mon.pid, mon.logPath, mon.logOffset, mon.logForeign
+	searching := path == "" && mon.logSearches < antigravityMonitorLogSearchMax
+	if searching {
+		mon.logSearches++
+	}
 	mon.mu.Unlock()
-	if pid <= 0 || foreign {
+	if pid <= 0 || foreign || (path == "" && !searching) {
 		return
 	}
 	var fresh []byte
 	if path == "" {
-		p, block, ok := antigravityPIDBlockFile(antigravityRunLogBase(), pid, mon.spawnedAt)
+		p, block, ok := antigravityPIDBlockFile(mon.logBase, pid, mon.spawnedAt)
 		if !ok {
 			return
 		}
@@ -399,7 +427,7 @@ func (mon *antigravityTurnMonitor) followLog(now time.Time) {
 	}
 	for _, raw := range bytes.Split(fresh, []byte("\n")) {
 		line := string(raw)
-		if !antigravityGlogLine.MatchString(line) {
+		if !antigravityGlogRecord.MatchString(line) {
 			continue
 		}
 		if m := antigravityPendingInteractionLogLine.FindStringSubmatch(line); m != nil {

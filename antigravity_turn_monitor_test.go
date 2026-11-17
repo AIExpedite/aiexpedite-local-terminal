@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -221,14 +222,15 @@ func TestAntigravityMonitor_IgnoredInterruptIsForceKilled(t *testing.T) {
 func installUnkillableTurnTree(t *testing.T) (restore func()) {
 	t.Helper()
 	prev := antigravityKillTurnTree
-	var disabled = true
+	var disabled atomic.Bool
+	disabled.Store(true)
 	antigravityKillTurnTree = func(cmd *exec.Cmd) {
-		if !disabled {
+		if !disabled.Load() {
 			prev(cmd)
 		}
 	}
 	t.Cleanup(func() { antigravityKillTurnTree = prev })
-	return func() { disabled = false }
+	return func() { disabled.Store(false) }
 }
 
 func TestAntigravityLingering_SurvivingTreeStillPublishesThenShutsDownNextSend(t *testing.T) {
@@ -297,5 +299,43 @@ func TestAntigravityLingering_UnrelatedAgyIsNotWaitedFor(t *testing.T) {
 	err, took := sendAndTime(t, m, s.ID, &fl)
 	if err != nil || took > 3*time.Second {
 		t.Fatalf("err=%v took=%s — an unrelated process must not hold the turn", err, took)
+	}
+}
+
+// A finished turn is never stopped: a permission settle timer can fire after
+// the run returned, when its PID may already name another program.
+func TestAntigravityMonitor_NoStopAfterFinish(t *testing.T) {
+	called := make(chan struct{}, 1)
+	mon := newAntigravityTurnMonitor("s", time.Now(), 1024, func() { called <- struct{}{} }, nil)
+	mon.finish()
+	mon.stop(antigravityFailureInteraction, "ask_question", time.Now())
+	select {
+	case <-called:
+		t.Fatal("a finished turn's process was signalled")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if mon.stopped.Load() {
+		t.Fatal("a finished turn recorded a stop")
+	}
+}
+
+// The run's own log block is looked for a bounded number of ticks, never for
+// the whole turn.
+func TestAntigravityMonitor_LogSearchIsBounded(t *testing.T) {
+	base := filepath.Join(t.TempDir(), ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(antigravityLogDir(base), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := antigravityRunLogBase
+	antigravityRunLogBase = func() string { return base }
+	resetAntigravityLogIndex()
+	t.Cleanup(func() { antigravityRunLogBase = prev; resetAntigravityLogIndex() })
+	mon := newAntigravityTurnMonitor("s", time.Now(), 1024, nil, nil)
+	mon.pid = 424242
+	for i := 0; i < antigravityMonitorLogSearchMax+10; i++ {
+		mon.followLog(time.Now())
+	}
+	if mon.logSearches != antigravityMonitorLogSearchMax {
+		t.Fatalf("searches = %d, want %d", mon.logSearches, antigravityMonitorLogSearchMax)
 	}
 }

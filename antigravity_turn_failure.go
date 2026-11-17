@@ -187,9 +187,6 @@ func (ev *antigravityTurnEvidence) sorted() []antigravityEvidence {
 	return out
 }
 
-// antigravityGlogLine matches a glog-formatted line (agy's own log format).
-var antigravityGlogLine = regexp.MustCompile(`^[IWEF]\d{4} \d{2}:\d{2}:\d{2}\.\d{1,6}\s+\d+\s+\S+\] `)
-
 // collectAntigravityTurnEvidence gathers a failed turn's evidence from its
 // stdout lines, stderr and the run's own log failure reasons.
 func collectAntigravityTurnEvidence(stdoutLines []string, stderr string, logReasons []string) antigravityTurnEvidence {
@@ -232,7 +229,7 @@ func collectAntigravityTurnEvidence(stdoutLines []string, stderr string, logReas
 	var stderrKept []string
 	for _, line := range strings.Split(stderr, "\n") {
 		line = strings.TrimRight(line, "\r")
-		if strings.TrimSpace(line) == "" || antigravityGlogLine.MatchString(line) {
+		if strings.TrimSpace(line) == "" || antigravityGlogRecord.MatchString(line) {
 			continue
 		}
 		stderrKept = append(stderrKept, line)
@@ -504,24 +501,10 @@ func boundAntigravityFailureReason(reason, category string) string {
 	}
 	if category == antigravityFailureQuota && strings.HasPrefix(reason, antigravityQuotaWrapperPrefix) && strings.HasSuffix(reason, "]") {
 		inner := strings.TrimSuffix(strings.TrimPrefix(reason, antigravityQuotaWrapperPrefix), "]")
-		room := antigravityFailureReasonMax - utf8.RuneCountInString(antigravityQuotaWrapperPrefix) - 2 // "…]"
-		return antigravityQuotaWrapperPrefix + truncateRunes(inner, room) + "…]"
+		room := antigravityFailureReasonMax - utf8.RuneCountInString(antigravityQuotaWrapperPrefix) - 1 // "]"
+		return antigravityQuotaWrapperPrefix + clipString(inner, room) + "]"
 	}
-	return truncateRunes(reason, antigravityFailureReasonMax-1) + "…"
-}
-
-func truncateRunes(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	i := 0
-	for pos := range s {
-		if i == n {
-			return s[:pos]
-		}
-		i++
-	}
-	return s
+	return clipString(reason, antigravityFailureReasonMax)
 }
 
 // antigravityLaunchModel is the START's --model value, "" when agy's default

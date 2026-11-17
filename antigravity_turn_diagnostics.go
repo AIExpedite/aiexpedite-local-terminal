@@ -73,7 +73,7 @@ func antigravityDiagnosticEvents(lines []string) []antigravityDiagnosticEvent {
 			continue
 		}
 		if !strings.HasPrefix(line, "{") {
-			out = append(out, antigravityDiagnosticEvent{Event: "text", PlainText: truncateRunes(redactAgentSecrets(line), 400)})
+			out = append(out, antigravityDiagnosticEvent{Event: "text", PlainText: clipString(redactAgentSecrets(line), 400)})
 			continue
 		}
 		var event antigravityStreamEvent
@@ -88,7 +88,7 @@ func antigravityDiagnosticEvents(lines []string) []antigravityDiagnosticEvent {
 			if event.Result != nil {
 				d.Status = event.Result.Status
 				if strings.EqualFold(event.Result.Status, "ERROR") {
-					d.Error = truncateRunes(redactAgentSecrets(event.Result.Error), 400)
+					d.Error = clipString(redactAgentSecrets(event.Result.Error), 400)
 				}
 			}
 			out = append(out, d)
@@ -97,7 +97,7 @@ func antigravityDiagnosticEvents(lines []string) []antigravityDiagnosticEvent {
 			if s := event.StepUpdate; s != nil {
 				d.StepType, d.State, d.ToolName = s.StepType, s.State, s.ToolName
 				if msg := s.failureSentence(); msg != "" {
-					d.Error = truncateRunes(redactAgentSecrets(msg), 400)
+					d.Error = clipString(redactAgentSecrets(msg), 400)
 				}
 			}
 			out = append(out, d)
@@ -142,16 +142,19 @@ func recordAntigravityTurnFailure(d antigravityTurnDiagnostics) {
 	if dir == "" {
 		return
 	}
-	d.Stderr = truncateRunes(redactAgentSecrets(d.Stderr), 16*1024)
+	d.Stderr = clipString(redactAgentSecrets(d.Stderr), 16*1024)
+	// A copy: the caller's slice is the classifier's evidence.
+	lines := make([]string, len(d.FailureLines))
 	for i, l := range d.FailureLines {
-		d.FailureLines[i] = truncateRunes(redactAgentSecrets(l), 2000)
+		lines[i] = clipString(redactAgentSecrets(l), 2000)
 	}
+	d.FailureLines = lines
 	raw, err := json.MarshalIndent(d, "", "  ")
 	for err == nil && len(raw) > antigravityDiagnosticsMaxBytes && (len(d.StdoutTail) > 0 || d.Stderr != "") {
 		if len(d.StdoutTail) > 0 {
 			d.StdoutTail = d.StdoutTail[1:]
 		} else {
-			d.Stderr = truncateRunes(d.Stderr, len(d.Stderr)/2)
+			d.Stderr = clipString(d.Stderr, len(d.Stderr)/2)
 		}
 		raw, err = json.MarshalIndent(d, "", "  ")
 	}
@@ -180,7 +183,7 @@ func sanitizeDiagnosticsName(id string) string {
 	if b.Len() == 0 {
 		return "session"
 	}
-	return truncateRunes(b.String(), 80)
+	return clipString(b.String(), 80)
 }
 
 // pruneAntigravityTurnDiagnostics keeps the newest antigravityDiagnosticsKeep

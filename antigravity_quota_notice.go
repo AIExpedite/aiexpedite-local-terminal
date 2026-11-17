@@ -118,16 +118,11 @@ func isAntigravityErrorMessageStep(line string) bool {
 	if !strings.HasPrefix(trimmed, "{") || !strings.Contains(trimmed, "error_message") {
 		return false
 	}
-	var ev struct {
-		Event      string `json:"event"`
-		StepUpdate struct {
-			StepType string `json:"step_type"`
-		} `json:"step_update"`
-	}
+	var ev antigravityStreamEvent
 	if err := json.Unmarshal([]byte(trimmed), &ev); err != nil {
 		return false
 	}
-	return ev.Event == "step_update" && ev.StepUpdate.StepType == "error_message"
+	return ev.Event == "step_update" && ev.StepUpdate != nil && ev.StepUpdate.StepType == "error_message"
 }
 
 // isAntigravityQuotaReason reports whether a run-failure reason is the account

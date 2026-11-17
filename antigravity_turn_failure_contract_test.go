@@ -32,6 +32,24 @@ func TestAntigravityTurnFailureCategoryContractPins(t *testing.T) {
 			t.Errorf("table order [%d] = %q, want %q", i, antigravityFailureCategoryIDs[i], p[1])
 		}
 	}
+	// shared-constants ANTIGRAVITY_TURN_FAILURE_NEXT_STEPS: voice speaks the
+	// same next step the card shows.
+	nextSteps := map[string]string{
+		"signed_out":            "Sign in to Antigravity on that computer, then send the message again.",
+		"entitlement":           "Fix the Antigravity account's plan and send the message again, or start a new session with another model.",
+		"quota":                 "Wait until the quota resets and send the message again, or start a new session with another model.",
+		"invalid_launch_option": "Start a new session with another model or effort.",
+		"cwd_project":           "Start a new session in a project folder Antigravity can open.",
+		"interaction_required":  "Rephrase the task so it does not need that, then send it again.",
+		"stalled":               "Send the message again; if it repeats, restart Antigravity on that computer.",
+		"cli_defect":            "Update Antigravity on that computer, then send the message again.",
+		"unknown":               "Send the message again; if it repeats, check Antigravity on that computer.",
+	}
+	for cat, want := range nextSteps {
+		if got := antigravityFailureRows[cat].nextStep; got != want {
+			t.Errorf("next step for %s drifted: %q, want %q", cat, got, want)
+		}
+	}
 	// shared-constants ANTIGRAVITY_TURN_SHUTTING_DOWN_TEXT: voice speaks it as is.
 	if antigravityShuttingDownText != "Antigravity's previous run on this computer is still shutting down. Send the message again in a moment, or restart Antigravity on that computer." {
 		t.Fatalf("shutting-down text drifted: %q", antigravityShuttingDownText)

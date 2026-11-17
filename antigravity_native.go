@@ -782,6 +782,21 @@ var (
 type antigravityLingeringTurn struct {
 	pid int
 	cmd *exec.Cmd
+	// reaped is set once cmd.Wait has returned. From then on the PID (and on
+	// Windows the handle that pinned it) is released and may name another
+	// program, so its tree is only ended through the ledger (the turn's own
+	// process group / Job Object), never by PID.
+	reaped *atomic.Bool
+}
+
+// killTree force-kills the turn's tree by PID only while the process is not
+// yet reaped (its PID cannot have been reused), and always ends what the
+// ledger holds for it.
+func (lg *antigravityLingeringTurn) killTree(sessionID string) {
+	if !lg.reaped.Load() {
+		antigravityKillTurnTree(lg.cmd)
+	}
+	antigravityEndTurnLeftovers(sessionID, lg.pid)
 }
 
 // awaitLingeringTurn holds a new turn's spawn until the previous STOPPED
@@ -816,8 +831,7 @@ func (m *AntigravityNativeManager) awaitLingeringTurn(session *AntigravityNative
 		colorYellow, lg.pid, session.ID, colorReset)
 	deadline := time.Now().Add(antigravityLingeringWait)
 	for {
-		antigravityKillTurnTree(lg.cmd)
-		antigravityEndTurnLeftovers(session.ID, lg.pid)
+		lg.killTree(session.ID)
 		time.Sleep(antigravityLingeringPoll)
 		if gone() {
 			fmt.Printf("%s[antigravity-native] Previous turn's processes (PID %d) on %s are gone — starting this turn%s\n",
@@ -930,9 +944,20 @@ func (m *AntigravityNativeManager) runOneShot(
 	// line stop the turn. Quota exhaustion used to surface only through a
 	// 15 s poll of the shared cli.log; agy 1.5.10 dies of it in ~4 s.
 	var quotaReason atomic.Value
+	// Set once cmd.Wait returns: no signal goes to this PID after that.
+	var reaped atomic.Bool
+	// Read once: the seams are never read again from this turn's goroutines.
+	killTree, killGrace := antigravityKillTurnTree, antigravityStopKillGrace
 	stopTree := func() {
+		if reaped.Load() {
+			return
+		}
 		_ = interruptProcess(cmd)
-		time.AfterFunc(antigravityStopKillGrace, func() { antigravityKillTurnTree(cmd) })
+		time.AfterFunc(killGrace, func() {
+			if !reaped.Load() {
+				killTree(cmd)
+			}
+		})
 	}
 	mon := newAntigravityTurnMonitor(session.ID, spawnedAt, antigravityNativeMaxStdout, stopTree, func(reason string) {
 		quotaReason.Store(reason)
@@ -990,7 +1015,9 @@ func (m *AntigravityNativeManager) runOneShot(
 	}()
 	go func() {
 		wg.Wait()
-		exitCh <- cmd.Wait()
+		err := cmd.Wait()
+		reaped.Store(true)
+		exitCh <- err
 	}()
 
 	var waitErr error
@@ -1013,7 +1040,7 @@ func (m *AntigravityNativeManager) runOneShot(
 	if run.stopCause != "" {
 		// Whatever the stopped tree does next, the next turn waits for it.
 		session.mu.Lock()
-		session.lingering = &antigravityLingeringTurn{pid: pid, cmd: cmd}
+		session.lingering = &antigravityLingeringTurn{pid: pid, cmd: cmd, reaped: &reaped}
 		session.mu.Unlock()
 	}
 	if !exited {
@@ -1028,7 +1055,9 @@ func (m *AntigravityNativeManager) runOneShot(
 					releaseProcess()
 					return
 				case <-time.After(time.Second):
-					antigravityKillTurnTree(cmd)
+					if !reaped.Load() {
+						killTree(cmd)
+					}
 				}
 			}
 		}()
