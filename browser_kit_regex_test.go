@@ -46,12 +46,16 @@ console.log(JSON.stringify({ wrong: out, ms: Date.now() - t0 }));
 `
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	raw, err := exec.CommandContext(ctx, node, "-e", script).CombinedOutput()
+	// Stdout only: a Node warning on stderr must not corrupt the JSON result.
+	var stderr strings.Builder
+	cmd := exec.CommandContext(ctx, node, "-e", script)
+	cmd.Stderr = &stderr
+	raw, err := cmd.Output()
 	if ctx.Err() != nil {
 		t.Fatal("the zero-polygon regex did not finish on a hostile clip-path (catastrophic backtracking)")
 	}
 	if err != nil {
-		t.Fatalf("node: %v: %s", err, raw)
+		t.Fatalf("node: %v: %s", err, stderr.String())
 	}
 	var res struct {
 		Wrong map[string]bool `json:"wrong"`
