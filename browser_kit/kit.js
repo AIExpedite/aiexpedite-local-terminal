@@ -20,7 +20,7 @@
 // Nothing the kit returns may be logged by the agent: it carries page text and form values.
 (function () {
   'use strict';
-  var VERSION = 'aix-1.0.28';
+  var VERSION = 'aix-1.0.29';
   if (globalThis.__aixKit && globalThis.__aixKit.version === VERSION) return;
   if (globalThis.__aixKit && globalThis.__aixKit._teardown) {
     try { globalThis.__aixKit._teardown(); } catch (e) { /* older kit */ }
@@ -379,9 +379,14 @@
     for (var x = n; x && x.nodeType === 1 && op >= 0.05; x = parentOf(x)) op *= opacityOf(getComputedStyle(x));
     return op;
   }
+  // A polygon whose every point is "0 0" clips the element away. Points are comma-separated (as
+  // getComputedStyle reports them), so each run of whitespace has exactly one way to match. The
+  // earlier "(\s*0 0\s*,?)+" let neighbouring \s* share the same spaces and backtracked
+  // exponentially on a long clip-path that almost matched (CodeQL js/redos).
+  var ZERO_POLYGON = /^polygon\(\s*0(?:px|%)?\s+0(?:px|%)?(?:\s*,\s*0(?:px|%)?\s+0(?:px|%)?)*\s*\)$/;
   function clipPathHides(cp) {
     return /^inset\(\s*(5\d|[6-9]\d|100)%/.test(cp) || /^circle\(\s*0(px|%)?[\s)]/.test(cp) ||
-      /^ellipse\(\s*0(px|%)?\s/.test(cp) || /^polygon\((\s*0(px|%)?\s+0(px|%)?\s*,?)+\)$/.test(cp);
+      /^ellipse\(\s*0(px|%)?\s/.test(cp) || ZERO_POLYGON.test(cp);
   }
   function maskHides(mi) {
     if (!mi || mi === 'none' || /url\(/.test(mi) || !/gradient\(/.test(mi)) return false;
