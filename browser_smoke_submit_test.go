@@ -1,0 +1,1284 @@
+package main
+
+// Opt-in end-to-end checks of the approved submit against a THROWAWAY headless
+// Chrome (see browser_smoke_test.go for the harness and how to run it):
+//
+//	AIX_BROWSER_SMOKE=1 go test -run TestBrowserSmokeSubmit -v .
+//
+//   - a submitter's formaction changed after approval refuses the submit (the
+//     destination is part of what the person approved);
+//   - the browser's own validation refusing the submission reports "nothing
+//     was submitted";
+//   - a script-driven save (a submit-class type=button posting by fetch, no
+//     submit event, no navigation) is NOT reported as unsent;
+//   - a hidden input changed after approval refuses the submit;
+//   - without trusted input (the AppleScript route's path), the approved
+//     control is clicked from the page, so its own onclick runs;
+//   - an option matched by its value ("DE") verifies against its label;
+//   - a control inside an open shadow root can be clicked;
+//   - an approved control whose onclick calls form.submit() (no submit event)
+//     posts the approved form, once;
+//   - an approved submit button in a form inside an open shadow root submits
+//     (its click and submit events are retargeted or not composed);
+//   - a form with a control named "elements" still lists its submit button;
+//   - a field the page repurposes during the highlight delay is not filled;
+//   - an approved button whose own click handler changes a value it sends is
+//     stopped, while a token written into an empty hidden input is allowed;
+//   - an unapproved click whose handler posts a new form into a hidden iframe
+//     is blocked by the network backstop;
+//   - an approved button whose handler natively submits a SECOND form to the
+//     same action with other values is refused (the outgoing data counts);
+//   - an approved button sharing its name with a filled field submits;
+//   - an unapproved click whose handler sends a GET form with data into a
+//     hidden iframe is blocked by the network backstop;
+//   - a value a blur handler clears is reported mismatch, not filled;
+//   - same-named form-less radios in two shadow roots are two groups;
+//   - an option inside a disabled <optgroup> is never chosen;
+//   - an image button (left out of form.elements) is its form's submit control,
+//     inside the form or tied to it with form=, and its press's x / y never
+//     make an unchanged form read as changed;
+//   - a select's option is chosen by itself, never by a value it shares with
+//     another option, and only while the list is as it was matched;
+//   - on the script path, an editor whose beforeinput handler moves the focus
+//     or the selection, or repurposes it, is not written (nor is the field
+//     the focus or the selection moved to);
+//   - trusted typing into an editor never lands in a password input inside it
+//     that a focus handler focused, at once or on a timer.
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+const smokeSubmitPage = `<!doctype html><html><head><title>Submit cases</title></head><body>
+<form id="dest" method="post" action="/submit">
+  <label for="a">Alpha</label><input id="a" name="a" value="one">
+  <input type="hidden" id="amount" name="amount" value="10.00">
+  <button id="go" type="submit">Send alpha</button>
+</form>
+<form id="req" method="post" action="/submit">
+  <label for="b">Beta</label><input id="b" name="b" required>
+  <button id="go2" type="submit">Send beta</button>
+</form>
+<form id="ajax" onsubmit="return false">
+  <label for="c">Gamma</label><input id="c" name="c" value="three">
+  <button id="save" type="button">Save</button>
+</form>
+<form id="handled" method="post" action="/native">
+  <label for="d">Delta</label><input id="d" name="d" value="four">
+  <button id="send4" type="submit">Send delta</button>
+</form>
+<form id="geo">
+  <label for="country">Country</label><select id="country" name="country"><option value="">Choose</option><option value="DE">Germany</option><option value="FR">France</option></select>
+</form>
+<form id="shadowed" method="post" action="/posted8"><label for="el">Elements</label><input id="el" name="elements" value="x"><button type="submit">Send eta</button></form>
+<form id="xi" method="post" action="/posted12"><label for="xa">Xi</label><input id="xa" name="action" value="edit"><button id="send12" type="submit" name="action" value="save">Save xi</button></form>
+<form id="clearing"><label for="nu">Nu</label><input id="nu" name="nu"></form>
+<form id="retheta"><label for="th">Theta</label><input id="th" name="theta"></form>
+<form id="tamper" method="post" action="/posted9"><label for="io">Iota</label><input id="io" name="iota" value="nine"><input type="hidden" id="amt9" name="amount" value="10.00"><button id="send9" type="submit">Send iota</button></form>
+<form id="token" method="post" action="/posted10"><label for="ka">Kappa</label><input id="ka" name="kappa" value="ten"><input type="hidden" id="tok10" name="captcha" value=""><button id="send10" type="submit">Send kappa</button></form>
+<button id="sneaky" type="button">Show more</button>
+<form id="forge" method="post" action="/posted11"><label for="mu">Mu</label><input id="mu" name="mu" value="eleven"><input type="hidden" name="amount" value="10.00"><button id="send11" type="submit">Send mu</button></form>
+<button id="peek" type="button">More options</button>
+<form id="omicron" method="post" action="/posted13"><label for="om">Omicron</label><input id="om" name="omicron" value="thirteen"><button id="send13" type="submit">Send omicron</button></form>
+<iframe name="sink14" style="display:none"></iframe>
+<form id="pi" method="post" action="/posted14"><label for="pi1">Pi</label><input id="pi1" name="pi" value="fourteen"><input type="hidden" id="amt14" name="amount" value="10.00"><button id="send14" type="submit" formtarget="sink14">Send pi</button></form>
+<div id="shadowform2"></div>
+<form id="tau" method="get" action="/got16"><label for="tx">Tau notes</label><textarea id="tx" name="tau">first line
+second line</textarea><button id="send16" type="submit">Send tau</button></form>
+<form id="upsilon" method="post" action="/posted18"><label for="up">Upsilon</label><input id="up" name="upsilon" value="eighteen"><input type="hidden" name="item[]" value="A"><input type="hidden" id="q18a" name="qty[]" value="1"><input type="hidden" name="item[]" value="B"><input type="hidden" id="q18b" name="qty[]" value="2"><button id="send18" type="submit">Send upsilon</button></form>
+<form id="chi" method="post" action="/posted19"><label for="c1x">Chi first</label><input id="c1x" name="action" value="save"><label for="c2x">Chi second</label><input id="c2x" name="action" value="edit"><button type="submit" name="action" value="save">Save chi</button></form>
+<form id="phi"><label for="sa">Signed amount</label><input id="sa" name="signed"><label for="da">Decimal amount</label><input id="da" name="decimal"><label for="acct">Tracking reference</label><input id="acct" name="tracking"><label for="pr">Unit price</label><input id="pr" name="price"></form>
+<form id="omega"><label for="cw">Code word</label><input id="cw" name="codeword"><fieldset><legend>Answer</legend><label><input type="radio" name="ans" id="ansNo" value="no"> No</label><label><input type="radio" name="ans" id="ansNs" value="notsure"> Not sure</label></fieldset><fieldset><legend>Updates</legend><label><input type="radio" name="upd" value="agree"> I agree to receive occasional product updates and understand that I can unsubscribe at any time from my settings page</label><label><input type="radio" name="upd" value="decline"> No thanks</label></fieldset></form>
+<iframe name="sink21" style="display:none"></iframe>
+<form id="ups21" method="post" action="/posted21"><label for="k21">Kappa one</label><input id="k21" name="kappa" value="twentyone"><input type="hidden" id="amt21" name="amount" value="10.00"><button type="submit">Send kappa one</button></form>
+<form id="ups22" method="post" action="/posted22"><label for="k22">Kappa two</label><input id="k22" name="kappa" value="twentytwo"><input type="hidden" id="amt22" name="amount" value="10.00"><button type="submit">Send kappa two</button></form>
+<form id="ups23" method="post" action="/posted23"><label for="k23">Kappa three</label><input id="k23" name="kappa" value="twentythree"><button type="submit">Send kappa three</button></form>
+<form id="cities"><label for="cb24">Shipping city</label><input id="cb24" name="shipcity" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="lb24"><ul id="lb24" role="listbox" style="display:none"><li role="option">Boston</li><li role="option">Denver</li></ul></form>
+<form id="phi2" method="post" action="/posted24"><label for="p24">Phi two</label><input id="p24" name="phi" value="twentyfour"><button type="submit" id="send24">Send phi two</button></form>
+<form id="phi3" method="post" action="/posted25"><label for="p25">Phi three</label><input id="p25" name="phi" value="twentyfive"><button type="submit" id="send25">Send phi three</button></form>
+<form id="branches"><label for="br39">Branch</label><select id="br39" name="branch" onchange="this.dataset.seen = (this.dataset.seen || '') + this.selectedOptions[0].text + ';'"><option value="">Choose</option><option value="shared">First branch</option><option value="shared">Second branch</option></select><label for="br40">Office</label><select id="br40" name="office" onfocus="if (!this.dataset.done) { this.dataset.done = '1'; this.options[2].text = 'Third office'; }" onchange="this.dataset.changed = '1'"><option value="">Choose</option><option value="north">North office</option><option value="south">South office</option></select></form>
+<form id="tiers2"><label for="tier2">Tier two</label><select id="tier2" name="tier2"><option value="">Choose</option><option value="cheap">Standard</option><option value="premium">Premium</option></select></form>
+<div id="ce26" contenteditable="true" role="textbox" aria-label="Notes one" style="min-height:24px;border:1px solid #888"></div>
+<div id="ce27" contenteditable="true" role="textbox" aria-label="Notes two" style="min-height:24px;border:1px solid #888"></div>
+<div id="ce41" contenteditable="true" role="textbox" aria-label="Notes three" style="min-height:24px;border:1px solid #888"></div><input type="password" id="pw41" aria-label="Decoy secret">
+<div id="ce42" contenteditable="true" role="textbox" aria-label="Notes four" style="min-height:24px;border:1px solid #888"></div>
+<div id="ce43" contenteditable="true" role="textbox" aria-label="Notes five" style="min-height:24px;border:1px solid #888"></div><div id="ce43b" contenteditable="true" role="textbox" aria-label="Notes decoy" style="min-height:24px;border:1px solid #888"></div>
+<div id="ce44" contenteditable="true" role="textbox" aria-label="Notes six" style="min-height:24px;border:1px solid #888"><input type="password" id="pw44" aria-label="Inner secret"></div>
+<div id="ce45" contenteditable="true" role="textbox" aria-label="Notes seven" style="min-height:24px;border:1px solid #888"></div><p id="p45">After notes seven</p>
+<div id="ce46" contenteditable="true" role="textbox" aria-label="Notes eight" style="min-height:24px;border:1px solid #888"><input type="password" id="pw46" aria-label="Inner secret two"></div>
+<div id="ce47" contenteditable="true" role="textbox" aria-label="Notes nine" style="min-height:24px;border:1px solid #888"><input type="password" id="pw47" aria-label="Inner secret three"></div>
+<div id="ce48" contenteditable="true" role="textbox" aria-label="Notes ten" style="min-height:24px;border:1px solid #888"></div><p id="p48">After notes ten</p>
+<form id="plans2"><fieldset><legend>Plan choice</legend><label><input type="radio" name="pc" id="pc1" value="cheap"> Standard</label><label><input type="radio" name="pc" value="premium"> Premium</label></fieldset><label><input type="checkbox" id="cb28" name="extras" value="none"> Add extras</label><label for="t29">Delivery note</label><input id="t29" name="dnote"></form>
+<form id="seats"><fieldset><legend>Seat class</legend><label><input type="radio" name="sc" id="sc1" value="cheap"> Standard</label><label><input type="radio" name="sc" id="sc2" value="expensive"> Standard</label></fieldset></form>
+<form id="omega2" method="post" action="/posted31"><label for="r31">Required thing</label><input id="r31" name="req" required><button type="submit" id="send31">Send required</button></form>
+<span id="cb32l">Attending</span><button type="button" id="cb32" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="lb32" aria-labelledby="cb32l">Choose</button><ul id="lb32" role="listbox" hidden><li role="option">No</li><li role="option">Not sure</li><li role="option">Yes</li></ul>
+<form id="sci"><label for="ex33">Exponent</label><input id="ex33" name="exponent"><label for="co34">Coordinates</label><input id="co34" name="coords"></form>
+<form id="upl35" method="get" action="/got35"><label for="att35">Attachment</label><input type="file" id="att35" name="attachment"><label for="u35">Upsilon three</label><input id="u35" name="ups" value="thirtyfive"><button type="submit">Send upload</button></form>
+<form id="img36" method="post" action="/posted36"><label for="i36">Iota six</label><input id="i36" name="iota" value="thirtysix"><input type="image" alt="Send image six" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='24'%3E%3Crect width='80' height='24' fill='%23336'/%3E%3C/svg%3E" width="80" height="24"></form>
+<form id="img37" method="post" action="/posted37"><label for="x37">X mark</label><input id="x37" name="x" value="seven"></form><input type="image" form="img37" alt="Send x mark" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='24'%3E%3Crect width='80' height='24' fill='%23336'/%3E%3C/svg%3E" width="80" height="24">
+<form id="img38" method="post" action="/posted38"><label for="x38">X tag</label><input id="x38" name="x" value="eight"></form><input type="image" form="img38" alt="Send x tag" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='24'%3E%3Crect width='80' height='24' fill='%23336'/%3E%3C/svg%3E" width="80" height="24">
+<form id="tiers"><label for="tier">Tier</label><select id="tier" name="tier"><option value="">Choose</option><option value="cheap">Standard</option><option value="expensive">Standard</option></select></form>
+<form id="psi" method="get" action="/got20"><label for="ps">Psi</label><input id="ps" name="psi" value="twenty"><button id="send20" type="button">Send psi</button></form>
+<form id="rho" method="post" action="/posted15"><label for="rh">Rho</label><input id="rh" name="rho" value="fifteen"><button id="send15" type="submit" formtarget="sink14">Send rho</button></form>
+<div id="radios1"></div><div id="radios2"></div>
+<form id="plans"><label for="plan">Plan</label><select id="plan" name="plan"><option value="">Choose</option><optgroup label="Old" disabled><option>Legacy</option></optgroup><option>Basic</option></select></form>
+<div id="shadowhost"></div>
+<div id="shadowform"></div>
+<form id="scripted" method="post" action="/posted5">
+  <label for="e">Epsilon</label><input id="e" name="e" value="five">
+  <button id="send5" type="button">Send epsilon</button>
+</form>
+<script>
+[['radios1', 'Newsletter'], ['radios2', 'Terms']].forEach(function (x) {
+  var r = document.getElementById(x[0]).attachShadow({ mode: 'open' });
+  r.innerHTML = '<fieldset><legend>' + x[1] + '</legend><label><input type="radio" name="agree" value="yes"> Yes</label><label><input type="radio" name="agree" value="no"> No</label></fieldset>';
+});
+document.getElementById('nu').addEventListener('blur', function () { this.value = ''; });
+document.getElementById('send9').addEventListener('click', function () { document.getElementById('amt9').value = '1000.00'; });
+document.getElementById('send10').addEventListener('click', function () { document.getElementById('tok10').value = 'tok-abc'; });
+document.getElementById('sneaky').addEventListener('click', function () {
+  var f = document.createElement('iframe'); f.name = 'sink'; f.style.display = 'none'; document.body.appendChild(f);
+  var fm = document.createElement('form'); fm.method = 'post'; fm.action = '/sneaky'; fm.target = 'sink';
+  var i = document.createElement('input'); i.name = 'x'; i.value = 'y'; fm.appendChild(i); document.body.appendChild(fm);
+  fm.submit();
+});
+document.getElementById('send11').addEventListener('click', function (e) {
+  e.preventDefault();
+  var fm = document.createElement('form'); fm.method = 'post'; fm.action = '/posted11';
+  [['mu', 'eleven'], ['amount', '9999']].forEach(function (p) { var i = document.createElement('input'); i.type = 'hidden'; i.name = p[0]; i.value = p[1]; fm.appendChild(i); });
+  document.body.appendChild(fm);
+  HTMLFormElement.prototype.submit.call(fm);
+});
+document.getElementById('send13').addEventListener('click', function (e) {
+  e.preventDefault();
+  var fm = document.createElement('form'); fm.method = 'get'; fm.action = '/elsewhere13';
+  var i = document.createElement('input'); i.name = 'q'; i.value = 'stolen'; fm.appendChild(i); document.body.appendChild(fm);
+  HTMLFormElement.prototype.submit.call(fm);
+});
+document.getElementById('pi').addEventListener('submit', function () { document.getElementById('amt14').value = '9999.00'; });
+document.getElementById('send18').addEventListener('click', function () { var a = document.getElementById('q18a'), b = document.getElementById('q18b'), t = a.value; a.value = b.value; b.value = t; });
+document.getElementById('sa').addEventListener('blur', function () { this.value = this.value.replace('-', ''); });
+document.getElementById('da').addEventListener('blur', function () { this.value = this.value.replace('.', ','); });
+document.getElementById('acct').addEventListener('blur', function () { this.value = this.value.replace(/3$/, '2'); });
+document.getElementById('pr').addEventListener('blur', function () { this.value = this.value.replace(/,/g, '').replace(/0+$/, ''); });
+document.getElementById('cw').addEventListener('focus', function () { this.type = 'password'; });
+document.getElementById('ansNo').addEventListener('change', function () { document.getElementById('ansNs').checked = true; });
+['21', '22'].forEach(function (n) {
+  document.getElementById('ups' + n).addEventListener('submit', function () { this.target = 'sink21'; document.getElementById('amt' + n).value = '9999.00'; });
+});
+document.getElementById('ups23').addEventListener('submit', function (e) { if (e.submitter) e.submitter.setAttribute('formtarget', 'sink21'); e.stopImmediatePropagation(); });
+document.getElementById('tier').addEventListener('change', function () { if (this.value === 'cheap') this.value = 'expensive'; });
+document.getElementById('cb24').addEventListener('focus', function () { this.type = 'password'; });
+document.getElementById('send24').addEventListener('click', function (e) {
+  e.preventDefault();
+  var f = document.getElementById('phi2'); f.method = 'get';
+  HTMLFormElement.prototype.submit.call(f);
+});
+document.getElementById('send25').addEventListener('click', function (e) {
+  e.preventDefault();
+  var fm = document.createElement('form'); fm.method = 'get'; fm.action = '/posted25';
+  var i = document.createElement('input'); i.name = 'phi'; i.value = 'twentyfive'; fm.appendChild(i); document.body.appendChild(fm);
+  HTMLFormElement.prototype.submit.call(fm);
+});
+document.getElementById('tier2').addEventListener('change', function () { if (this.value === 'cheap') this.selectedOptions[0].value = 'expensive'; });
+['ce26', 'ce27'].forEach(function (id) { document.getElementById(id).addEventListener('focus', function () { this.setAttribute('aria-label', 'Password'); }); });
+document.getElementById('ce41').addEventListener('beforeinput', function () { document.getElementById('pw41').focus(); });
+document.getElementById('ce42').addEventListener('beforeinput', function () { this.setAttribute('aria-label', 'Password'); });
+document.getElementById('ce43').addEventListener('beforeinput', function () { var r = document.createRange(); r.selectNodeContents(document.getElementById('ce43b')); var sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); });
+document.getElementById('ce44').addEventListener('beforeinput', function () { document.getElementById('pw44').focus(); });
+document.getElementById('ce45').addEventListener('beforeinput', function () { getSelection().extend(document.getElementById('p45').firstChild, 5); });
+document.getElementById('ce46').addEventListener('focus', function () { if (!this.dataset.moved) { this.dataset.moved = '1'; document.getElementById('pw46').focus(); } });
+document.getElementById('ce47').addEventListener('focus', function () { if (!this.dataset.moved) { this.dataset.moved = '1'; setTimeout(function () { document.getElementById('pw47').focus(); }, 0); } });
+document.getElementById('ce48').addEventListener('focus', function () { if (!this.dataset.moved) { this.dataset.moved = '1'; setTimeout(function () { getSelection().extend(document.getElementById('p48').firstChild, 5); }, 0); } });
+document.getElementById('pc1').addEventListener('change', function () { this.value = 'expensive'; });
+document.getElementById('ex33').addEventListener('blur', function () { this.value = this.value.replace('e-', 'e'); });
+document.getElementById('co34').addEventListener('blur', function () { this.value = this.value.replace(', -', ', '); });
+document.getElementById('sc1').addEventListener('change', function () { var other = document.getElementById('sc2'); this.closest('label').remove(); other.checked = true; });
+document.getElementById('send31').addEventListener('click', function () { fetch('/slowsave', { method: 'POST', body: 'x' }); });
+(function () {
+  var btn = document.getElementById('cb32'), lb = document.getElementById('lb32');
+  btn.addEventListener('click', function () { lb.hidden = false; btn.setAttribute('aria-expanded', 'true'); });
+  Array.prototype.forEach.call(lb.querySelectorAll('[role=option]'), function (li) {
+    li.addEventListener('click', function () {
+      btn.textContent = li.textContent === 'No' ? 'Not sure' : li.textContent;
+      lb.hidden = true; btn.setAttribute('aria-expanded', 'false');
+    });
+  });
+})();
+document.getElementById('cb28').addEventListener('change', function () { this.value = 'all'; });
+document.getElementById('t29').addEventListener('focus', function () { var el = this; setTimeout(function () { el.type = 'password'; }, 0); });
+document.getElementById('send20').addEventListener('click', function () {
+  var f = document.getElementById('psi');
+  HTMLFormElement.prototype.submit.call(f);
+  setTimeout(function () { HTMLFormElement.prototype.submit.call(f); }, 400);
+});
+var sf2 = document.getElementById('shadowform2').attachShadow({ mode: 'open' });
+sf2.innerHTML = '<form method="post" action="/posted17" target="sink14"><label for="sg">Sigma</label><input id="sg" name="sigma" value="seventeen"><input type="hidden" id="amt17" name="amount" value="10.00"><button type="submit">Send sigma</button></form>';
+sf2.querySelector('form').addEventListener('submit', function () { sf2.getElementById('amt17').value = '9999.00'; });
+document.getElementById('peek').addEventListener('click', function () {
+  var f = document.createElement('iframe'); f.name = 'sink2'; f.style.display = 'none'; document.body.appendChild(f);
+  var fm = document.createElement('form'); fm.method = 'get'; fm.action = '/peek'; fm.target = 'sink2';
+  var i = document.createElement('input'); i.name = 'q'; i.value = 'secret'; fm.appendChild(i); document.body.appendChild(fm);
+  fm.submit();
+});
+var sr = document.getElementById('shadowhost').attachShadow({ mode: 'open' });
+sr.innerHTML = '<button id="toggle" type="button">Toggle details</button>';
+var sf = document.getElementById('shadowform').attachShadow({ mode: 'open' });
+sf.innerHTML = '<form method="post" action="/posted7"><label for="z">Zeta</label><input id="z" name="z" value="six"><button type="submit">Send zeta</button></form>';
+sr.getElementById('toggle').addEventListener('click', function () { document.getElementById('shadowhost').setAttribute('data-toggled', 'yes'); });
+document.getElementById('send5').addEventListener('click', function () { document.getElementById('scripted').submit(); });
+document.getElementById('send4').addEventListener('click', function (e) {
+  e.preventDefault();
+  fetch('/save2', { method: 'POST', body: document.getElementById('d').value });
+});
+document.getElementById('save').addEventListener('click', function () {
+  fetch('/save', { method: 'POST', body: document.getElementById('c').value });
+});
+</script>
+</body></html>`
+
+func TestBrowserSmokeSubmit(t *testing.T) {
+	chromePath := smokeChromePath(t)
+
+	var mu sync.Mutex
+	hits := map[string]int{}
+	posted := map[string]map[string][]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && (r.URL.Path == "/posted36" || r.URL.Path == "/posted37" || r.URL.Path == "/posted38") {
+			_ = r.ParseForm()
+			mu.Lock()
+			posted[r.URL.Path] = r.PostForm
+			mu.Unlock()
+		}
+		mu.Lock()
+		hits[r.Method+" "+r.URL.Path]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		switch r.URL.Path {
+		case "/":
+			fmt.Fprint(w, smokeSubmitPage)
+		case "/save":
+			fmt.Fprint(w, "saved")
+		case "/got20":
+			w.WriteHeader(http.StatusNoContent)
+		case "/slowsave":
+			time.Sleep(4 * time.Second)
+			fmt.Fprint(w, "saved")
+		default:
+			fmt.Fprint(w, `<!doctype html><html><head><title>Posted</title></head><body>ok</body></html>`)
+		}
+	}))
+	defer srv.Close()
+	hit := func(k string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits[k]
+	}
+
+	launchSmokeChrome(t, chromePath)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	choice, berr := chooseBrowserRoute(ctx, "darwin", "", discoverChromeDevTools)
+	if berr != nil || choice.Route != browserRouteDevTools {
+		t.Fatalf("route: %+v %v", choice, berr)
+	}
+	be, release, err := openBrowserBackend(ctx, choice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	stop := &atomic.Bool{}
+	run := func(p browserParams) (any, error) {
+		t.Helper()
+		return (&browserOpRun{p: p, be: be, stop: stop}).run(ctx)
+	}
+
+	res, err := run(browserParams{Op: browserOpOpen, URL: srv.URL + "/"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	tab := res.(browserPageInfo).TabID
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	refs := map[string]string{}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+	if refs["Send alpha"] == "" || refs["Send beta"] == "" || refs["Save"] == "" {
+		t.Fatalf("buttons: %+v", res.(browserReadResult).Buttons)
+	}
+	if refs["Toggle details"] == "" || refs["Send epsilon"] == "" {
+		t.Fatalf("buttons: %+v", res.(browserReadResult).Buttons)
+	}
+
+	// An option matched by its value is shown by its label. The fill's closing
+	// message lingers over the top of the page; the next steps act right away,
+	// so they also prove it no longer reads as covering the controls under it.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Country", Value: "DE"}}})
+	if err != nil {
+		t.Fatalf("fill select: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFilled {
+		t.Fatalf("fill select by value: %+v", o)
+	}
+	// A control named "elements" shadows form.elements: the submit button is
+	// still found, and the form can be prepared by its ref.
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	etaForm := ""
+	for _, f := range res.(browserReadResult).Forms {
+		for _, c := range f.SubmitControls {
+			if c.Text == "Send eta" {
+				etaForm = f.FormRef
+			}
+		}
+	}
+	if etaForm == "" {
+		t.Fatalf("the form with a control named elements lists no submit control: %+v", res.(browserReadResult).Forms)
+	}
+	if r, err := run(browserParams{Op: browserOpPrepareSubmit, TabID: tab, Ref: etaForm}); err != nil || r.(browserPrepareResult).SubmitText != "Send eta" {
+		t.Fatalf("prepare by form ref: %v %+v", err, r)
+	}
+	// Same-named radios in two shadow roots are two groups; a disabled
+	// optgroup's option is never chosen.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{
+		{Field: "Newsletter", Value: "Yes"}, {Field: "Terms", Value: "No"}, {Field: "Plan", Value: "Legacy"},
+	}})
+	if err != nil {
+		t.Fatalf("fill radios/plan: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 3 || o[0].Outcome != browserOutcomeFilled || o[1].Outcome != browserOutcomeFilled || o[2].Outcome == browserOutcomeFilled {
+		t.Fatalf("shadow radio groups / disabled optgroup: %+v", o)
+	}
+	_, raw, _ := parseBrowserTabID(tab)
+	pg, err := be.Page(ctx, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepare := func(ref string) browserPrepareResult {
+		t.Helper()
+		res, err := run(browserParams{Op: browserOpPrepareSubmit, TabID: tab, Ref: ref})
+		if err != nil {
+			t.Fatalf("prepare %s: %v", ref, err)
+		}
+		return res.(browserPrepareResult)
+	}
+
+	// The page repurposes the planned field during the highlight delay: it is
+	// reported form-changed and nothing is written into it.
+	if _, err := pg.Eval(ctx, `setTimeout(function () { document.getElementById('th').setAttribute('name', 'notes'); }, 250); 'ok'`); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Theta", Value: "hello"}}})
+	if err != nil {
+		t.Fatalf("fill theta: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFormChanged {
+		t.Fatalf("repurposed field: %+v", o)
+	}
+	if v, _ := pg.Eval(ctx, `document.getElementById('th').value || 'empty'`); !strings.Contains(v, "empty") {
+		t.Fatalf("a repurposed field was written: %q", v)
+	}
+
+	// A field whose blur handler clears the value: the read-back comes after
+	// the blur, so it is reported as not holding the value, never as filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Nu", Value: "hello"}}})
+	if err != nil {
+		t.Fatalf("fill nu: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a value the blur handler cleared: %+v", o)
+	}
+
+	// 1. The destination changes after approval: refused, nothing posted anywhere.
+	prep := prepare(refs["Send alpha"])
+	if _, err := pg.Eval(ctx, `document.getElementById('go').setAttribute('formaction', '/elsewhere'); 'ok'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r1"}); !isBrowserCode(err, browserErrSubmitFormChanged) {
+		t.Fatalf("formaction changed after approval: %v", err)
+	}
+	// The form's own action changing is refused the same way.
+	if _, err := pg.Eval(ctx, `document.getElementById('go').removeAttribute('formaction'); 'ok'`); err != nil {
+		t.Fatal(err)
+	}
+	prep = prepare(refs["Send alpha"])
+	if _, err := pg.Eval(ctx, `document.getElementById('dest').setAttribute('action', '/elsewhere'); 'ok'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r2"}); !isBrowserCode(err, browserErrSubmitFormChanged) {
+		t.Fatalf("form action changed after approval: %v", err)
+	}
+	if n := hit("POST /elsewhere") + hit("POST /submit"); n != 0 {
+		t.Fatalf("%d post(s) after a refused submit", n)
+	}
+
+	// 1a. The destination and identities reach the digest whole, never as a
+	// 32-bit fingerprint two destinations could share; and an arm needs the
+	// exact reading its check kept.
+	if _, err := pg.Eval(ctx, `document.getElementById('go').setAttribute('formaction', '/pay?recipient=329599'); 'ok'`); err != nil {
+		t.Fatal(err)
+	}
+	kr := newKitRunner(pg)
+	var chk kitSubmitCheck
+	if _, err := kr.call(ctx, "submitCheck", &chk, refs["Send alpha"]); err != nil || !chk.OK {
+		t.Fatalf("submitCheck: %+v %v", chk, err)
+	}
+	if !strings.Contains(chk.Parts.Submit, "/pay?recipient=329599") || !strings.Contains(chk.Parts.Form, "/elsewhere") {
+		t.Fatalf("destinations not kept whole: form %q submit %q", chk.Parts.Form, chk.Parts.Submit)
+	}
+	var arm kitArm
+	if _, err := kr.call(ctx, "armSubmit", &arm, refs["Send alpha"], "not-the-token", "click"); err != nil || arm.OK {
+		t.Fatalf("arm with a foreign token: %+v %v", arm, err)
+	}
+	if _, err := pg.Eval(ctx, `document.getElementById('go').removeAttribute('formaction'); 'ok'`); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1b. A hidden input changes after approval: refused.
+	if _, err := pg.Eval(ctx, `document.getElementById('dest').setAttribute('action', '/submit'); 'ok'`); err != nil {
+		t.Fatal(err)
+	}
+	prep = prepare(refs["Send alpha"])
+	if _, err := pg.Eval(ctx, `document.getElementById('amount').value = '1000.00'; 'ok'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r2b"}); !isBrowserCode(err, browserErrSubmitFormChanged) {
+		t.Fatalf("hidden input changed after approval: %v", err)
+	}
+	if n := hit("POST /submit"); n != 0 {
+		t.Fatalf("%d post(s) after a hidden value changed", n)
+	}
+
+	// 2. The browser's validation refuses it: reported as not submitted.
+	prep = prepare(refs["Send beta"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r3"})
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || !strings.Contains(err.Error(), "validation") {
+		t.Fatalf("required field empty: %v", err)
+	}
+	if n := hit("POST /submit"); n != 0 {
+		t.Fatalf("%d post(s) past the browser's validation", n)
+	}
+
+	// 3. A script-driven save: no submit event, no navigation, yet it was sent.
+	prep = prepare(refs["Save"])
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r4"})
+	if err != nil {
+		t.Fatalf("script-driven save reported as failed: %v", err)
+	}
+	cr := res.(browserClickResult)
+	if cr.Navigated || cr.SubmitObserved == nil || *cr.SubmitObserved {
+		t.Fatalf("script-driven save: %+v", cr)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for hit("POST /save") == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if n := hit("POST /save"); n != 1 {
+		t.Fatalf("save posted %d time(s), want 1", n)
+	}
+
+	// 4. No trusted input (the AppleScript route's path): the kit clicks the
+	// approved control from the page, so a submit button's own onclick (which
+	// cancels the native post and saves by fetch) runs, as for a person.
+	ub := untrustedBackend{be}
+	prep = prepare(refs["Send delta"])
+	res, err = (&browserOpRun{p: browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r5"},
+		be: ub, stop: stop}).run(ctx)
+	if err != nil {
+		t.Fatalf("script click: %v", err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for hit("POST /save2") == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if hit("POST /save2") != 1 || hit("POST /native") != 0 {
+		t.Fatalf("script click: save2=%d native=%d (%+v)", hit("POST /save2"), hit("POST /native"), res)
+	}
+
+	// 4b. The approved button's own click handler changes a value it sends.
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+	prep = prepare(refs["Send iota"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r9"})
+	// Stopped after the click: the page's own handlers ran first, so the result
+	// must not claim that nothing was sent.
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted9") != 0 ||
+		strings.Contains(err.Error(), "Nothing was submitted") || !strings.Contains(err.Error(), "may still have sent") {
+		t.Fatalf("changed during activation: %v posted9=%d", err, hit("POST /posted9"))
+	}
+
+	// 4c. An unapproved click whose handler posts a new form into a hidden
+	// iframe: the network backstop fails it.
+	if _, err := run(browserParams{Op: browserOpClick, TabID: tab, Ref: refs["Show more"]}); err != nil {
+		t.Fatalf("click show more: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := hit("POST /sneaky"); n != 0 {
+		t.Fatalf("an unapproved click posted a form %d time(s)", n)
+	}
+
+	// 4d. An approved submit button whose click handler cancels the approved
+	// post and natively submits a SECOND form to the same action with other
+	// values (amount 9999): the outgoing data is not what was approved, so
+	// nothing reaches the server and the submit reports the form changed.
+	prep = prepare(refs["Send mu"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r11"})
+	time.Sleep(500 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted11") != 0 {
+		t.Fatalf("forged second form: %v posted11=%d", err, hit("POST /posted11"))
+	}
+
+	// 4d2. The approved button shares its name with a filled field
+	// (action=edit + button action=save): the unchanged form submits.
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+	prep = prepare(refs["Save xi"])
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r12"})
+	if err != nil || hit("POST /posted12") != 1 {
+		t.Fatalf("submitter sharing a field's name: %v posted12=%d", err, hit("POST /posted12"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d3. The approved button's click handler natively submits its own GET
+	// form to ANOTHER address: refused, nothing reaches either address.
+	prep = prepare(refs["Send omicron"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r13"})
+	time.Sleep(300 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("GET /elsewhere13") != 0 || hit("POST /posted13") != 0 {
+		t.Fatalf("handler's GET form elsewhere: %v elsewhere13=%d posted13=%d", err, hit("GET /elsewhere13"), hit("POST /posted13"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d4. An approved button aimed at an iframe (formtarget) whose FORM's own
+	// submit handler changes a hidden amount after the capture-phase check:
+	// refused, nothing posted.
+	prep = prepare(refs["Send pi"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r14"})
+	time.Sleep(300 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted14") != 0 {
+		t.Fatalf("formtarget + submit handler change: %v posted14=%d", err, hit("POST /posted14"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d5. The same iframe-targeted button with no handler changing anything:
+	// the approved form posts, once.
+	prep = prepare(refs["Send rho"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r15"})
+	deadline = time.Now().Add(5 * time.Second)
+	for hit("POST /posted15") == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil || hit("POST /posted15") != 1 {
+		t.Fatalf("iframe-targeted approved submit: %v posted15=%d", err, hit("POST /posted15"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d6. An approved form inside an open shadow root, aimed at an iframe
+	// (target), whose own submit handler changes a hidden amount: refused.
+	prep = prepare(refs["Send sigma"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r17"})
+	time.Sleep(300 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted17") != 0 {
+		t.Fatalf("shadow-root form aimed at an iframe: %v posted17=%d", err, hit("POST /posted17"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d7. An approved GET form with a multiline textarea (the submission sends
+	// CRLF, the DOM reads LF): the unchanged form submits, once.
+	prep = prepare(refs["Send tau"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r16"})
+	deadline = time.Now().Add(5 * time.Second)
+	for hit("GET /got16") == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil || hit("GET /got16") != 1 {
+		t.Fatalf("multiline GET form: %v got16=%d", err, hit("GET /got16"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d8. Repeated names pair by position: a click handler that swaps the two
+	// quantities (item[]=A qty[]=1, item[]=B qty[]=2 -> qty 2,1) is refused.
+	prep = prepare(refs["Send upsilon"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r18"})
+	time.Sleep(300 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted18") != 0 {
+		t.Fatalf("reordered repeated values: %v posted18=%d", err, hit("POST /posted18"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	// 4d10. Repeated fields whose values include the button's own (action=save,
+	// action=edit, then a button action=save): the unchanged form submits once.
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+	prep = prepare(refs["Save chi"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r19"})
+	deadline = time.Now().Add(5 * time.Second)
+	for hit("POST /posted19") == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil || hit("POST /posted19") != 1 {
+		t.Fatalf("button value among repeated values: %v posted19=%d", err, hit("POST /posted19"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4d11. The approved GET form's handler submits it natively twice against an
+	// endpoint answering 204 (the page stays): only the first one goes.
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+	prep = prepare(refs["Send psi"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r20"})
+	time.Sleep(1500 * time.Millisecond)
+	if err != nil || hit("GET /got20") != 1 {
+		t.Fatalf("approved GET form submitted twice: %v got20=%d", err, hit("GET /got20"))
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	// 4d12. A page that turns a decimal point into a thousands separator: mismatch.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Decimal amount", Value: "1.234"}}})
+	if err != nil {
+		t.Fatalf("fill decimal amount: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("1.234 shown as 1,234 must read as a mismatch: %+v", o)
+	}
+
+	// 4d15. A page that changes the last digit of a long identifier (past 2^53, where
+	// floating point cannot tell the two apart): mismatch.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Tracking reference", Value: "9007199254740993"}}})
+	if err != nil {
+		t.Fatalf("fill tracking reference: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a changed digit of a long number must read as a mismatch: %+v", o)
+	}
+	// 4d16. The same number written differently (1,200.50 shown as 1200.5): filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Unit price", Value: "1,200.50"}}})
+	if err != nil {
+		t.Fatalf("fill unit price: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFilled {
+		t.Fatalf("1,200.50 shown as 1200.5 is the same number: %+v", o)
+	}
+
+	// 4d13. A field that turns into a password field when focused: refused, nothing typed.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Code word", Value: "abc123"}}})
+	if err != nil {
+		t.Fatalf("fill code word: %v", err)
+	}
+	// Refused either as sensitive or because its identity changed (the type is part of its
+	// fingerprint): what matters is that nothing was typed into it.
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || (o[0].Outcome != "refused-sensitive" && o[0].Outcome != browserOutcomeFormChanged) {
+		t.Fatalf("a field that becomes a password on focus must be refused: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('cw').value)`); err != nil || v != `""` {
+		t.Fatalf("the refused field was written: %q %v", v, err)
+	}
+	// 4d22. An editable combobox that turns into a password field when focused: refused, nothing typed.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Shipping city", Value: "Boston"}}})
+	if err != nil {
+		t.Fatalf("fill shipping city: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || (o[0].Outcome != "refused-sensitive" && o[0].Outcome != browserOutcomeFormChanged) {
+		t.Fatalf("a combobox that becomes a password on focus must be refused: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('cb24').value)`); err != nil || v != `""` {
+		t.Fatalf("the refused combobox was written: %q %v", v, err)
+	}
+	// 4d14. A radio whose handler selects "Not sure" when "No" was asked: mismatch.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Answer", Value: "No"}}})
+	if err != nil {
+		t.Fatalf("fill answer: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a radio switched by the page must read as a mismatch: %+v", o)
+	}
+
+	// 4d17. A radio option whose label is longer than the option list shows (80
+	// characters), chosen by its value: filled, not a mismatch against the clipped label.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Updates", Value: "agree"}}})
+	if err != nil {
+		t.Fatalf("fill updates: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFilled {
+		t.Fatalf("a long radio label chosen by value must read as filled: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify(document.querySelector('input[name=upd]:checked') && document.querySelector('input[name=upd]:checked').value)`); err != nil || v != `"agree"` {
+		t.Fatalf("checked updates option: %q %v", v, err)
+	}
+
+	// 4d9. A page that strips the minus sign of a filled amount: mismatch, not filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Signed amount", Value: "-10"}}})
+	if err != nil {
+		t.Fatalf("fill signed amount: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a stripped minus sign must read as a mismatch: %+v", o)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d18. Two options share a label ("Standard" at two prices) and the page switches from
+	// the chosen one to the other: mismatch, not filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Tier", Value: "cheap"}}})
+	if err != nil {
+		t.Fatalf("fill tier: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a select switched to another option with the same label must read as a mismatch: %+v", o)
+	}
+
+	// 4d25. The page rewrites the chosen option's own value: mismatch, not filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Tier two", Value: "cheap"}}})
+	if err != nil {
+		t.Fatalf("fill tier two: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a chosen option whose value the page rewrote must read as a mismatch: %+v", o)
+	}
+
+	// 4d39. Two options with one value, told apart by their labels: the requested one is
+	// selected (never the first with that value), and the page's change handler sees it.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Branch", Value: "Second branch"}}})
+	if err != nil {
+		t.Fatalf("fill branch: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFilled || o[0].ReadBack != "Second branch" {
+		t.Fatalf("the second of two options sharing a value: %+v", o)
+	}
+	if v, _ := pg.Eval(ctx, `document.getElementById('br39').dataset.seen || 'none'`); !strings.Contains(v, "Second branch;") || strings.Contains(v, "First branch") {
+		t.Fatalf("the change handler saw another option: %q", v)
+	}
+	// 4d40. A focus handler relabels the matched option: the field changed, nothing is
+	// selected and no change handler runs.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Office", Value: "South office"}}})
+	if err != nil {
+		t.Fatalf("fill office: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFormChanged {
+		t.Fatalf("an option relabelled on focus must read as form-changed: %+v", o)
+	}
+	if v, _ := pg.Eval(ctx, `(document.getElementById('br40').value || 'empty') + '|' + (document.getElementById('br40').dataset.changed ? 'changed' : 'quiet')`); !strings.Contains(v, "empty|quiet") {
+		t.Fatalf("an option was selected after the list changed: %q", v)
+	}
+
+	// 4d26. An editor whose focus handler repurposes it (relabelled "Password"): refused,
+	// nothing typed, on the trusted path and on the script path (the AppleScript route's).
+	for _, c := range []struct {
+		label, id string
+		be        browserBackend
+	}{{"Notes one", "ce26", be}, {"Notes two", "ce27", ub}} {
+		res, err = (&browserOpRun{p: browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: c.label, Value: "hello"}}}, be: c.be, stop: stop}).run(ctx)
+		if err != nil {
+			t.Fatalf("fill %s: %v", c.label, err)
+		}
+		if o := res.(browserFillResult).Outcomes; len(o) != 1 || (o[0].Outcome != "refused-sensitive" && o[0].Outcome != browserOutcomeFormChanged) {
+			t.Fatalf("an editor repurposed on focus must be refused (%s): %+v", c.label, o)
+		}
+		if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('`+c.id+`').textContent)`); err != nil || v != `""` {
+			t.Fatalf("the refused editor %s was written: %q %v", c.id, v, err)
+		}
+	}
+	// 4d41. Script path (the AppleScript route's): the editor's beforeinput handler focuses a
+	// password field without cancelling the event. Nothing is written, there or in the editor.
+	res, err = (&browserOpRun{p: browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Notes three", Value: "hello"}}}, be: ub, stop: stop}).run(ctx)
+	if err != nil {
+		t.Fatalf("fill notes three: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFormChanged {
+		t.Fatalf("an editor whose beforeinput handler moves the focus must read as form-changed: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify([document.getElementById('ce41').textContent, document.getElementById('pw41').value])`); err != nil || v != `["",""]` {
+		t.Fatalf("text landed after the focus moved: %q %v", v, err)
+	}
+	// 4d42. Script path: the editor's beforeinput handler relabels it "Password". Refused,
+	// nothing written.
+	res, err = (&browserOpRun{p: browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Notes four", Value: "hello"}}}, be: ub, stop: stop}).run(ctx)
+	if err != nil {
+		t.Fatalf("fill notes four: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || (o[0].Outcome != "refused-sensitive" && o[0].Outcome != browserOutcomeFormChanged) {
+		t.Fatalf("an editor repurposed in its beforeinput handler must be refused: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('ce42').textContent)`); err != nil || v != `""` {
+		t.Fatalf("the repurposed editor was written: %q %v", v, err)
+	}
+	// 4d43. Script path: the editor's beforeinput handler moves the selection into another
+	// editor. Nothing is written, there or in the editor.
+	res, err = (&browserOpRun{p: browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Notes five", Value: "hello"}}}, be: ub, stop: stop}).run(ctx)
+	if err != nil {
+		t.Fatalf("fill notes five: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFormChanged {
+		t.Fatalf("an editor whose beforeinput handler moves the selection must read as form-changed: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify([document.getElementById('ce43').textContent, document.getElementById('ce43b').textContent])`); err != nil || v != `["",""]` {
+		t.Fatalf("text landed after the selection moved: %q %v", v, err)
+	}
+	// 4d44. Script path: the beforeinput handler focuses a password input INSIDE the editor
+	// (the selection is still in the editor, the focus is not on it). Nothing is written.
+	// 4d45. Script path: the handler extends the selection past the editor (the focus stays).
+	// Nothing is written.
+	for _, c := range []struct{ label, read string }{
+		{"Notes six", `JSON.stringify([document.getElementById('ce44').innerText.trim(), document.getElementById('pw44').value])`},
+		{"Notes seven", `JSON.stringify([document.getElementById('ce45').textContent, document.getElementById('p45').textContent === 'After notes seven' ? '' : 'changed'])`},
+	} {
+		res, err = (&browserOpRun{p: browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: c.label, Value: "hello"}}}, be: ub, stop: stop}).run(ctx)
+		if err != nil {
+			t.Fatalf("fill %s: %v", c.label, err)
+		}
+		if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeFormChanged {
+			t.Fatalf("%s: an editor whose beforeinput handler moves the focus or the selection must read as form-changed: %+v", c.label, o)
+		}
+		if v, err := pg.Eval(ctx, c.read); err != nil || v != `["",""]` {
+			t.Fatalf("%s: text landed: %q %v", c.label, v, err)
+		}
+	}
+	// 4d46. Trusted typing (DevTools): the editor's focus handler focuses a password input
+	// inside it. 4d47. The same, on a timer just after the editor took the focus. Chrome's
+	// typing would land in the password input: nothing is typed anywhere.
+	// 4d48. Trusted typing: a timer extends the selection past the editor just after it took
+	// the focus. Nothing is typed.
+	for _, c := range []struct{ label, read string }{
+		{"Notes eight", `JSON.stringify([document.getElementById('ce46').innerText.trim(), document.getElementById('pw46').value])`},
+		{"Notes nine", `JSON.stringify([document.getElementById('ce47').innerText.trim(), document.getElementById('pw47').value])`},
+		{"Notes ten", `JSON.stringify([document.getElementById('ce48').textContent, document.getElementById('p48').textContent === 'After notes ten' ? '' : 'changed'])`},
+	} {
+		res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: c.label, Value: "hello"}}})
+		if err != nil {
+			t.Fatalf("fill %s: %v", c.label, err)
+		}
+		if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome == browserOutcomeFilled {
+			t.Fatalf("%s: an editor that lost the focus or the selection before typing must not be filled: %+v", c.label, o)
+		}
+		if v, err := pg.Eval(ctx, c.read); err != nil || v != `["",""]` {
+			t.Fatalf("%s: text landed: %q %v", c.label, v, err)
+		}
+	}
+	// 4d27. A radio whose change handler rewrites its own value: mismatch, not filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Plan choice", Value: "cheap"}}})
+	if err != nil {
+		t.Fatalf("fill plan choice: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a radio whose value the page rewrote must read as a mismatch: %+v", o)
+	}
+	// 4d28. A checkbox whose change handler rewrites its own value: mismatch, not filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Add extras", Value: "yes"}}})
+	if err != nil {
+		t.Fatalf("fill add extras: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a checkbox whose value the page rewrote must read as a mismatch: %+v", o)
+	}
+	// 4d29. A field that turns into a password field just after it is focused (a timer): the
+	// agent's last check before it types refuses it, nothing typed (trusted path).
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Delivery note", Value: "leave at door"}}})
+	if err != nil {
+		t.Fatalf("fill delivery note: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || (o[0].Outcome != "refused-sensitive" && o[0].Outcome != browserOutcomeFormChanged) {
+		t.Fatalf("a field repurposed after focus must be refused: %+v", o)
+	}
+	if v, err := pg.Eval(ctx, `JSON.stringify(document.getElementById('t29').value)`); err != nil || v != `""` {
+		t.Fatalf("the refused field was written: %q %v", v, err)
+	}
+
+	// 4d32. A custom combobox (a button) whose page shows "Not sure" after the kit chose "No":
+	// mismatch, not filled (a prefix of the shown answer is not the answer).
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Attending", Value: "No"}}})
+	if err != nil {
+		t.Fatalf("fill attending: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a combobox that shows another answer must read as a mismatch: %+v", o)
+	}
+
+	// 4d30. A radio whose change handler removes the clicked option and selects another with
+	// the same label but another value: mismatch, not filled.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Seat class", Value: "cheap"}}})
+	if err != nil {
+		t.Fatalf("fill seat class: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a removed radio replaced by another with the same label must read as a mismatch: %+v", o)
+	}
+	// 4d31. The approved button's click handler starts a slow save of its own, then the
+	// browser's validation refuses the form: the form was not sent, but the result must not
+	// claim nothing was (the save is still in flight past the settle window).
+	prep = prepare(refs["Send required"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r31"})
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || strings.Contains(err.Error(), "Nothing was submitted") || !strings.Contains(err.Error(), "may still have sent") || hit("POST /posted31") != 0 {
+		t.Fatalf("validation refusal with a save in flight: %v posted31=%d", err, hit("POST /posted31"))
+	}
+
+	// 4d33. A page that drops an exponent's minus sign (1e-3 shown as 1e3): mismatch.
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Exponent", Value: "1e-3"}}})
+	if err != nil {
+		t.Fatalf("fill exponent: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("1e-3 shown as 1e3 must read as a mismatch: %+v", o)
+	}
+	// 4d34. A page that drops the sign of the second number (40.7, -74.0 shown as 40.7, 74.0).
+	res, err = run(browserParams{Op: browserOpFill, TabID: tab, Values: []browserPlanValue{{Field: "Coordinates", Value: "40.7, -74.0"}}})
+	if err != nil {
+		t.Fatalf("fill coordinates: %v", err)
+	}
+	if o := res.(browserFillResult).Outcomes; len(o) != 1 || o[0].Outcome != browserOutcomeMismatch {
+		t.Fatalf("a dropped sign on the second number must read as a mismatch: %+v", o)
+	}
+	// 4d35. An approved GET form with a chosen file: the query carries only the file's name, and
+	// the unchanged form is submitted, not refused.
+	if _, err := pg.Eval(ctx, `(function () { var dt = new DataTransfer(); dt.items.add(new File(['hello'], 'report.txt', { type: 'text/plain' })); document.getElementById('att35').files = dt.files; return 'ok'; })()`); err != nil {
+		t.Fatalf("choose a file: %v", err)
+	}
+	prep = prepare(refs["Send upload"])
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r35"})
+	if err != nil || hit("GET /got35") != 1 || !res.(browserClickResult).Navigated {
+		t.Fatalf("approved GET form with a file: %v got35=%d %+v", err, hit("GET /got35"), res)
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4d36. A form whose only submit control is an image button, which form.elements leaves
+	// out: read lists it as the form's submit control, preparing by the form's ref finds it,
+	// and the approved submission posts (with the press's x / y).
+	// 4d37. An image button tied to its form from outside it (form=), in a form with a field
+	// named x: the press adds its own x and y after the field's, and the unchanged form is
+	// submitted, not refused.
+	// 4d38. The same through a script click (the AppleScript route's path): the kit clicks the
+	// image button from the page, which presses it at 0, 0.
+	for i, tc := range []struct {
+		button, path string
+		script       bool
+	}{{"Send image six", "/posted36", false}, {"Send x mark", "/posted37", false}, {"Send x tag", "/posted38", true}} {
+		n := 36 + i
+		formRef := ""
+		for _, f := range res.(browserReadResult).Forms {
+			for _, c := range f.SubmitControls {
+				if c.Text == tc.button {
+					formRef = f.FormRef
+				}
+			}
+		}
+		if formRef == "" {
+			t.Fatalf("4d%d: the image button is not among its form's submit controls: %+v", n, res.(browserReadResult).Forms)
+		}
+		prep = prepare(formRef)
+		if prep.SubmitText != tc.button {
+			t.Fatalf("4d%d: prepared by the form's ref: %+v", n, prep)
+		}
+		var b browserBackend = be
+		if tc.script {
+			b = ub
+		}
+		r, err := (&browserOpRun{p: browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: fmt.Sprintf("r%d", n)},
+			be: b, stop: stop}).run(ctx)
+		deadline := time.Now().Add(5 * time.Second)
+		for hit("POST "+tc.path) == 0 && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if err != nil || hit("POST "+tc.path) != 1 {
+			t.Fatalf("4d%d: approved image button: %v posted=%d %+v", n, err, hit("POST "+tc.path), r)
+		}
+		if cr, ok := r.(browserClickResult); !tc.script && (!ok || !cr.Navigated) {
+			t.Fatalf("4d%d: not navigated: %+v", n, r)
+		}
+		mu.Lock()
+		got := posted[tc.path]
+		mu.Unlock()
+		switch n {
+		case 36:
+			if len(got["iota"]) != 1 || got["iota"][0] != "thirtysix" || len(got["x"]) != 1 || len(got["y"]) != 1 {
+				t.Fatalf("4d36: posted %v", got)
+			}
+		case 37:
+			if len(got["x"]) != 2 || got["x"][0] != "seven" || len(got["y"]) != 1 {
+				t.Fatalf("4d37: the field x must come first, then the press: %v", got)
+			}
+		case 38:
+			if len(got["x"]) != 2 || got["x"][0] != "eight" || got["x"][1] != "0" || len(got["y"]) != 1 || got["y"][0] != "0" {
+				t.Fatalf("4d38: the field x, then the press at 0, 0: %v", got)
+			}
+		}
+		if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+			t.Fatal(err)
+		}
+		res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, b := range res.(browserReadResult).Buttons {
+			refs[b.Text] = b.Ref
+		}
+	}
+
+	// 4d23. An approved POST form whose button's click handler switches it to GET and submits
+	// it natively (no submit event): the fields would land in the URL. Refused, nothing sent.
+	prep = prepare(refs["Send phi two"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r24"})
+	time.Sleep(800 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("GET /posted24") != 0 || hit("POST /posted24") != 0 {
+		t.Fatalf("approved POST switched to GET: %v get=%d post=%d", err, hit("GET /posted24"), hit("POST /posted24"))
+	}
+	// 4d24. Its handler builds a GET copy of the approved POST form, same action and values.
+	prep = prepare(refs["Send phi three"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r25"})
+	time.Sleep(800 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("GET /posted25") != 0 {
+		t.Fatalf("GET copy of an approved POST form: %v get=%d", err, hit("GET /posted25"))
+	}
+
+	// 4d19. The approved form's own submit handler, after the capture-phase check, aims the
+	// form at a hidden iframe and raises a hidden amount: stopped, nothing sent (trusted click).
+	prep = prepare(refs["Send kappa one"])
+	_, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r21"})
+	time.Sleep(800 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted21") != 0 {
+		t.Fatalf("re-aimed and changed in a submit handler (trusted): %v posted21=%d", err, hit("POST /posted21"))
+	}
+	// 4d20. The same through a script click (the AppleScript route's path).
+	prep = prepare(refs["Send kappa two"])
+	_, err = (&browserOpRun{p: browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r22"},
+		be: ub, stop: stop}).run(ctx)
+	time.Sleep(800 * time.Millisecond)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || hit("POST /posted22") != 0 {
+		t.Fatalf("re-aimed and changed in a submit handler (script click): %v posted22=%d", err, hit("POST /posted22"))
+	}
+	// 4d21. A submit handler that re-aims the button itself and stops the event, so nothing of
+	// the kit runs after it. Script click: the browser planned the post into the frame before
+	// the kit could look, so the result says it may have been sent, never "submitted".
+	prep = prepare(refs["Send kappa three"])
+	_, err = (&browserOpRun{p: browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r23"},
+		be: ub, stop: stop}).run(ctx)
+	if !isBrowserCode(err, browserErrSubmitFormChanged) || !strings.Contains(err.Error(), "may have been sent") {
+		t.Fatalf("re-aimed with the event stopped (script click) must be reported: %v", err)
+	}
+	// Trusted click: the pin observer undoes the re-aiming as soon as the handler returns, so the
+	// approved data posts to the page itself and the page navigates.
+	// The script click above ended with the button pinned to _self, and the guard restores it a
+	// moment later: a prepare inside that moment must still match the submit after it.
+	before23 := hit("POST /posted23")
+	prep = prepare(refs["Send kappa three"])
+	time.Sleep(300 * time.Millisecond)
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r23b"})
+	if err != nil || hit("POST /posted23") != before23+1 || !res.(browserClickResult).Navigated {
+		t.Fatalf("re-aimed with the event stopped (trusted): %v posted23 %d -> %d %+v", err, before23, hit("POST /posted23"), res)
+	}
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.(browserReadResult).Buttons {
+		refs[b.Text] = b.Ref
+	}
+
+	// 4e. An unapproved, non-submit-class button whose handler submits a GET
+	// form carrying data into a new hidden iframe: no GET with that data
+	// reaches the server.
+	if refs["More options"] == "" {
+		t.Fatalf("no More options button: %+v", refs)
+	}
+	if _, err := run(browserParams{Op: browserOpClick, TabID: tab, Ref: refs["More options"]}); err != nil {
+		t.Fatalf("click more options: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n := hit("GET /peek"); n != 0 {
+		t.Fatalf("an unapproved click sent a GET form into an iframe %d time(s)", n)
+	}
+
+	// 5. A control inside an open shadow root is clicked, not reported covered.
+	if _, err := run(browserParams{Op: browserOpClick, TabID: tab, Ref: refs["Toggle details"]}); err != nil {
+		t.Fatalf("shadow click: %v", err)
+	}
+	if v, err := pg.Eval(ctx, `document.getElementById('shadowhost').getAttribute('data-toggled') || 'no'`); err != nil || !strings.Contains(v, "yes") {
+		t.Fatalf("shadow click had no effect: %q %v", v, err)
+	}
+
+	// 6. The approved control's onclick calls form.submit(): no submit event,
+	// yet the approved form posts to its own action, once.
+	prep = prepare(refs["Send epsilon"])
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r6"})
+	if err != nil {
+		t.Fatalf("scripted submit: %v", err)
+	}
+	if cr := res.(browserClickResult); !cr.Navigated || cr.Title != "Posted" || hit("POST /posted5") != 1 {
+		t.Fatalf("scripted submit: %+v posted5=%d", cr, hit("POST /posted5"))
+	}
+
+	// 7. A submit button in a form inside an open shadow root.
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeta := ""
+	for _, b := range res.(browserReadResult).Buttons {
+		if b.Text == "Send zeta" {
+			zeta = b.Ref
+		}
+	}
+	if zeta == "" {
+		t.Fatalf("no shadow-root submit button: %+v", res.(browserReadResult).Buttons)
+	}
+	prep = prepare(zeta)
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r7"})
+	if err != nil {
+		t.Fatalf("shadow-root submit: %v", err)
+	}
+	if cr := res.(browserClickResult); !cr.Navigated || cr.Title != "Posted" || hit("POST /posted7") != 1 {
+		t.Fatalf("shadow-root submit: %+v posted7=%d", cr, hit("POST /posted7"))
+	}
+
+	// 8. An anti-bot token written into an empty hidden input on the way out
+	// is allowed: the approved values are unchanged.
+	if _, err := run(browserParams{Op: browserOpNavigate, TabID: tab, URL: srv.URL + "/"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = run(browserParams{Op: browserOpRead, TabID: tab, IncludeText: new(bool)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kappa := ""
+	for _, b := range res.(browserReadResult).Buttons {
+		if b.Text == "Send kappa" {
+			kappa = b.Ref
+		}
+	}
+	prep = prepare(kappa)
+	res, err = run(browserParams{Op: browserOpSubmit, TabID: tab, SubmitRef: prep.SubmitRef, Digest: prep.Digest, RequestID: "r10"})
+	if err != nil {
+		t.Fatalf("token submit: %v", err)
+	}
+	if cr := res.(browserClickResult); !cr.Navigated || hit("POST /posted10") != 1 {
+		t.Fatalf("token submit: %+v posted10=%d", cr, hit("POST /posted10"))
+	}
+}
+
+// untrustedBackend hands out pages without trusted input, as the AppleScript
+// route does, over a real DevTools page.
+type untrustedBackend struct{ browserBackend }
+
+func (u untrustedBackend) Page(ctx context.Context, raw string) (browserPage, error) {
+	pg, err := u.browserBackend.Page(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+	return untrustedPage{pg}, nil
+}
+
+type untrustedPage struct{ browserPage }
+
+func (untrustedPage) TrustedInput() bool { return false }

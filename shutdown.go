@@ -260,6 +260,9 @@ func tearDownSubprocesses(ctx context.Context) {
 	// deadline allows; the session and any unflushed outbox stay on disk.
 	globalWhatsAppSupervisor.ShutdownAll(ctx)
 
+	// Browser control: close the DevTools connection and the AppleScript helper.
+	shutdownBrowserControl()
+
 	// Cleanup GCS storage client (closes idle HTTP/2 streams cleanly).
 	CloseStorageClient()
 

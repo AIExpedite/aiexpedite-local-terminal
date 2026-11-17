@@ -29,6 +29,8 @@ dist/
 
 # Node.js helper scripts (icon conversion, etc.)
 *.js
+# ...except the browser-control kit and Chrome helper, embedded into the agent (go:embed).
+!browser_kit/*.js
 node_modules/
 package.json
 package-lock.json

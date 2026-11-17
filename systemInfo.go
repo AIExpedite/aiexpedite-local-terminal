@@ -263,6 +263,13 @@ type capabilitiesInfo struct {
 	// never omitempty, an empty list meaning "the CLI does not qualify", and
 	// re-read with it.
 	MSPDrivers *mspDriversCapability `json:"mspDrivers"`
+	// BrowserControl (shared-constants BROWSER_CONTROL_CAPABILITY_KEY,
+	// isBrowserControlCapable): this build runs the `__browser__` built-in
+	// (browser_*.go) at `protocol`, over the listed routes (devtools
+	// everywhere, applescript on macOS). terminal-service sends a browser
+	// command only to a computer that reports it; an older agent would look
+	// the unknown built-in up on PATH and show an approval prompt.
+	BrowserControl *browserControlCapability `json:"browserControl,omitempty"`
 }
 
 type relayFollowUpsCapability struct {
@@ -418,6 +425,7 @@ func newMachineCapabilities() *capabilitiesInfo {
 		SignedExecutionID:   true,
 		SignedCommandExpiry: true,
 		WhatsApp:            currentWhatsAppCapability(),
+		BrowserControl:      currentBrowserControlCapability(),
 		ACPDrivers:          newACPDriversCapability(),
 		MSPDrivers:          newMSPDriversCapability(),
 	}

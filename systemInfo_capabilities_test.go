@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"runtime"
 	"testing"
 )
 
@@ -72,6 +73,9 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 				t.Fatalf("caps = %+v, want the WhatsApp capability reported", *caps)
 			}
 			waRaw, _ := json.Marshal(&whatsAppCapability{Supported: true, SecureStorage: caps.WhatsApp.SecureStorage, Protocol: 2})
+			// browserControl's routes depend on the OS (applescript on macOS
+			// only); browser_contract_test.go pins both lists.
+			bcRaw, _ := json.Marshal(&browserControlCapability{Supported: true, Protocol: 1, Routes: browserRoutesFor(runtime.GOOS)})
 			raw, _ := json.Marshal(caps)
 			// The literal IS the assertion: this pins the exact wire shape, so
 			// adding a capability has to be a deliberate edit here rather than
@@ -89,8 +93,9 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// provider in its error frame; `acpDrivers` with OpenCode and
 			// Antigravity on their long-lived ACP drivers, and `mspDrivers` with
 			// Muse Code on `muse serve` (both always present, an empty list when
-			// no installed CLI qualifies).
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]},"mspDrivers":{"protocol":2,"agents":[]}}` {
+			// no installed CLI qualifies); `browserControl` with the AI working
+			// in the person's own Chrome (browser_*.go).
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]},"mspDrivers":{"protocol":2,"agents":[]},"browserControl":`+string(bcRaw)+`}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})

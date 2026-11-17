@@ -33,10 +33,16 @@ const (
 	whatsAppSyncResponseLimit = 64 * 1024
 )
 
-// buildWhatsAppSyncSignedMessage is the canonical the signature covers.
-func buildWhatsAppSyncSignedMessage(agentID string, timestamp int64, rawBody []byte) string {
+// buildDeviceBodySignedMessage is the canonical every body-signed device call
+// covers (the WhatsApp front door and the browser-control results).
+func buildDeviceBodySignedMessage(agentID string, timestamp int64, rawBody []byte) string {
 	sum := sha256.Sum256(rawBody)
 	return agentID + ":" + strconv.FormatInt(timestamp, 10) + ":" + hex.EncodeToString(sum[:])
+}
+
+// buildWhatsAppSyncSignedMessage is the canonical the WhatsApp sync signature covers.
+func buildWhatsAppSyncSignedMessage(agentID string, timestamp int64, rawBody []byte) string {
+	return buildDeviceBodySignedMessage(agentID, timestamp, rawBody)
 }
 
 // whatsAppSyncResponse is terminal-service's answer. Tolerant reader: every

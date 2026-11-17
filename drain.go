@@ -549,6 +549,10 @@ func isDrainPassThrough(cmd commandMsg) bool {
 	if isOperationalCommand(cmd.Command) {
 		return true
 	}
+	// A browser `stop` starts nothing: it halts a fill already running.
+	if isBrowserStopCommand(cmd) {
+		return true
+	}
 	return isWorkContinuationCommand(cmd)
 }
 
