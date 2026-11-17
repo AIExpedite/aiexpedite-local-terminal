@@ -742,12 +742,13 @@ func TestAntigravityNativeRunOneShot_LongPromptUsesStdin(t *testing.T) {
 
 	prompt := strings.Repeat("long \\\"quoted\\\" line with C:\\\\repo\\n", 5000)
 	session := &AntigravityNativeSession{ID: "long-stdin", status: "idle"}
-	out, stderr, exitCode, timedOut, truncated, _, err := NewAntigravityNativeManager(nil).runOneShot(
+	run := NewAntigravityNativeManager(nil).runOneShot(
 		session, dir, fakeAgy, prompt, "", 10*time.Second, "test:antigravity-long-stdin",
 	)
-	if err != nil {
-		t.Fatal(err)
+	if run.startErr != nil || run.streamErr != nil {
+		t.Fatal(run.startErr, run.streamErr)
 	}
+	out, stderr, exitCode, timedOut, truncated := run.resultText, run.stderr, run.exitCode, run.timedOut, run.truncated
 	if out != "done" || stderr != "" || exitCode != 0 || timedOut || truncated {
 		t.Fatalf("unexpected result: out=%q stderr=%q exit=%d timeout=%v truncated=%v", out, stderr, exitCode, timedOut, truncated)
 	}
@@ -1161,14 +1162,22 @@ func TestAntigravityNativeManager_SendNonzeroExitWithStdoutIsError(t *testing.T)
 	if err == nil {
 		t.Fatal("expected Send to fail on non-zero agy exit")
 	}
-	if !strings.Contains(err.Error(), "exited with code 2") {
-		t.Fatalf("error should mention exit code: %v", err)
+	// The ERROR result's own text is the reason, inside the cli_defect
+	// template — never the raw stdout event, and no exit code added.
+	want := "Antigravity failed: authentication required — please run agy login " +
+		"Update Antigravity on that computer, then send the message again. " +
+		"The session is still open — send another message to try again."
+	if err.Error() != want {
+		t.Fatalf("error = %q\nwant    %q", err.Error(), want)
 	}
 
 	var sawError, sawSuccess bool
 	for _, f := range frames {
 		if f.Type == "antigravity_native_error" {
 			sawError = true
+			if f.Output != want || f.FailureCategory != antigravityFailureCLIDefect {
+				t.Fatalf("error frame = %q / %q", f.Output, f.FailureCategory)
+			}
 		}
 		if f.Type == "antigravity_native_message" && f.Status == "success" {
 			sawSuccess = true
@@ -1599,12 +1608,12 @@ func TestAntigravityNativeRunOneShot_ReleasesQuotaCaptureOnTimeout(t *testing.T)
 	session := &AntigravityNativeSession{ID: "capture-timeout", status: "idle"}
 	// The mock sleeps 600ms before answering; a 100ms turn budget forces the
 	// timeout/kill path.
-	_, _, _, timedOut, _, _, err := NewAntigravityNativeManager(nil).runOneShot(
+	run := NewAntigravityNativeManager(nil).runOneShot(
 		session, t.TempDir(), executable, "hello", "", 100*time.Millisecond, "test:antigravity-capture-timeout")
-	if err != nil {
-		t.Fatalf("runOneShot: %v", err)
+	if run.startErr != nil {
+		t.Fatalf("runOneShot: %v", run.startErr)
 	}
-	if !timedOut {
+	if !run.timedOut {
 		t.Fatalf("expected the turn to time out")
 	}
 

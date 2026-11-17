@@ -32,12 +32,20 @@ package main
 //   (3) parent orchestration approval for terminal access, (4) working-directory
 //   scope on Start, (5) process registration + orphan cleanup limited to
 //   AIExpedite-owned PIDs, (6) redacted telemetry (no prompts/secrets).
+//   Failed-turn reporting (antigravity_turn_failure.go), the turn monitor's
+//   stall / interaction stop (antigravity_turn_monitor.go) and the wait for a
+//   stopped turn's tree change none of this: argv, sanitizeAntigravityEnv and
+//   the gate args are untouched, the approved command is still exactly the
+//   spawned one, and nothing answers a prompt beyond the existing
+//   auto-approve. An uncovered interactive request (ask_question,
+//   ask_permission, ask_custom_permission) can only END the turn with a named
+//   reason, never be answered; until agy 1.5.10's shapes are captured that
+//   stop only logs (antigravityInteractionStopMode = observe).
 //   The legacy PTY-only buildAntigravityInteractiveArgs path still uses
 //   --print <prompt>; pipe-based session_start uses the same stdin stream
 //   protocol as this native manager.
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -129,6 +137,10 @@ type AntigravityNativeSession struct {
 	// as a tombstone (see end_confirm.go): only a verified-absent turn process
 	// may convert it into the "not found" absence answer.
 	endDrainUnconfirmed bool
+	// lingering is the last turn the monitor STOPPED (stall / interaction)
+	// while its tree may still be exiting; the next turn's spawn waits for it
+	// (awaitLingeringTurn). Guarded by mu.
+	lingering *antigravityLingeringTurn
 }
 
 type antigravityTurn struct {
@@ -527,33 +539,17 @@ func (m *AntigravityNativeManager) SendTurn(id, text string, publishFn PublishFu
 		beforeIDs = listAntigravityConversationIDs()
 	}
 
-	outText, errText, exitCode, timedOut, truncated, streamConvID, runErr := m.runOneShot(
-		session, runDir, executable, promptToSend, nativeID, turnTimeout, "antigravity-native:"+id,
-	)
-	m.publishStderrIfAny(session, publishFn, errText)
-	if truncated {
-		// Requirements: oversize output must not be silently dropped/truncated
-		// as if it were a complete assistant answer.
-		return m.publishTurnError(session, publishFn,
-			"Antigravity output exceeded the maximum capture size")
+	run := m.runOneShot(session, runDir, executable, promptToSend, nativeID, turnTimeout, "antigravity-native:"+id)
+	if done, err := m.settleRunPreconditions(session, publishFn, run, ""); done {
+		return err
 	}
 
-	if session.Status() == "ended" {
-		// Cancelled mid-turn — do not promote late output to a completion.
-		return fmt.Errorf("session ended during turn")
-	}
-	if timedOut {
-		return m.publishTurnError(session, publishFn, "Antigravity turn timed out")
-	}
-
-	// Exact-ID resume failed with a recognized missing/stale conversation.
-	// Can happen either via non-zero process exit or a stream-json ERROR result
-	// (runErr != nil). Require an explicit error signal (exitCode != 0 or runErr != nil)
-	// so ordinary assistant text that mentions "conversation not found" cannot trigger
-	// a costly false-positive replay. At most one replay recovery for this turn.
-	isMissingConv := useNativeResume && (exitCode != 0 || runErr != nil) &&
-		(looksLikeMissingConversation(outText, errText) || (runErr != nil && looksLikeMissingConversation(runErr.Error(), errText)))
-	if isMissingConv {
+	// Exact-ID resume failed with a recognized missing/stale conversation —
+	// a non-zero exit or an ERROR result naming it. Require that explicit
+	// failure signal so ordinary assistant text that mentions "conversation
+	// not found" cannot trigger a costly false-positive replay. At most one
+	// replay recovery for this turn.
+	if useNativeResume && run.failed() && looksLikeMissingConversation(run.missingConversationText(), run.stderr) {
 		fmt.Printf("%s[antigravity-native] Native resume failed for %s — replaying bounded transcript%s\n",
 			colorYellow, id, colorReset)
 		session.NativeConversationID = ""
@@ -565,55 +561,28 @@ func (m *AntigravityNativeManager) SendTurn(id, text string, publishFn PublishFu
 		lockCapture()
 		beforeIDs = listAntigravityConversationIDs()
 
-		out2, err2, exit2, timed2, trunc2, conv2, run2 := m.runOneShot(
-			session, runDir, executable, replayPrompt, "", turnTimeout, "antigravity-native:"+id+":replay",
-		)
-		if run2 != nil {
-			return m.publishTurnError(session, publishFn, fmt.Sprintf("replay failed: %v", run2))
+		run = m.runOneShot(session, runDir, executable, replayPrompt, "", turnTimeout, "antigravity-native:"+id+":replay")
+		if done, err := m.settleRunPreconditions(session, publishFn, run, "replay "); done {
+			return err
 		}
-		m.publishStderrIfAny(session, publishFn, err2)
-		if session.Status() == "ended" {
-			return fmt.Errorf("session ended during turn")
-		}
-		if timed2 {
-			return m.publishTurnError(session, publishFn, "Antigravity replay recovery timed out")
-		}
-		if trunc2 {
-			return m.publishTurnError(session, publishFn,
-				"Antigravity replay output exceeded the maximum capture size")
-		}
-		outText, errText, exitCode = out2, err2, exit2
-		streamConvID = conv2
-		runErr = nil
 		usedReplay = true
 		needCapture = true
-		// Non-zero exit after replay is handled by the unified exit-code gate
-		// below (including stdout-bearing diagnostics such as auth/quota).
-	} else if runErr != nil {
-		return m.publishTurnError(session, publishFn, runErr.Error())
+		// A failure after replay is handled by the failure gate below.
 	}
 
-	// After missing-conversation replay is handled, remaining non-zero exits
-	// (auth, quota, invalid flags, tool failures) must surface as turn errors
-	// even when stdout carries diagnostic text — never publish success or
-	// append diagnostics into the conversation transcript as an assistant turn.
-	if exitCode != 0 {
-		detail := strings.TrimSpace(outText)
-		if detail == "" {
-			detail = strings.TrimSpace(errText)
-		}
-		if detail != "" {
-			// Keep the user-facing message bounded; full stderr is already
-			// published (redacted) via publishStderrIfAny when present.
-			if len(detail) > 400 {
-				detail = detail[:400] + "…"
-			}
-			return m.publishTurnError(session, publishFn,
-				fmt.Sprintf("Antigravity exited with code %d: %s", exitCode, detail))
-		}
-		return m.publishTurnError(session, publishFn,
-			fmt.Sprintf("Antigravity exited with code %d and produced no response", exitCode))
+	// Every remaining failed turn — a non-zero exit (even one carrying a
+	// successful result), an ERROR result, a quota reason from the run's own
+	// log — is classified from its evidence and published as reason + next
+	// step + closing sentence (antigravity_turn_failure.go). It never becomes
+	// an assistant turn, and the native conversation id is not adopted.
+	if run.failed() {
+		return m.publishClassifiedFailure(session, publishFn, run, runDir)
 	}
+	if run.streamErr != nil {
+		return m.publishTurnError(session, publishFn, run.streamErr.Error())
+	}
+	outText := run.resultText
+	streamConvID := run.conversationID
 	if outText == "" {
 		return m.publishTurnError(session, publishFn,
 			"Antigravity produced no response (empty completion is not treated as success)")
@@ -662,7 +631,6 @@ func (m *AntigravityNativeManager) SendTurn(id, text string, publishFn PublishFu
 		Type:        "antigravity_native_message",
 		SessionID:   session.ID,
 		Seq:         seq,
-		ExitCode:    exitCode,
 		// Durable conversation id for conversation-scoped resume. Published
 		// here — after the success gate above and after the capture block has
 		// adopted it — so the cloud only ever commits an id that names a
@@ -746,22 +714,153 @@ func containedCwd(cwd, workspaceRoot string) (string, error) {
 	return resolvedCwd, nil
 }
 
+// antigravityTurnRun is what one `agy` run left: its stdout events, stderr,
+// exit, the driver's own stop (if any) and the failure lines in its own log.
+type antigravityTurnRun struct {
+	args        []string
+	rawStdout   string
+	stdoutLines []string
+	stderr      string
+	exitCode    int
+	timedOut    bool
+	truncated   bool
+	// resultText is the successful result's response; resultErr is an ERROR
+	// result's error. streamErr is a stream-contract failure on a zero exit
+	// (no result event, invalid stream-json).
+	resultText     string
+	resultErr      error
+	streamErr      error
+	conversationID string
+	pid            int
+	spawnedAt      time.Time
+	// stopCause / stopDetail: the turn the monitor stopped
+	// (interaction_required / stalled) and the interaction's tool or title.
+	stopCause  string
+	stopDetail string
+	// quotaReason: the in-run log follow saw a quota failure and stopped agy.
+	quotaReason string
+	// logReasons: the failure lines of this run's own log block, read after
+	// exit; agyLog names that log.
+	logReasons []string
+	agyLog     string
+	// startErr: nothing ran (pipe or spawn failure, or the session ended).
+	startErr error
+	// shuttingDown: the previous stopped turn's processes outlived the wait.
+	shuttingDown bool
+}
+
+// failed reports a turn that must not publish success: a non-zero exit (even
+// one carrying a successful result), an ERROR result, a quota stop or a
+// monitor stop.
+func (r antigravityTurnRun) failed() bool {
+	return r.exitCode != 0 || r.resultErr != nil || r.quotaReason != "" || r.stopCause != ""
+}
+
+// missingConversationText is the text looksLikeMissingConversation reads: the
+// raw stdout plus an ERROR result's error, as before the classifier existed.
+func (r antigravityTurnRun) missingConversationText() string {
+	if r.resultErr != nil {
+		return r.rawStdout + "\n" + r.resultErr.Error()
+	}
+	return r.rawStdout
+}
+
+// Seams: the force-kill of a turn's tree, and how long the next turn waits
+// for a stopped turn's tree.
+var (
+	antigravityKillTurnTree     = killAntigravityProcessTree
+	antigravityLingeringWait    = 30 * time.Second
+	antigravityLingeringPoll    = 100 * time.Millisecond
+	antigravityTurnTreeAlive    = sessionTurnTreeAlive
+	antigravityEndTurnLeftovers = func(sessionID string, pid int) { globalSpawnLedger.EndTurnLeftovers(sessionID, pid) }
+	// Room kept inside antigravityStopPublishBound for classification and
+	// publishing once the stopped process is waited out (or given up on).
+	antigravityStopPublishMargin = 500 * time.Millisecond
+)
+
+// antigravityLingeringTurn is a stopped turn whose tree may still be exiting.
+type antigravityLingeringTurn struct {
+	pid int
+	cmd *exec.Cmd
+}
+
+// awaitLingeringTurn holds a new turn's spawn until the previous STOPPED
+// turn's process and the tools it started are gone — that turn's tree only,
+// never another agy on the computer (a usage probe). It keeps force-killing
+// that tree while it waits, for at most antigravityLingeringWait from when
+// this message starts waiting. false: the tree outlived the wait.
+func (m *AntigravityNativeManager) awaitLingeringTurn(session *AntigravityNativeSession) bool {
+	session.mu.Lock()
+	lg := session.lingering
+	session.mu.Unlock()
+	if lg == nil {
+		return true
+	}
+	gone := func() bool {
+		if antigravityTurnTreeAlive(session.ID, lg.pid) {
+			return false
+		}
+		session.mu.Lock()
+		if session.lingering == lg {
+			session.lingering = nil
+		}
+		session.mu.Unlock()
+		// The tree is empty: release its ledger record and Job Object.
+		untrackSessionProcess(session.ID, lg.pid)
+		return true
+	}
+	if gone() {
+		return true
+	}
+	fmt.Printf("%s[antigravity-native] Waiting for the previous turn's processes (PID %d) on %s before starting this one%s\n",
+		colorYellow, lg.pid, session.ID, colorReset)
+	deadline := time.Now().Add(antigravityLingeringWait)
+	for {
+		antigravityKillTurnTree(lg.cmd)
+		antigravityEndTurnLeftovers(session.ID, lg.pid)
+		time.Sleep(antigravityLingeringPoll)
+		if gone() {
+			fmt.Printf("%s[antigravity-native] Previous turn's processes (PID %d) on %s are gone — starting this turn%s\n",
+				colorCyan, lg.pid, session.ID, colorReset)
+			return true
+		}
+		if time.Now().After(deadline) {
+			fmt.Printf("%s[antigravity-native] Previous turn's processes (PID %d) on %s still alive after %s%s\n",
+				colorRed, lg.pid, session.ID, antigravityLingeringWait, colorReset)
+			return false
+		}
+	}
+}
+
 // runOneShot spawns one stream-json `agy` process, drains stdout/stderr
-// concurrently (required to avoid pipe deadlock), and waits for exit. Does not
-// publish frames. conversationID is the conversation the run reported on its
-// own stream (antigravityStreamConversationID), set only when that stream
-// parsed as a complete result; "" otherwise.
+// concurrently (required to avoid pipe deadlock) while the turn monitor
+// watches it (antigravity_turn_monitor.go), and waits for exit. Does not
+// publish frames.
+//
+// A turn the monitor stops (stall, or an interaction request in enforce mode)
+// is interrupted and its tree force-killed antigravityStopKillGrace later; the
+// run returns by antigravityStopPublishBound after the signal's first
+// sighting even if a child outlives the kill. That turn then stays as the
+// session's lingering turn: the next turn waits for its tree
+// (awaitLingeringTurn), and its ledger record and Job Object are kept until
+// the tree is empty.
 func (m *AntigravityNativeManager) runOneShot(
 	session *AntigravityNativeSession,
 	runDir, executable, prompt, nativeID string,
 	turnTimeout time.Duration,
 	registryLabel string,
-) (stdoutText, stderrText string, exitCode int, timedOut, truncated bool, conversationID string, err error) {
+) antigravityTurnRun {
 	// Unattended remote chat cannot answer local permission prompts — see
 	// package threat-model comment. Same prefix the approval gate displays
 	// (buildAntigravityNativeGateArgs) so the two never drift. The START's
 	// model and effort ride on every turn, whichever conversation it runs in.
 	args := buildAntigravityNativeTurnArgs(nativeID, session.LaunchArgs)
+	run := antigravityTurnRun{args: args}
+
+	if !m.awaitLingeringTurn(session) {
+		run.shuttingDown = true
+		return run
+	}
 
 	cmd := exec.Command(executable, args...)
 	stdinLine := antigravityStreamUserMessage(prompt)
@@ -785,16 +884,19 @@ func (m *AntigravityNativeManager) runOneShot(
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", "", 0, false, false, "", fmt.Errorf("stdout pipe: %w", err)
+		run.startErr = fmt.Errorf("stdout pipe: %w", err)
+		return run
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return "", "", 0, false, false, "", fmt.Errorf("stderr pipe: %w", err)
+		run.startErr = fmt.Errorf("stderr pipe: %w", err)
+		return run
 	}
 
 	// Avoid spawning when End already won the race during turn setup.
 	if session.Status() == "ended" {
-		return "", "", 0, false, false, "", fmt.Errorf("session ended during turn")
+		run.startErr = fmt.Errorf("session ended during turn")
+		return run
 	}
 
 	// agy already leads its own group (Setsid above). Recorded in the spawn
@@ -802,30 +904,43 @@ func (m *AntigravityNativeManager) runOneShot(
 	beginSessionSpawn(session.ID, cmd)
 	if err := cmd.Start(); err != nil {
 		abortSessionSpawn(session.ID)
-		return "", "", 0, false, false, "", fmt.Errorf("failed to start agy (is Antigravity CLI installed?): %w", err)
+		run.startErr = fmt.Errorf("failed to start agy (is Antigravity CLI installed?): %w", err)
+		return run
 	}
 	trackSessionProcess(session.ID, cmd)
-	defer untrackSessionProcess(session.ID, cmd.Process.Pid)
-	if cmd.Process != nil {
-		globalProcessRegistry.Register(cmd.Process.Pid, registryLabel)
-		defer globalProcessRegistry.Deregister(cmd.Process.Pid)
+	pid := cmd.Process.Pid
+	globalProcessRegistry.Register(pid, registryLabel)
+	// Released when the run returns — or, for a stopped turn whose process
+	// outlived the publish bound, once it is finally gone (below).
+	releaseProcess := func() {
+		globalProcessRegistry.Deregister(pid)
+		untrackSessionProcess(session.ID, pid)
 	}
-
-	// Quota exhaustion is invisible on this path until exit (stdout is
-	// buffered) and agy retries it silently for as long as the turn budget
-	// allows. Poll its log for the reason and cut the turn short with it
-	// (antigravity_quota_notice.go); the reason becomes the turn's error. The
-	// cadence is bounded by this turn's budget so a short turn still gets a
-	// lookup before its timeout fires.
+	abandoned := false
+	defer func() {
+		if !abandoned {
+			releaseProcess()
+		}
+	}()
 	spawnedAt := time.Now()
-	quotaCtx, stopQuotaWatch := context.WithCancel(context.Background())
-	defer stopQuotaWatch()
+	run.pid, run.spawnedAt = pid, spawnedAt
+
+	// The monitor follows stdout and this run's own log: a stall after init,
+	// an uncovered interaction request (enforce mode) and a quota failure
+	// line stop the turn. Quota exhaustion used to surface only through a
+	// 15 s poll of the shared cli.log; agy 1.5.10 dies of it in ~4 s.
 	var quotaReason atomic.Value
-	go watchAntigravityQuota(quotaCtx, spawnedAt, antigravityQuotaPollCadence(turnTimeout), func(reason string) {
+	stopTree := func() {
+		_ = interruptProcess(cmd)
+		time.AfterFunc(antigravityStopKillGrace, func() { antigravityKillTurnTree(cmd) })
+	}
+	mon := newAntigravityTurnMonitor(session.ID, spawnedAt, antigravityNativeMaxStdout, stopTree, func(reason string) {
 		quotaReason.Store(reason)
 		fmt.Printf("%s[antigravity-native] quota exhausted — %s%s\n", colorYellow, reason, colorReset)
 		stopAntigravityRetryLoop(cmd, func() { killAntigravityProcessTree(cmd) })
 	})
+	go mon.run(pid)
+	defer mon.finish()
 
 	// This process is the only window in which agy's quota is readable: its
 	// language server lives and dies with it, so the post-run usage refresh can
@@ -836,7 +951,7 @@ func (m *AntigravityNativeManager) runOneShot(
 	// turn. The capture owns the run's agy PID, so its settle can read the
 	// run's own log block. See cliagent_usage_antigravity_capture.go.
 	quotaCapture := startAntigravityQuotaCapture("native turn")
-	quotaCapture.SetPID(cmd.Process.Pid)
+	quotaCapture.SetPID(pid)
 	defer quotaCapture.Finish()
 
 	var timedOutFlag atomic.Bool
@@ -861,75 +976,209 @@ func (m *AntigravityNativeManager) runOneShot(
 
 	// Drain both pipes concurrently — sequential read deadlocks when the child
 	// fills the unread pipe buffer (Go exec docs).
-	var (
-		stdoutBuf, stderrBuf *limitedBuffer
-		wg                   sync.WaitGroup
-	)
+	stderrCh := make(chan *limitedBuffer, 1)
+	exitCh := make(chan error, 1)
+	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		stdoutBuf = captureLimited(stdout, antigravityNativeMaxStdout)
+		mon.consumeStdout(stdout)
 	}()
 	go func() {
 		defer wg.Done()
-		stderrBuf = captureLimited(stderr, antigravityNativeMaxStderr)
+		stderrCh <- captureLimited(stderr, antigravityNativeMaxStderr)
 	}()
-	wg.Wait()
+	go func() {
+		wg.Wait()
+		exitCh <- cmd.Wait()
+	}()
 
-	waitErr := cmd.Wait()
-	stopQuotaWatch()
-	if reason, _ := quotaReason.Load().(string); reason != "" {
-		// Not a timeout and not a missing conversation: Send publishes this
-		// reason as the turn error, in the wrapper the cloud's matcher reads.
-		return "", "", 1, false, false, "", fmt.Errorf("[Antigravity turn failed: %s]", reason)
-	}
-	exitCode = 0
-	if waitErr != nil {
-		if ee, ok := waitErr.(*exec.ExitError); ok {
-			exitCode = ee.ExitCode()
-		} else {
-			return "", "", 0, timedOutFlag.Load(), false, "", fmt.Errorf("agy process error: %w", waitErr)
+	var waitErr error
+	exited := false
+	select {
+	case waitErr = <-exitCh:
+		exited = true
+	case <-mon.stopCh:
+		_, _, signalAt := mon.stopInfo()
+		bound := time.Until(signalAt.Add(antigravityStopPublishBound - antigravityStopPublishMargin))
+		select {
+		case waitErr = <-exitCh:
+			exited = true
+		case <-time.After(max(bound, 0)):
 		}
 	}
+	mon.finish()
+
+	run.stopCause, run.stopDetail, _ = mon.stopInfo()
+	if run.stopCause != "" {
+		// Whatever the stopped tree does next, the next turn waits for it.
+		session.mu.Lock()
+		session.lingering = &antigravityLingeringTurn{pid: pid, cmd: cmd}
+		session.mu.Unlock()
+	}
+	if !exited {
+		// Publish now; keep force-killing the tree and release it once gone.
+		abandoned = true
+		fmt.Printf("%s[antigravity-native] Stopped turn's process (PID %d) on %s outlived the force-kill; publishing anyway%s\n",
+			colorRed, pid, session.ID, colorReset)
+		go func() {
+			for {
+				select {
+				case <-exitCh:
+					releaseProcess()
+					return
+				case <-time.After(time.Second):
+					antigravityKillTurnTree(cmd)
+				}
+			}
+		}()
+		rawOut, _ := mon.snapshot()
+		run.rawStdout = strings.TrimSpace(rawOut)
+		run.stdoutLines = strings.Split(run.rawStdout, "\n")
+		run.exitCode = -1
+		return run
+	}
+
+	if reason, _ := quotaReason.Load().(string); reason != "" {
+		run.quotaReason = reason
+	}
+	if waitErr != nil {
+		if ee, ok := waitErr.(*exec.ExitError); ok {
+			run.exitCode = ee.ExitCode()
+		} else {
+			run.startErr = fmt.Errorf("agy process error: %w", waitErr)
+			run.timedOut = timedOutFlag.Load()
+			return run
+		}
+	}
+	run.timedOut = timedOutFlag.Load()
+
+	rawOut, trunc := mon.snapshot()
+	run.rawStdout = strings.TrimSpace(rawOut)
+	run.stdoutLines = strings.Split(run.rawStdout, "\n")
 	// Fail closed only when assistant stdout was truncated. Stderr may hit its
 	// smaller cap without invalidating a complete assistant response; the
 	// partial stderr is still published (redacted) for diagnostics.
-	out := ""
-	convID := ""
-	if stdoutBuf != nil {
-		rawOut := strings.TrimSpace(stdoutBuf.b.String())
-		if !stdoutBuf.trunc && !timedOutFlag.Load() {
-			if rawOut == "" && exitCode == 0 {
-				return "", "", exitCode, false, false, "", fmt.Errorf("Antigravity stream ended without a result event")
-			}
-			if rawOut != "" {
-				parsed, parseErr := antigravityStreamResultText(rawOut)
-				if parseErr != nil {
-					// A failed/older CLI may print a plain-text diagnostic before
-					// exiting non-zero. Preserve it for the normal exit-code error
-					// path; successful runs must honor the stream-json contract.
-					if exitCode == 0 {
-						return parsed, "", exitCode, false, false, "", parseErr
-					}
-					out = rawOut
-				} else {
-					out = parsed
-					convID = antigravityStreamConversationID(rawOut)
-				}
-			}
-		} else {
-			out = rawOut
+	run.truncated = trunc
+	if buf := <-stderrCh; buf != nil {
+		run.stderr = strings.TrimSpace(buf.b.String())
+	}
+	if !trunc && !run.timedOut {
+		switch parsed, parseErr := antigravityStreamResultText(run.rawStdout); {
+		case parseErr == nil:
+			run.resultText = parsed
+			run.conversationID = antigravityStreamConversationID(run.rawStdout)
+		case errors.As(parseErr, new(*antigravityResultError)):
+			run.resultErr = parseErr
+		case run.exitCode == 0:
+			// A successful exit must honor the stream-json contract; a failed
+			// one is classified from its evidence instead.
+			run.streamErr = parseErr
 		}
 	}
-	errOut := ""
-	if stderrBuf != nil {
-		errOut = strings.TrimSpace(stderrBuf.b.String())
+
+	// The run's own failure lines, read once after exit: a 1.5.10 run dies
+	// before any in-run follow reads them. Bounded by antigravityPIDBlock's
+	// read cap; an unreadable log only leaves the other evidence. A stopped
+	// turn keeps its stop cause, so it skips the read.
+	if run.failed() && run.stopCause == "" {
+		if path, block, ok := antigravityPIDBlockFile(antigravityRunLogBase(), pid, spawnedAt); ok {
+			run.agyLog = path
+			run.logReasons = antigravityRunFailureReasons(block)
+		}
 	}
-	trunc := stdoutBuf != nil && stdoutBuf.trunc
-	return out, errOut, exitCode, timedOutFlag.Load(), trunc, convID, nil
+	return run
 }
 
-func (m *AntigravityNativeManager) publishStderrIfAny(session *AntigravityNativeSession, publishFn PublishFunc, errText string) {
+// settleRunPreconditions publishes the outcomes that end a turn before its
+// result is read: shutting down, nothing spawned, truncation, a session ended
+// mid-turn, the driver's own stop, the turn timeout. done is false when the
+// run's result is still to be read. label prefixes the replay's messages.
+func (m *AntigravityNativeManager) settleRunPreconditions(session *AntigravityNativeSession, publishFn PublishFunc, run antigravityTurnRun, label string) (bool, error) {
+	if run.shuttingDown {
+		recordAntigravityTurnFailure(antigravityTurnDiagnostics{
+			SessionID: session.ID, At: time.Now().UTC().Format(time.RFC3339), AgyVersion: antigravityCapabilityVersion(),
+			Source: "shutting_down", Argv: antigravityRedactedArgv(run.args), Cwd: session.Cwd,
+		})
+		return true, m.publishTurnFailure(session, publishFn, antigravityShuttingDownText, "")
+	}
+	if run.startErr != nil {
+		if label != "" {
+			return true, m.publishTurnError(session, publishFn, fmt.Sprintf("replay failed: %v", run.startErr))
+		}
+		if session.Status() == "ended" {
+			return true, run.startErr
+		}
+		return true, m.publishTurnError(session, publishFn, run.startErr.Error())
+	}
+	exitForStderr := 0
+	if run.failed() {
+		exitForStderr = run.exitCode
+	}
+	m.publishStderrIfAny(session, publishFn, run.stderr, exitForStderr)
+	if session.Status() == "ended" {
+		// Cancelled mid-turn — do not promote late output to a completion.
+		return true, fmt.Errorf("session ended during turn")
+	}
+	if run.stopCause != "" {
+		return true, m.publishClassifiedFailure(session, publishFn, run, session.Cwd)
+	}
+	if run.truncated {
+		// Requirements: oversize output must not be silently dropped/truncated
+		// as if it were a complete assistant answer.
+		msg := "Antigravity output exceeded the maximum capture size"
+		if label != "" {
+			msg = "Antigravity replay output exceeded the maximum capture size"
+		}
+		return true, m.publishTurnError(session, publishFn, msg)
+	}
+	if run.timedOut {
+		msg := "Antigravity turn timed out"
+		if label != "" {
+			msg = "Antigravity replay recovery timed out"
+		}
+		return true, m.publishTurnError(session, publishFn, msg)
+	}
+	return false, nil
+}
+
+// publishClassifiedFailure classifies a failed turn, keeps its diagnostics
+// locally and publishes exactly one error frame. The transcript and the
+// native conversation id are left as they were.
+func (m *AntigravityNativeManager) publishClassifiedFailure(session *AntigravityNativeSession, publishFn PublishFunc, run antigravityTurnRun, cwd string) error {
+	logReasons := run.logReasons
+	if run.quotaReason != "" {
+		logReasons = append([]string{run.quotaReason}, logReasons...)
+	}
+	ev := collectAntigravityTurnEvidence(run.stdoutLines, run.stderr, logReasons)
+	failure := classifyAntigravityTurnFailure(ev, run.stopCause, run.stopDetail, antigravityFailureContext{
+		computer: getDeviceName(),
+		cwd:      cwd,
+		model:    antigravityLaunchModel(session.LaunchArgs),
+		exitCode: run.exitCode,
+	})
+	recordAntigravityTurnFailure(antigravityTurnDiagnostics{
+		SessionID:    session.ID,
+		At:           time.Now().UTC().Format(time.RFC3339),
+		AgyVersion:   antigravityCapabilityVersion(),
+		ExitCode:     run.exitCode,
+		Category:     failure.category,
+		Source:       failure.source.String(),
+		Argv:         antigravityRedactedArgv(run.args),
+		Cwd:          cwd,
+		PID:          run.pid,
+		AgyLog:       run.agyLog,
+		FailureLines: logReasons,
+		Stderr:       run.stderr,
+		StdoutTail:   antigravityDiagnosticEvents(run.stdoutLines),
+	})
+	return m.publishTurnFailure(session, publishFn, composeAntigravityFailureText(failure), failure.category)
+}
+
+// publishStderrIfAny publishes a turn's stderr (redacted). exitCode is the
+// failed turn's exit code (0 on success, omitted from the frame), so the
+// stderr frame records it alongside the classified error.
+func (m *AntigravityNativeManager) publishStderrIfAny(session *AntigravityNativeSession, publishFn PublishFunc, errText string, exitCode int) {
 	if errText == "" || publishFn == nil {
 		return
 	}
@@ -949,6 +1198,7 @@ func (m *AntigravityNativeManager) publishStderrIfAny(session *AntigravityNative
 		Type:      "antigravity_native_stderr",
 		SessionID: session.ID,
 		Seq:       seq,
+		ExitCode:  exitCode,
 	})
 }
 
@@ -1194,6 +1444,14 @@ func (m *AntigravityNativeManager) removeSessionIfSame(id string, s *Antigravity
 }
 
 func (m *AntigravityNativeManager) publishTurnError(session *AntigravityNativeSession, publishFn PublishFunc, msg string) error {
+	return m.publishTurnFailure(session, publishFn, msg, "")
+}
+
+// publishTurnFailure publishes one antigravity_native_error frame. category
+// is the failure category (antigravity_turn_failure.go), "" for errors outside
+// the category table; it rides as the optional failureCategory field, so older
+// readers keep reading `output` unchanged.
+func (m *AntigravityNativeManager) publishTurnFailure(session *AntigravityNativeSession, publishFn PublishFunc, msg, category string) error {
 	seq := int(atomic.AddInt64(&session.seq, 1))
 	publishFn(resultMsg{
 		ID:          session.ID,
@@ -1207,6 +1465,8 @@ func (m *AntigravityNativeManager) publishTurnError(session *AntigravityNativeSe
 		BootID:      agentBootID,
 		SessionID:   session.ID,
 		Seq:         seq,
+		// FailureCategory is set only on this frame type.
+		FailureCategory: category,
 	})
 	return fmt.Errorf("%s", msg)
 }
@@ -1311,6 +1571,13 @@ func antigravityStreamUserMessage(prompt string) string {
 	return fmt.Sprintf(`{"event":"user","message":{"content":%s}}`, jsonEscapeString(prompt))
 }
 
+// antigravityResultError is an ERROR result's error, so a caller can tell it
+// from a stream-contract failure (no result event, invalid JSON). Its Error()
+// is the CLI's error text alone.
+type antigravityResultError struct{ msg string }
+
+func (e *antigravityResultError) Error() string { return e.msg }
+
 // antigravityStreamResultText extracts the complete current-turn response from
 // agy's terminal result event. Step updates are deliberately ignored here: the
 // native manager publishes one complete response, matching its prior text-mode
@@ -1349,7 +1616,7 @@ func antigravityStreamResultText(output string) (string, error) {
 			if errMsg == "" {
 				errMsg = "Antigravity turn failed"
 			}
-			resultErr = fmt.Errorf("%s", errMsg)
+			resultErr = &antigravityResultError{msg: errMsg}
 			resultText = errMsg
 		} else {
 			resultText = event.Result.Response
@@ -1470,7 +1737,17 @@ var (
 	antigravityCapabilityOK      bool
 	antigravityCapabilityChecked time.Time
 	antigravityCapabilityErr     error
+	// antigravityCapabilityVer is the version the last successful probe read.
+	antigravityCapabilityVer string
 )
+
+// antigravityCapabilityVersion is agy's version from the cached capability
+// probe ("" when it was never read). Never spawns.
+func antigravityCapabilityVersion() string {
+	antigravityCapabilityMu.Lock()
+	defer antigravityCapabilityMu.Unlock()
+	return antigravityCapabilityVer
+}
 
 func probeAntigravityNativeCapability() error {
 	antigravityCapabilityMu.Lock()
@@ -1484,8 +1761,11 @@ func probeAntigravityNativeCapability() error {
 		return antigravityCapabilityErr
 	}
 
-	err := probeAntigravityNativeCapabilityUncached()
+	ver, err := probeAntigravityNativeCapabilityUncached()
 	antigravityCapabilityChecked = time.Now()
+	if ver != "" {
+		antigravityCapabilityVer = ver
+	}
 	if err != nil {
 		antigravityCapabilityOK = false
 		antigravityCapabilityErr = err
@@ -1496,7 +1776,7 @@ func probeAntigravityNativeCapability() error {
 	return nil
 }
 
-func probeAntigravityNativeCapabilityUncached() error {
+func probeAntigravityNativeCapabilityUncached() (string, error) {
 	executable := resolveExecutable("agy")
 	if executable == "" {
 		// Still try bare name — may be on PATH at spawn time.
@@ -1511,24 +1791,24 @@ func probeAntigravityNativeCapabilityUncached() error {
 		hideWindow(cmd2)
 		out2, err2 := cmd2.CombinedOutput()
 		if err2 != nil {
-			return fmt.Errorf("Antigravity CLI not found or not runnable: install agy ≥ %s", antigravityNativeMinVersion)
+			return "", fmt.Errorf("Antigravity CLI not found or not runnable: install agy ≥ %s", antigravityNativeMinVersion)
 		}
 		out = out2
 	}
 	ver := strings.TrimSpace(string(out))
 	if ver == "" {
 		// Empty but successful version probe — accept (rare builds).
-		return nil
+		return "", nil
 	}
 	m := semverRe.FindStringSubmatch(ver)
 	if m == nil {
 		// Unknown version format — fail closed for native chat.
-		return fmt.Errorf("unsupported Antigravity CLI version %q (need ≥ %s)", ver, antigravityNativeMinVersion)
+		return "", fmt.Errorf("unsupported Antigravity CLI version %q (need ≥ %s)", ver, antigravityNativeMinVersion)
 	}
 	if compareSemver(m[0], antigravityNativeMinVersion) < 0 {
-		return fmt.Errorf("Antigravity CLI %s is below minimum %s for native chat", m[0], antigravityNativeMinVersion)
+		return m[0], fmt.Errorf("Antigravity CLI %s is below minimum %s for native chat", m[0], antigravityNativeMinVersion)
 	}
-	return nil
+	return m[0], nil
 }
 
 // compareSemver returns -1/0/1 for a < b / a == b / a > b (major.minor.patch).

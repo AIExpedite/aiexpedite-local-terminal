@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -237,48 +236,58 @@ func TestQuotaFailureFromErrorStepIsOncePerManagedSession(t *testing.T) {
 	}
 }
 
-func TestAntigravityQuotaPollCadence(t *testing.T) {
-	// A turn budget at or above two polls keeps the default cadence.
-	for _, timeout := range []time.Duration{0, -time.Second, 30 * time.Second, 10 * time.Minute} {
-		if got := antigravityQuotaPollCadence(timeout); got != antigravityQuotaPollInterval {
-			t.Fatalf("cadence(%v) = %v, want the default", timeout, got)
+// agy 1.5.10 (AIE2, 2026-11-17) does not retry a quota failure: it logs the
+// executor error and a Print-mode line, then exits 3. Both are run-failure
+// lines carrying the same reason, and both are quota.
+func TestParseAntigravityRunFailureLine_Agy1510Shapes(t *testing.T) {
+	now := time.Date(time.Now().Year(), time.November, 17, 13, 0, 0, 0, time.Local)
+	for _, line := range []string{
+		`E1117 12:55:47.801000   7712 executor.go:212] agent executor error: generating and executing: ` + aie2QuotaReason,
+		`E1117 12:55:47.802000   7712 print.go:97] Print mode: run ended with error and no response: ` + aie2QuotaReason,
+	} {
+		_, reason, ok := parseAntigravityRunFailureLine(line, now)
+		if !ok || reason != aie2QuotaReason || !isAntigravityQuotaReason(reason) {
+			t.Fatalf("line %q → (%q, %v)", line, reason, ok)
 		}
 	}
-	// A shorter budget gets a cadence that fits at least one lookup inside it,
-	// otherwise the turn times out before the log is ever read.
-	for _, timeout := range []time.Duration{10 * time.Second, 5 * time.Second, time.Second, 100 * time.Millisecond} {
-		got := antigravityQuotaPollCadence(timeout)
-		if got > timeout && got != antigravityQuotaMinPollInterval {
-			t.Fatalf("cadence(%v) = %v, no lookup would run", timeout, got)
-		}
-		if got < antigravityQuotaMinPollInterval {
-			t.Fatalf("cadence(%v) = %v, below the floor", timeout, got)
+	// The decoys every run writes are not failure lines.
+	for _, line := range []string{
+		`W1117 12:55:44.301000   7712 auth.go:140] You are not logged into Antigravity.`,
+		`W1117 12:55:45.001000   7712 routing.go:77] AICode routing probe failed: PERMISSION_DENIED (code 403): Request had insufficient authentication scopes.`,
+	} {
+		if _, _, ok := parseAntigravityRunFailureLine(line, now); ok {
+			t.Fatalf("decoy %q parsed as a failure line", line)
 		}
 	}
 }
 
-func TestWatchAntigravityQuotaPollsWithinAShortTurn(t *testing.T) {
-	path := writeAgyLog(t, agyQuotaLogLine)
-	orig := antigravityCliLogPathOverride
-	antigravityCliLogPathOverride = path
-	defer func() { antigravityCliLogPathOverride = orig }()
-	now := agyLogNow()
-	antigravityQuotaClock = func() time.Time { return now }
-	defer func() { antigravityQuotaClock = time.Now }()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	got := make(chan string, 1)
-	// A 1s turn budget: the default 15s cadence would never fire.
-	go watchAntigravityQuota(ctx, now.Add(-40*time.Minute), antigravityQuotaPollCadence(time.Second), func(reason string) {
-		got <- reason
-	})
-	select {
-	case reason := <-got:
-		if reason != agyQuotaReason {
-			t.Fatalf("reason = %q", reason)
+// The in-run quota follow reads the run's own PID block: a neighbour's quota
+// line in the same file never stops this turn.
+func TestAntigravityMonitor_QuotaOnlyFromOwnBlock(t *testing.T) {
+	base := filepath.Join(t.TempDir(), ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(antigravityLogDir(base), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := antigravityRunLogBase
+	antigravityRunLogBase = func() string { return base }
+	resetAntigravityLogIndex()
+	t.Cleanup(func() { antigravityRunLogBase = prev; resetAntigravityLogIndex() })
+	now := time.Now()
+	stamp := now.Format("0102 15:04:05")
+	body := fmt.Sprintf("I%s.000000 301 main.go:1] Starting language server process with pid 301\n"+
+		"E%s.000000 301 print.go:97] Print mode: run ended with error and no response: %s\n"+
+		"I%s.000000 302 main.go:1] Starting language server process with pid 302\n", stamp, stamp, aie2QuotaReason, stamp)
+	name := "cli-" + now.In(antigravityLogZone()).Format("20060102_150405") + ".log"
+	if err := os.WriteFile(filepath.Join(antigravityLogDir(base), name), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for pid, want := range map[int]string{302: "", 301: aie2QuotaReason} {
+		got := ""
+		mon := newAntigravityTurnMonitor("s", now.Add(-time.Second), 1024, nil, func(r string) { got = r })
+		mon.pid = pid
+		mon.followLog(now)
+		if got != want {
+			t.Fatalf("pid %d: quota = %q, want %q", pid, got, want)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the watcher never polled inside a short turn's budget")
 	}
 }

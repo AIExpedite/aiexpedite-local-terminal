@@ -198,8 +198,9 @@ func TestPostUpdateColdStart_Antigravity(t *testing.T) {
 
 			if path == "direct run" {
 				session := &AntigravityNativeSession{ID: "cold-start-native", status: "idle"}
-				out, _, exitCode, timedOut, _, _, runErr := NewAntigravityNativeManager(nil).runOneShot(
+				run := NewAntigravityNativeManager(nil).runOneShot(
 					session, t.TempDir(), executable, "hello", "", 30*time.Second, "test:antigravity-cold-start")
+				out, exitCode, timedOut, runErr := run.resultText, run.exitCode, run.timedOut, run.startErr
 				if runErr != nil || exitCode != 0 || timedOut {
 					t.Fatalf("stub turn failed: out=%q exit=%d timedOut=%v err=%v", out, exitCode, timedOut, runErr)
 				}

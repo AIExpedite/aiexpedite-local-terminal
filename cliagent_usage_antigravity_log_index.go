@@ -549,12 +549,20 @@ func antigravityPIDBlockIn(body []byte, pid int) ([]byte, bool) {
 // legacy log is still read when the stamped names at or after its floor alone
 // would fill the cap.
 func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bool) {
+	_, block, ok := antigravityPIDBlockFile(base, pid, sinceFloor)
+	return block, ok
+}
+
+// antigravityPIDBlockFile is antigravityPIDBlock that also names the log the
+// block is in, so a caller can follow what the run writes next
+// (antigravity_turn_monitor.go).
+func antigravityPIDBlockFile(base string, pid int, sinceFloor time.Time) (string, []byte, bool) {
 	if pid <= 0 {
-		return nil, false
+		return "", nil, false
 	}
 	names, ok := antigravityListLogNames(base)
 	if !ok {
-		return nil, false
+		return "", nil, false
 	}
 	dir := antigravityLogDir(base)
 	floorSecond := sinceFloor.Truncate(time.Second)
@@ -608,15 +616,16 @@ func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bo
 		if examined >= antigravityWatchedNewest {
 			break
 		}
-		body, ok := antigravityReadLog(filepath.Join(dir, name))
+		path := filepath.Join(dir, name)
+		body, ok := antigravityReadLog(path)
 		if !ok {
 			continue
 		}
 		if block, found := antigravityPIDBlockIn(body, pid); found {
-			return block, true
+			return path, block, true
 		}
 	}
-	return nil, false
+	return "", nil, false
 }
 
 // antigravityLegacyLogsSince keeps the unstamped names written at or after
