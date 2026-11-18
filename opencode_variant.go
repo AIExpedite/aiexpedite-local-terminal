@@ -39,6 +39,11 @@
 // The version is the one the agent already records (openCodeProbeVersion,
 // cached per binary and read again only when the binary changes). A run with no
 // effort, or any run on OpenCode 1, therefore asks OpenCode nothing new.
+//
+// Reading and spelling are separate steps (openCodeEffortReading): the session
+// path reads before it takes the session manager's lock, because the model
+// list comes from a child process, and spells under the lock from that reading
+// alone. The direct chat turn holds no shared lock and does both at once.
 package main
 
 import (
