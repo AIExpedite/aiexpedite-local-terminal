@@ -7034,6 +7034,12 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// The prompt is deliberately absent: it now travels on the child's
 		// stdin, so the dialog no longer renders prompt text (which could carry
 		// a credential, a private path, or a maintenance smoke's marker nonce).
+		//
+		// The effort is shown as the platform asked for it (`--variant`). On
+		// OpenCode 2 the session path re-spells it inside `--model` after
+		// approval (opencode_variant.go), from OpenCode's live model list. That
+		// list is not read here, because reading it can start OpenCode's
+		// background service before the person has approved anything.
 		if isOpenCodeCommand(cmd.Command) {
 			// The promoted maintenance-smoke control token is stripped FIRST so
 			// it is never displayed in the dialog nor matched against a pattern.
@@ -7125,6 +7131,8 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		if cfg.CommandSecret != "" && !forceNative {
 			return true
 		}
+		// The effort is shown as the platform asked for it; see session_start
+		// above for why OpenCode 2's spelling is not computed before approval.
 		allowCommand = "opencode"
 		allowArgs = buildOpenCodeNativeTurnArgs("", openCodeNativeLaunchArgs(cmd.Args))
 		dialogArgs = allowArgs
