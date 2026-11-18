@@ -19,6 +19,9 @@
 //     openCodeNativeMinVersion, and is the one droppable token in the ladder.
 //   - The direct path appends its START's `--model` / `--variant` to every
 //     turn (buildOpenCodeNativeTurnArgs); nothing else from a START reaches it.
+//   - Both spawn sites then spell the effort for the installed OpenCode
+//     (opencode_variant.go): OpenCode 2 has no `--variant` and reads the level
+//     inside the model reference, `--model provider/model#level`.
 //   - Manager-owned flags a caller sent (openCodeStrippedFlags) are removed
 //     with their values; every other TOKEN a caller sent is forwarded AS-IS,
 //     because nothing tells us whether an unlearned option is boolean or
@@ -164,10 +167,12 @@ var openCodeValuedStrippedFlags = map[string]bool{
 var openCodeForwardedValuedFlags = map[string]bool{
 	"--model": true,
 	"-m":      true,
-	// `opencode run --variant <level>` is the provider-specific reasoning
-	// effort; the orchestrator composes it beside --model (shared-constants
-	// CLI_AGENT_EFFORT_FLAG_BY_ID). Without this entry the level would be read
-	// as prompt text and the run would silently use the default effort.
+	// `opencode run --variant <level>` is OpenCode 1's provider-specific
+	// reasoning effort; the orchestrator composes it beside --model
+	// (shared-constants CLI_AGENT_EFFORT_FLAG_BY_ID). Without this entry the
+	// level would be read as prompt text and the run would silently use the
+	// default effort. OpenCode 2 has no such flag: the spawn sites re-spell it
+	// as `--model provider/model#level` (opencode_variant.go).
 	"--variant": true,
 	"--agent":   true,
 	"--port":    true,

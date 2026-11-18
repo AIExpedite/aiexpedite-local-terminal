@@ -745,8 +745,14 @@ func (m *OpenCodeNativeManager) runOneShot(
 	// directly, a Windows `.cmd` / `.bat` npm shim through cmd.exe. A direct
 	// spawn of a shim fails in CreateProcess, which is why an npm-installed
 	// OpenCode could not start a turn at all on Windows. The START's model and
-	// effort ride on every turn, whichever conversation it runs in.
-	args := buildOpenCodeNativeTurnArgs(nativeID, session.LaunchArgs)
+	// effort ride on every turn, whichever conversation it runs in, with the
+	// effort spelled the way the installed OpenCode reads it (opencode_variant.go:
+	// OpenCode 2 has no `--variant`).
+	args, effortNote := openCodeArgsForInstalled(executable, runDir,
+		buildOpenCodeNativeTurnArgs(nativeID, session.LaunchArgs))
+	if effortNote != "" {
+		fmt.Printf("%s[opencode-native] Session %s: %s%s\n", colorYellow, session.ID, effortNote, colorReset)
+	}
 	cmd, launchErr := newOpenCodeCmd(context.Background(), openCodeLaunch{
 		Path:       executable,
 		Args:       args,

@@ -436,6 +436,18 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		}
 	}
 
+	// OpenCode 2 reads the effort inside `--model provider/model#variant` and
+	// refuses `--variant` (opencode_variant.go). What that needs from the
+	// installed OpenCode, its version and a named model's variants, is read
+	// here, before the manager lock: the model list comes from a child
+	// process. Under the lock the argv is spelled from this reading alone.
+	var openCodeEffort openCodeEffortReading
+	if isOpenCodeCommand(command) && !readOnly {
+		cleaned, _ := extractOpenCodeMaintenanceSmokeControl(args)
+		runArgs, _ := buildOpenCodeInteractiveArgs(cleaned)
+		openCodeEffort = readOpenCodeEffort(resolveExecutableIn(command, cwd), cwd, runArgs)
+	}
+
 	sm.mu.Lock()
 	// The manager lock is released EXPLICITLY once this session is registered
 	// (unlockManager below, just before the initial prompt is written), so the
@@ -719,6 +731,17 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 	if readOnly {
 		if err := checkReadOnlyExecutable(command, executable, cwd); err != nil {
 			return err
+		}
+	}
+
+	// Spell the effort for the installed OpenCode from the reading taken
+	// before the lock (opencode_variant.go). A maintenance smoke's argv is the
+	// ladder's and carries no effort.
+	if isOpenCodeCommand(command) && !openCodeMaintenanceSmoke {
+		var effortNote string
+		cliArgs, effortNote = openCodeEffort.spell(cliArgs)
+		if effortNote != "" {
+			logSession(id, "%s[session] %s session %s: %s%s\n", colorYellow, command, id, effortNote, colorReset)
 		}
 	}
 
@@ -5032,6 +5055,19 @@ func resolveExecutable(command string) string {
 // resolved against PATH.
 func isExplicitPath(command string) bool {
 	return strings.ContainsAny(command, `/\`)
+}
+
+// resolveExecutableIn is resolveExecutable as the child will see it. A
+// relative explicit path (`./opencode`), which resolveExecutable leaves for exec
+// to resolve inside the child's working directory, is joined to dir here. A
+// caller that inspects the binary before it runs (its version, say) must read
+// the file the child will exec, not one that happens to sit beside the agent.
+func resolveExecutableIn(command, dir string) string {
+	executable := resolveExecutable(command)
+	if dir != "" && isRelativeExplicitPath(executable) {
+		return filepath.Join(dir, executable)
+	}
+	return executable
 }
 
 // isRelativeExplicitPath reports whether command is an explicit path that
