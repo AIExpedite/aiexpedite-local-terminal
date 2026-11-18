@@ -599,3 +599,65 @@ func TestOpenCodeSessionStart_SpellsTheEffortForTheInstalledVersion(t *testing.T
 		})
 	}
 }
+
+func TestOpenCodeEffortReading_SpellsOnlyWhatItRead(t *testing.T) {
+	in := []string{"run", "--format", "json", "--model", "opencode/flint-40b-free", "--variant", "high"}
+
+	read := openCodeEffortReading{
+		version:  "2.2.7",
+		variants: map[string][]string{"opencode/flint-40b-free": {"low", "high"}},
+		errs:     map[string]error{},
+	}
+	if got, note := read.spell(in); strings.Join(got, " ") != "run --format json --model opencode/flint-40b-free#high" || note != "" {
+		t.Fatalf("a read model must be spelled from the reading: %q (%q)", got, note)
+	}
+
+	other := []string{"run", "--format", "json", "--model", "opencode/big-pickle", "--variant", "high"}
+	if got, note := read.spell(other); strings.Join(got, " ") != "run --format json --model opencode/big-pickle" ||
+		!strings.Contains(note, "were not read before the run") {
+		t.Fatalf("a model the reading never asked about must get no level: %q (%q)", got, note)
+	}
+
+	var none openCodeEffortReading
+	if got, note := none.spell(in); strings.Join(got, " ") != strings.Join(in, " ") || note != "" {
+		t.Fatalf("an empty reading (no version) must leave argv as it was: %q (%q)", got, note)
+	}
+}
+
+// The model list comes from a child process, and the session manager's lock
+// must never wait on one: every other session operation, the tray's shutdown
+// snapshot included, queues behind it.
+func TestOpenCodeSessionStart_ReadsTheModelListOutsideTheManagerLock(t *testing.T) {
+	argvLog, _ := installOpenCodeStubAt(t, "opencode v2.2.7")
+	sm := NewSessionManager(nil)
+	lockHeld := 0
+	reads := stubOpenCodeModelList(t, func(string) ([]byte, error) {
+		if sm.mu.TryLock() {
+			sm.mu.Unlock()
+		} else {
+			lockHeld++
+		}
+		return []byte(openCodeStubModelList), nil
+	})
+
+	id := fmt.Sprintf("opencode-effort-lock-%d", time.Now().UnixNano())
+	ended, publishFn := openCodeSessionEndedSignal()
+	args := []string{"--model", "opencode/flint-40b-free", "--variant", "medium", "address the review comments"}
+	if err := sm.StartSession(id, "opencode", args, t.TempDir(), "ws", "uid", 30000, false, publishFn); err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	select {
+	case <-ended:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the session never ended")
+	}
+	if len(*reads) != 1 {
+		t.Fatalf("the model list must be read once, read %d times", len(*reads))
+	}
+	if lockHeld != 0 {
+		t.Fatal("the model list was read while the session manager's lock was held")
+	}
+	if runs := readLogLines(t, argvLog); len(runs) != 1 || runs[0] != "run --format json --model opencode/flint-40b-free#medium" {
+		t.Fatalf("the session ran %q", runs)
+	}
+}

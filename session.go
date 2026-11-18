@@ -436,6 +436,18 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		}
 	}
 
+	// OpenCode 2 reads the effort inside `--model provider/model#variant` and
+	// refuses `--variant` (opencode_variant.go). What that needs from the
+	// installed OpenCode, its version and a named model's variants, is read
+	// here, before the manager lock: the model list comes from a child
+	// process. Under the lock the argv is spelled from this reading alone.
+	var openCodeEffort openCodeEffortReading
+	if isOpenCodeCommand(command) && !readOnly {
+		cleaned, _ := extractOpenCodeMaintenanceSmokeControl(args)
+		runArgs, _ := buildOpenCodeInteractiveArgs(cleaned)
+		openCodeEffort = readOpenCodeEffort(resolveExecutable(command), cwd, runArgs)
+	}
+
 	sm.mu.Lock()
 	// The manager lock is released EXPLICITLY once this session is registered
 	// (unlockManager below, just before the initial prompt is written), so the
@@ -722,13 +734,12 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		}
 	}
 
-	// OpenCode 2 reads the effort inside `--model provider/model#variant` and
-	// refuses `--variant`, so the effort is spelled for the binary about to run
-	// (opencode_variant.go). A maintenance smoke's argv is the ladder's and
-	// carries no effort.
+	// Spell the effort for the installed OpenCode from the reading taken
+	// before the lock (opencode_variant.go). A maintenance smoke's argv is the
+	// ladder's and carries no effort.
 	if isOpenCodeCommand(command) && !openCodeMaintenanceSmoke {
 		var effortNote string
-		cliArgs, effortNote = openCodeArgsForInstalled(executable, cwd, cliArgs)
+		cliArgs, effortNote = openCodeEffort.spell(cliArgs)
 		if effortNote != "" {
 			logSession(id, "%s[session] %s session %s: %s%s\n", colorYellow, command, id, effortNote, colorReset)
 		}

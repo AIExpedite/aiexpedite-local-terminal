@@ -75,9 +75,55 @@ func openCodeReadsInlineVariant(version string) bool {
 // sees them from dir. note is non-empty when a requested level was not applied,
 // and says why; callers log it.
 func openCodeArgsForInstalled(executable, dir string, args []string) (out []string, note string) {
+	return readOpenCodeEffort(executable, dir, args).spell(args)
+}
+
+// errOpenCodeEffortNotRead answers a model whose variants a reading never
+// asked for: the level is dropped rather than guessed.
+var errOpenCodeEffortNotRead = fmt.Errorf("its variants were not read before the run")
+
+// openCodeEffortReading is everything spellOpenCodeEffort asks the installed
+// OpenCode for one argv: the recorded version and, for each named model, the
+// variants it offers. It is read once (readOpenCodeEffort) and applied later
+// with no I/O (spell), so the session path can read before it takes the
+// session manager's lock and spell under it. Reading the model list runs a
+// child process, and nothing may wait on one under that lock.
+type openCodeEffortReading struct {
+	version  string
+	variants map[string][]string
+	errs     map[string]error
+}
+
+// readOpenCodeEffort asks the OpenCode at executable exactly what
+// spellOpenCodeEffort needs for args, and nothing when args carries no effort.
+func readOpenCodeEffort(executable, dir string, args []string) openCodeEffortReading {
+	r := openCodeEffortReading{variants: map[string][]string{}, errs: map[string]error{}}
+	spellOpenCodeEffort(args,
+		func() string {
+			r.version = parseOpenCodeVersion(openCodeProbeVersion(executable))
+			return r.version
+		},
+		func(model string) ([]string, error) {
+			variants, err := openCodeModelVariants(executable, dir, model)
+			r.variants[model], r.errs[model] = variants, err
+			return variants, err
+		},
+	)
+	return r
+}
+
+// spell applies spellOpenCodeEffort to args from this reading alone. A
+// question it did not answer reads as unknown: no version leaves argv as it
+// was, and a model whose variants were not read gets no level.
+func (r openCodeEffortReading) spell(args []string) (out []string, note string) {
 	return spellOpenCodeEffort(args,
-		func() string { return parseOpenCodeVersion(openCodeProbeVersion(executable)) },
-		func(model string) ([]string, error) { return openCodeModelVariants(executable, dir, model) },
+		func() string { return r.version },
+		func(model string) ([]string, error) {
+			if variants, ok := r.variants[model]; ok {
+				return variants, r.errs[model]
+			}
+			return nil, errOpenCodeEffortNotRead
+		},
 	)
 }
 
