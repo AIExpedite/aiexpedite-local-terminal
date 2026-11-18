@@ -21,10 +21,11 @@ const cwdOutsideGrantFolderRejectionCode = "CWD_OUTSIDE_GRANT_FOLDER"
 
 // refuseCwdOutsideFence checks whether a session start admitted through an
 // ancestor grant stays inside that granted boundary on disk.
-// If cmd carries CwdFence, both the fence and the working directory are
-// evaluated through symlinks. If either cannot be resolved or the real working
-// directory leaves the real fence, the command is refused with
-// CWD_OUTSIDE_GRANT_FOLDER.
+// If cmd carries CwdFence, the working directory must be the fence or a
+// directory below it as the filesystem answers it (dirWithin: both resolved
+// through symlinks and junctions, compared by file identity). If either cannot
+// be resolved or the real working directory leaves the real fence, the command
+// is refused with CWD_OUTSIDE_GRANT_FOLDER.
 // Returns true when the command was handled (refused) and settled.
 func refuseCwdOutsideFence(ctx context.Context, topic *pubsub.Publisher, m *pubsub.Message, cmd commandMsg, cfg *Config) bool {
 	if cmd.CwdFence == "" {
@@ -54,14 +55,14 @@ func refuseCwdOutsideFence(ctx context.Context, topic *pubsub.Publisher, m *pubs
 		return true
 	}
 
-	realFence, errFence := filepath.EvalSymlinks(cmd.CwdFence)
-	realCwd, errCwd := filepath.EvalSymlinks(cmd.Cwd)
-
-	if errFence != nil || errCwd != nil || !isPathWithin(realFence, realCwd) {
+	// The filesystem's own answer (dirWithin): symlinks and junctions
+	// resolved, then file identity, so a case variant is inside exactly where
+	// the volume folds case and a shared-prefix sibling never is.
+	if !dirWithin(cmd.CwdFence, cmd.Cwd) {
 		msg := fmt.Sprintf("working directory %q escapes granted folder %q", cmd.Cwd, cmd.CwdFence)
-		if errCwd != nil {
+		if _, errCwd := filepath.EvalSymlinks(cmd.Cwd); errCwd != nil {
 			msg = fmt.Sprintf("working directory %q cannot be resolved: %v", cmd.Cwd, errCwd)
-		} else if errFence != nil {
+		} else if _, errFence := filepath.EvalSymlinks(cmd.CwdFence); errFence != nil {
 			msg = fmt.Sprintf("granted folder %q cannot be resolved: %v", cmd.CwdFence, errFence)
 		}
 		fmt.Printf("%s[fence] Refused %s: %s%s\n", colorYellow, cmd.Type, msg, colorReset)

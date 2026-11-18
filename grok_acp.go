@@ -2744,7 +2744,7 @@ func validateGrokACPSendCwd(frame, resolvedRoot string) error {
 	if err != nil {
 		return fmt.Errorf("%s params.cwd %q could not be safely resolved: %w", probe.Method, cwd, err)
 	}
-	if !pathInsideRoot(resolved, resolvedRoot) {
+	if !resolvedPathWithin(resolvedRoot, resolved) {
 		return fmt.Errorf("%s params.cwd %q is outside the session's workspace root %q (the directory the session was started in)", probe.Method, resolved, resolvedRoot)
 	}
 	return nil
@@ -2842,35 +2842,6 @@ func isGrokAuthOverrideArg(lower string) bool {
 		}
 	}
 	return false
-}
-
-// pathInsideRoot reports whether candidate (already absolute, ideally
-// EvalSymlinks-resolved) is strictly inside root (same). Uses
-// filepath.Rel to handle Windows drive-letter cases correctly — a plain
-// strings.HasPrefix would mis-fire on `/root` vs `/rootkit`.
-func pathInsideRoot(candidate, root string) bool {
-	if candidate == "" || root == "" {
-		return false
-	}
-	rel, err := filepath.Rel(root, candidate)
-	if err != nil {
-		return false
-	}
-	// "." is the root itself — treat as inside.
-	if rel == "." {
-		return true
-	}
-	// A relative path that starts with ".." or "../" escapes the root. On
-	// Windows, a path on a different drive returns the absolute path back,
-	// which also starts with a drive letter and is therefore filtered by
-	// the same check.
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return false
-	}
-	if filepath.IsAbs(rel) {
-		return false
-	}
-	return true
 }
 
 // sanitizeGrokACPEnv applies a strip list to the inherited environment

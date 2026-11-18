@@ -162,6 +162,15 @@ type capabilitiesInfo struct {
 	// a start admitted through an ancestor only when this is true; older agents
 	// refuse with DEVICE_UPDATE_REQUIRED.
 	RelayCwdFence bool `json:"relayCwdFence"`
+	// FolderCaseInsensitive (shared-constants
+	// DEVICE_RELAY_CAPABILITIES.FOLDER_CASE_INSENSITIVE): a REPORTED FACT, not
+	// a protocol flag — whether the volume holding the user's home directory
+	// folds case (probeFolderCaseInsensitive). terminal-service folds a POSIX
+	// computer's voice-grant folder keys only when this is true; absent
+	// (an inconclusive probe, or an older build) keeps the exact compare, which
+	// can only refuse. Windows folds case whatever this says. omitempty on the
+	// POINTER, so a measured `false` is still sent.
+	FolderCaseInsensitive *bool `json:"folderCaseInsensitive,omitempty"`
 	// NativeLaunchArgs (shared-constants
 	// DEVICE_RELAY_CAPABILITIES.NATIVE_LAUNCH_ARGS): the one-shot native
 	// managers (Antigravity, OpenCode, Muse Code) keep a START's model and
@@ -869,6 +878,11 @@ func gatherMachineInfoBounded(usageBudget time.Duration) *MachineInfo {
 	// Protocol capabilities first, before any probe can fail — see
 	// capabilitiesInfo. The concurrency hints are merged in at the end.
 	info.Capabilities = newMachineCapabilities()
+	// One case probe per cycle, on the home directory's volume (the folder
+	// voice grants usually sit under).
+	if home, err := os.UserHomeDir(); err == nil {
+		info.Capabilities.FolderCaseInsensitive = probeFolderCaseInsensitive(home)
+	}
 
 	// CPU — gopsutil reads /proc/cpuinfo, sysctl, or WMI as appropriate.
 	if cpus, err := cpu.Info(); err == nil && len(cpus) > 0 {

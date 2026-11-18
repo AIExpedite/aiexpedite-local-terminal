@@ -298,3 +298,43 @@ func TestRefuseCwdOutsideFence(t *testing.T) {
 		t.Logf("skipping symlink escape test: %v", err)
 	}
 }
+
+// The fence is the filesystem's answer: a case variant of the granted folder
+// is inside exactly where the volume folds case (Windows, default APFS) and
+// refused where it does not; a shared-prefix sibling never is.
+func TestRefuseCwdOutsideFence_CaseVariantAndSibling(t *testing.T) {
+	publishes := captureCwdFencePublishes(t)
+	cfg := &Config{AgentID: "agent-fence-case"}
+	base := resolvedTempDir(t)
+	fence := filepath.Join(base, "Root")
+	nested := filepath.Join(fence, "frontend")
+	sibling := filepath.Join(base, "Root2")
+	for _, d := range []string{nested, sibling} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := commandMsg{ID: "cmd-case", Type: "session_start", SessionID: "sess-case", CwdFence: fence}
+
+	cmd.Cwd = sibling
+	if !refuseCwdOutsideFence(context.Background(), nil, nil, cmd, cfg) {
+		t.Fatalf("a shared-prefix sibling must be refused")
+	}
+
+	insensitive := probeFolderCaseInsensitive(fence)
+	if insensitive == nil {
+		t.Skip("the temp volume's case behaviour could not be probed")
+	}
+	cmd.Cwd = filepath.Join(filepath.Dir(fence), "rOOT", "frontend")
+	refused := refuseCwdOutsideFence(context.Background(), nil, nil, cmd, cfg)
+	if refused == *insensitive {
+		t.Fatalf("case variant refused = %v on a volume with caseInsensitive = %v", refused, *insensitive)
+	}
+	wantPublishes := 1
+	if refused {
+		wantPublishes = 2
+	}
+	if got := len(publishes()); got != wantPublishes {
+		t.Fatalf("published %d refusals, want %d", got, wantPublishes)
+	}
+}
