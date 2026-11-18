@@ -1040,7 +1040,8 @@ func (s *whatsAppSupervisor) resyncState(linkID string, generation int64) {
 // known to go unanswered. retry is true only while the supervisor is paused
 // (disconnected from the cloud: nothing may be posted, so the command waits
 // for the resume, like a link start) or shutting down (the next start
-// answers it); every other outcome is final.
+// answers it), when the command arrives or by the time its send is done;
+// every other outcome is final.
 func (s *whatsAppSupervisor) sendText(p whatsAppSendTextParams, ts int64) (retry bool) {
 	tag := whatsAppSendLogTag(p)
 	if s.isPaused() {
@@ -1069,7 +1070,12 @@ func (s *whatsAppSupervisor) sendText(p whatsAppSendTextParams, ts int64) (retry
 	if answer {
 		s.reportSendResult(p, res)
 	}
-	return false
+	// A pause (the tray pauses at once and stops the links after) or a
+	// shutdown that began during the send kept its result from the cloud:
+	// nothing is posted while paused, shutdown cancels the posts, and either
+	// may close the stores under the send. Acked now, the message would read
+	// unknown however it went; redelivered, the ledger answers it.
+	return s.isPaused() || s.stopping()
 }
 
 // reportSendResult posts a send's result through the runner holding the link

@@ -777,6 +777,15 @@ func TestWhatsAppSendLogsAndReportsNeverCarryTheText(t *testing.T) {
 	send("PROPOSAL0000000000A5", 1, 2, nowTs()) // refused by WhatsApp
 	refuse(whatsmeow.ErrMessageTimedOut)
 	send("PROPOSAL0000000000A6", 1, 2, nowTs()) // unknown
+	// whatsmeow's own errors quote the recipient: as a JID (send.go, filling
+	// the LID cache) or as a device's Signal address, its number without a
+	// server (send.go, encrypting with neither a session nor, the bound having
+	// passed while its keys were fetched, a prekey bundle).
+	refuse(fmt.Errorf("failed to get user info for %s to fill LID cache: %w", chat, whatsmeow.ErrIQNotFound))
+	send("PROPOSAL0000000000A8", 1, 2, nowTs()) // refused: no such user
+	device := types.JID{User: chat.User, Device: 3, Server: chat.Server}
+	refuse(fmt.Errorf("%w with %s", whatsmeow.ErrNoSession, device.SignalAddress().String()))
+	send("PROPOSAL0000000000A9", 1, 2, nowTs()) // unknown: cut short while encrypting
 	c.Disconnect()
 	send("PROPOSAL0000000000A7", 1, 2, nowTs()) // not connected
 	malformed := whatsAppSendTextParams{LinkID: "lnk_1", Generation: 2, ProposalID: "short", Attempt: 1, ChatJid: chat.String(), Text: secret}
@@ -796,7 +805,7 @@ func TestWhatsAppSendLogsAndReportsNeverCarryTheText(t *testing.T) {
 		}
 	}
 	results := sendResults(h)
-	if len(results) != 7 {
+	if len(results) != 9 {
 		t.Fatalf("results = %v", results)
 	}
 	for _, res := range results {
@@ -804,5 +813,88 @@ func TestWhatsAppSendLogsAndReportsNeverCarryTheText(t *testing.T) {
 		if strings.Contains(string(raw), "4815162342") || strings.Contains(string(raw), chat.User) {
 			t.Fatalf("a sendResult carried the text or the chat: %s", raw)
 		}
+	}
+}
+
+// whatsmeow logs a device it cannot encrypt a send for, quoting the device's
+// JID and its Signal address: the number with no server ("15551234567:3", a
+// LID's "123456789012345_1:3"). A business recipient's devices include hosted
+// (Cloud API) ones, "…@hosted" and "…@hosted.lid". No form reaches the log.
+func TestWhatsAppLogsMaskSignalAddressesAndHostedDevices(t *testing.T) {
+	var mu sync.Mutex
+	var captured strings.Builder
+	prevSink := whatsAppLogSink
+	whatsAppLogSink = func(line string) {
+		mu.Lock()
+		captured.WriteString(line)
+		captured.WriteByte('\n')
+		mu.Unlock()
+	}
+	t.Cleanup(func() { whatsAppLogSink = prevSink })
+
+	devices := []types.JID{
+		{User: "15559876543", Device: 3, Server: types.DefaultUserServer},
+		{User: "123456789012345", Device: 2, Server: types.HiddenUserServer},
+		{User: "15551112222", Device: 99, Server: types.HostedServer},
+		{User: "543210987654321", Device: 99, Server: types.HostedLIDServer},
+	}
+	wm := newWhatsAppLogger("client")
+	for _, dev := range devices {
+		noSession := fmt.Errorf("%w with %s", whatsmeow.ErrNoSession, dev.SignalAddress().String())
+		wm.Warnf("Failed to encrypt %s for %s: %v", "3EB0ABCDEF", dev, noSession) // send.go, per device
+		logWhatsApp("lnk_1", "send proposal=PROPOSAL000000000001 attempt=1: no definite answer from WhatsApp; never sent again: "+noSession.Error())
+	}
+
+	mu.Lock()
+	out := captured.String()
+	mu.Unlock()
+	for _, dev := range devices {
+		if strings.Contains(out, dev.User) {
+			t.Fatalf("log leaked %q:\n%s", dev.User, out)
+		}
+	}
+	if n := strings.Count(out, "Failed to encrypt 3EB0ABCDEF for [jid]: "+whatsmeow.ErrNoSession.Error()+" with [jid]"); n != len(devices) {
+		t.Fatalf("want every whatsmeow line kept with its devices masked, got %d:\n%s", n, out)
+	}
+}
+
+// A pause that begins while a send is in flight (the tray's "Disconnect from
+// cloud" pauses at once and stops the links after) keeps its result from the
+// cloud: nothing is posted while paused. The command is then not acked.
+// Redelivered after the reconnect it is answered from the ledger, so the
+// cloud learns the message went out instead of calling it unknown, and
+// nothing goes out twice.
+func TestWhatsAppSendPausedMidSendIsNackedAndAnsweredFromTheLedger(t *testing.T) {
+	h, c := pairedHarness(t)
+	prev := globalWhatsAppSupervisor
+	globalWhatsAppSupervisor = h.sup
+	t.Cleanup(func() { globalWhatsAppSupervisor = prev })
+	c.answerSends(func(context.Context, types.JID, string, types.MessageID) (time.Time, error) {
+		h.sup.requestCloudPause() // clicked while WhatsApp answered
+		return waTS, nil
+	})
+	cmd := sendCommandMsg(testSend(testProposalID, 1), nowTs())
+	if handleWhatsAppCommand(cmd) {
+		t.Fatal("a send whose result the pause kept from the cloud was acked")
+	}
+	if res := sendResults(h); len(res) != 0 {
+		t.Fatalf("posted while paused: %v", res)
+	}
+	rec, found := ledgerRow(t, h, testProposalID)
+	if !found || rec.State != whatsAppSendSent {
+		t.Fatalf("ledger = %+v (found %v)", rec, found)
+	}
+
+	c.answerSends(nil)
+	h.sup.setCloudConnected(true)
+	if !handleWhatsAppCommand(cmd) {
+		t.Fatal("the redelivery after the reconnect was not acked")
+	}
+	if n := len(c.sent()); n != 1 {
+		t.Fatalf("sent %d times", n)
+	}
+	if res := onlySendResult(t, h); res["outcome"] != waSendOutcomeSent || res["waMessageId"] != rec.WaMessageID ||
+		res["sentAt"] != float64(waTS.UnixMilli()) || res["attempt"] != 1.0 {
+		t.Fatalf("reported %v, want the recorded send", res)
 	}
 }

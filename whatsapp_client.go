@@ -246,10 +246,16 @@ func whatsAppClientVersion() string {
    Logging — linkId and event kinds only
    -------------------------------------------------------------------------- */
 
-// whatsAppJIDPattern masks WhatsApp addresses (phone numbers, LIDs, groups)
-// in any whatsmeow line that quotes one, including legacy group JIDs
-// ("creator-timestamp@g.us").
-var whatsAppJIDPattern = regexp.MustCompile(`\+?[0-9]{5,}(?:-[0-9]+)?(?:[.:][0-9]+)*@(?:s\.whatsapp\.net|lid|g\.us|c\.us|broadcast|newsletter)`)
+// whatsAppJIDPattern masks WhatsApp addresses (phone numbers, LIDs, groups,
+// a business's hosted devices) in any whatsmeow line that quotes one,
+// including legacy group JIDs ("creator-timestamp@g.us").
+var whatsAppJIDPattern = regexp.MustCompile(`\+?[0-9]{5,}(?:-[0-9]+)?(?:[.:][0-9]+)*@(?:s\.whatsapp\.net|lid|g\.us|c\.us|broadcast|newsletter|hosted\.lid|hosted)`)
+
+// whatsAppSignalAddressPattern masks a device's Signal protocol address, the
+// number with no server ("15551234567:3", a LID's "123456789012345_1:3"),
+// which whatsmeow and libsignal quote when a message cannot be encrypted or
+// decrypted for that device.
+var whatsAppSignalAddressPattern = regexp.MustCompile(`\b[0-9]{5,}(?:_[0-9]+)?:[0-9]+\b`)
 
 // whatsAppPairCodePattern is the 8-character phone pairing code ("ABCD-EFGH").
 var whatsAppPairCodePattern = regexp.MustCompile(`\b[A-Z0-9]{4}-[A-Z0-9]{4}\b`)
@@ -259,7 +265,8 @@ var whatsAppPairCodePattern = regexp.MustCompile(`\b[A-Z0-9]{4}-[A-Z0-9]{4}\b`)
 func redactWhatsAppLog(s string) string {
 	out := redactAgentSecrets(s)
 	out = whatsAppPairCodePattern.ReplaceAllString(out, "[pair-code]")
-	return whatsAppJIDPattern.ReplaceAllString(out, "[jid]")
+	out = whatsAppJIDPattern.ReplaceAllString(out, "[jid]")
+	return whatsAppSignalAddressPattern.ReplaceAllString(out, "[jid]")
 }
 
 // whatsAppLogSink receives every WhatsApp log line after redaction. A var so

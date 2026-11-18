@@ -202,9 +202,17 @@ func makeRejectionResult(cmd commandMsg, agentID, status, reason, output string)
 // path already redacts it via redactGrokACPArgsForLog. Route grok_acp_start
 // rejections through the same family-specific masker so the dialog and
 // rejection paths agree; everything else falls back to redactArgs.
+//
+// A WhatsApp command's one argument (whatsapp_commands.go) is the person's
+// own data — a confirmed message and its chat, a phone number, the browser's
+// pairing key — which no pattern-based redaction can tell apart, so none of
+// it is echoed. The command name still is.
 func redactRejectionArgs(cmd commandMsg) []string {
 	if cmd.Type == "grok_acp_start" {
 		return redactGrokACPArgsForLog(cmd.Args)
+	}
+	if isWhatsAppCommand(cmd.Command) {
+		return []string{}
 	}
 	return redactArgs(cmd.Args)
 }
