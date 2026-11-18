@@ -417,11 +417,24 @@ func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 		return errWhatsAppOutboxClosed
 	}
 	defer ob.beginWrite()()
+	return ob.appendLocked(records, history, nil)
+}
+
+// appendLocked is Append's transaction. with, when set, runs first in the same
+// transaction, and its error rolls the whole of it back: the records land
+// together with what it writes, or neither does (RecordSendOutcome). The
+// caller holds mu and a write (beginWrite), on an outbox not closed.
+func (ob *whatsAppOutbox) appendLocked(records []whatsAppRecord, history bool, with func(*sql.Tx) error) error {
 	tx, err := ob.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if with != nil {
+		if err := with(tx); err != nil {
+			return err
+		}
+	}
 	seq := ob.next
 	var addedBytes int64
 	for i := range records {
@@ -676,7 +689,15 @@ var errWhatsAppSendNotAttempting = errors.New("whatsapp send ledger: the proposa
 
 // RecordSendOutcome settles a claimed send as sent (with WhatsApp's time),
 // failed (with its code) or unknown. Only an `attempting` row moves.
-func (ob *whatsAppOutbox) RecordSendOutcome(proposalID, state string, sentAt int64, errorCode string) error {
+//
+// queue, the sent message's own records (whatsapp_send.go, step 4), is
+// appended as live records in the same transaction: the outcome and the
+// message land together or not at all. Committed one after the other, a stop
+// between the two would leave a `sent` row whose message never reached the
+// outbox, and nothing would queue it again: a repeat of the command reports
+// the row and sends nothing, and WhatsApp echoes none of this client's own
+// sends.
+func (ob *whatsAppOutbox) RecordSendOutcome(proposalID, state string, sentAt int64, errorCode string, queue []whatsAppRecord) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 	if ob.closed {
@@ -690,17 +711,31 @@ func (ob *whatsAppOutbox) RecordSendOutcome(proposalID, state string, sentAt int
 	if errorCode != "" {
 		code = errorCode
 	}
-	res, err := ob.db.Exec(`UPDATE sends SET state = ?, sent_at = ?, error_code = ?, updated_at = ? WHERE proposal_id = ? AND state = ?`,
-		state, sent, code, time.Now().UnixMilli(), proposalID, whatsAppSendAttempting)
+	settle := func(tx *sql.Tx) error {
+		res, err := tx.Exec(`UPDATE sends SET state = ?, sent_at = ?, error_code = ?, updated_at = ? WHERE proposal_id = ? AND state = ?`,
+			state, sent, code, time.Now().UnixMilli(), proposalID, whatsAppSendAttempting)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return errWhatsAppSendNotAttempting
+		}
+		return nil
+	}
+	if len(queue) > 0 {
+		return ob.appendLocked(queue, false, settle)
+	}
+	tx, err := ob.db.Begin()
 	if err != nil {
 		return err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
+	defer tx.Rollback()
+	if err := settle(tx); err != nil {
 		return err
 	}
-	if n == 0 {
-		return errWhatsAppSendNotAttempting
-	}
-	return nil
+	return tx.Commit()
 }

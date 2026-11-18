@@ -33,7 +33,10 @@
 //  4. On `sent`, the message itself is queued like a live one (op new,
 //     fromMe, source live, through the identity resolver): WhatsApp delivers
 //     a companion's own send to none of its event handlers, so this is how it
-//     reaches the thread by normal ingest.
+//     reaches the thread by normal ingest. It is queued in the transaction
+//     that records the outcome (RecordSendOutcome): a repeat reports the row
+//     and queues nothing, so a `sent` committed alone, with the agent
+//     stopping before the message was, would keep it out of the thread.
 //  5. The result is reported under the generation of the runner that holds
 //     the link then (whatsapp_supervisor.go, reportSendResult);
 //     whatsapp-service applies it by proposal id and attempt. When every
@@ -229,6 +232,7 @@ func (r *whatsAppLinkRunner) sendText(p whatsAppSendTextParams, ts int64) (res w
 	at, sendErr := client.SendText(ctx, chat, p.Text, types.MessageID(id))
 	cancel()
 	state := whatsAppSendSent
+	var own []whatsAppRecord
 	switch outcome, code := classifyWhatsAppSendError(sendErr); outcome {
 	case waSendOutcomeSent:
 		if at.IsZero() {
@@ -236,6 +240,9 @@ func (r *whatsAppLinkRunner) sendText(p whatsAppSendTextParams, ts int64) (res w
 		}
 		res = whatsAppSendResult{Outcome: waSendOutcomeSent, WaMessageID: id, SentAt: at.UnixMilli()}
 		r.log(tag + ": sent")
+		// 4. The message itself, into the thread: queued by the same commit
+		// that records the outcome.
+		own = r.ownSendRecords(chat, id, at, p.Text)
 	case waSendOutcomeFailed:
 		state, res = whatsAppSendFailed, whatsAppSendFailure(code)
 		r.log(tag + ": definitely not sent (" + code + "): " + sendErr.Error())
@@ -243,25 +250,25 @@ func (r *whatsAppLinkRunner) sendText(p whatsAppSendTextParams, ts int64) (res w
 		state, res = whatsAppSendUnknown, whatsAppSendResult{Outcome: waSendOutcomeUnknown}
 		r.log(tag + ": no definite answer from WhatsApp; never sent again: " + sendErr.Error())
 	}
-	if err := ob.RecordSendOutcome(p.ProposalID, state, res.SentAt, res.ErrorCode); err != nil {
-		// The row stays `attempting`, which a repeat reports as unknown and
-		// never sends again.
+	if err := ob.RecordSendOutcome(p.ProposalID, state, res.SentAt, res.ErrorCode, own); err != nil {
+		// Neither the outcome nor the message landed. The row stays
+		// `attempting`, which a repeat reports as unknown and never sends
+		// again.
 		r.log(tag + ": outcome not recorded; a repeat will report unknown: " + err.Error())
+	} else if len(own) > 0 {
+		r.liveAppended(own)
 	}
 	res.Recorded = true // the claim's row, whichever outcome it holds
-
-	// 4. The message itself, into the thread.
-	if res.Outcome == waSendOutcomeSent {
-		r.appendOwnSend(chat, id, at, p.Text)
-	}
 	return res, true
 }
 
-// appendOwnSend queues the record of a text this computer just sent
-// (normalizeWhatsAppOwnSend) exactly as a live message is queued.
-func (r *whatsAppLinkRunner) appendOwnSend(chat types.JID, id string, at time.Time, text string) {
+// ownSendRecords are the records of a text this computer just sent
+// (normalizeWhatsAppOwnSend), exactly as a live message's are queued: led by
+// the chat's record the first time this runner sees the chat live. Nothing
+// without a linked account.
+func (r *whatsAppLinkRunner) ownSendRecords(chat types.JID, id string, at time.Time, text string) []whatsAppRecord {
 	records := normalizeWhatsAppOwnSend(chat, id, at, text, r.normalizeContext())
-	r.appendLiveMessage(records, chat.Server == types.GroupServer, "")
+	return r.withConversationRecord(records, chat.Server == types.GroupServer, "")
 }
 
 // parseWhatsAppSendChat is the JID a send goes to: a person (a phone number

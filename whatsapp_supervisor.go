@@ -2018,12 +2018,18 @@ func (r *whatsAppLinkRunner) onLiveMessage(evt *events.Message) {
 }
 
 // appendLiveMessage stores one live message's records, announcing the chat
-// (with name, for a direct chat whose peer wrote) the first time this runner
-// sees it live. A text this computer sent itself comes through here too
-// (whatsapp_send.go).
+// the first time this runner sees it live (withConversationRecord).
 func (r *whatsAppLinkRunner) appendLiveMessage(records []whatsAppRecord, isGroup bool, name string) {
+	r.appendLive(r.withConversationRecord(records, isGroup, name))
+}
+
+// withConversationRecord is one live message's records, led by the record
+// announcing its chat (with name, for a direct chat whose peer wrote) the
+// first time this runner sees the chat live. A text this computer sent itself
+// is queued this way too (whatsapp_send.go).
+func (r *whatsAppLinkRunner) withConversationRecord(records []whatsAppRecord, isGroup bool, name string) []whatsAppRecord {
 	if len(records) == 0 {
-		return
+		return records
 	}
 	chat := records[0].ChatJid
 	r.mu.Lock()
@@ -2034,7 +2040,7 @@ func (r *whatsAppLinkRunner) appendLiveMessage(records []whatsAppRecord, isGroup
 		conv := whatsAppConversationRecord(chat, isGroup, name)
 		records = append([]whatsAppRecord{conv}, records...)
 	}
-	r.appendLive(records)
+	return records
 }
 
 func (r *whatsAppLinkRunner) appendLive(records []whatsAppRecord) {
@@ -2051,6 +2057,12 @@ func (r *whatsAppLinkRunner) appendLive(records []whatsAppRecord) {
 		r.log("live message not stored: " + err.Error())
 		return
 	}
+	r.liveAppended(records)
+}
+
+// liveAppended counts live records just stored in the outbox and wakes the
+// uploader for them.
+func (r *whatsAppLinkRunner) liveAppended(records []whatsAppRecord) {
 	r.mu.Lock()
 	r.liveSynced += int64(countWhatsAppMessages(records))
 	r.mu.Unlock()

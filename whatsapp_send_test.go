@@ -230,7 +230,7 @@ func TestWhatsAppSendAttemptedWithoutAnAnswerStaysUnknown(t *testing.T) {
 			t.Fatalf("claim: %v %v", put, err)
 		}
 		if state != whatsAppSendAttempting {
-			if err := ob.RecordSendOutcome(pid, state, 0, ""); err != nil {
+			if err := ob.RecordSendOutcome(pid, state, 0, "", nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -278,6 +278,43 @@ func TestWhatsAppSendOutcomeNotRecordedLeavesTheAttempt(t *testing.T) {
 	defer reopened.Close()
 	if rec, found, err := reopened.GetSend(testProposalID); err != nil || !found || rec.State != whatsAppSendAttempting || rec.result().Outcome != waSendOutcomeUnknown {
 		t.Fatalf("ledger = %+v found=%v %v, want the attempt left for a repeat to report unknown", rec, found, err)
+	}
+}
+
+// The ledger never says sent for a message the outbox does not hold: the
+// message is queued by the commit that records `sent` (step 4). A repeat
+// reports the row and queues nothing, and WhatsApp echoes none of this
+// client's own sends, so a `sent` committed before its message, with the
+// agent stopping in between, would keep the message out of the thread for
+// good. A trigger refusing the outbox's insert stands in for that stop:
+// neither write lands, and the row stays `attempting`, which a repeat
+// reports unknown without sending again.
+func TestWhatsAppSendRecordsSentOnlyWithItsMessageQueued(t *testing.T) {
+	h, c := pairedHarness(t)
+	ob := runnerOutbox(h.sup.runner("lnk_1"))
+	if _, err := ob.db.Exec(`CREATE TRIGGER fail_queue BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'stopped'); END`); err != nil {
+		t.Fatal(err)
+	}
+	h.sup.sendText(testSend(testProposalID, 1), nowTs())
+	if res := onlySendResult(t, h); res["outcome"] != waSendOutcomeSent {
+		t.Fatalf("reported %v, want what WhatsApp answered", res)
+	}
+	if rec, found := ledgerRow(t, h, testProposalID); !found || rec.State != whatsAppSendAttempting {
+		t.Fatalf("ledger = %+v (found %v): sent recorded without its message queued", rec, found)
+	}
+	if _, err := ob.db.Exec(`DROP TRIGGER fail_queue`); err != nil {
+		t.Fatal(err)
+	}
+	h.sup.sendText(testSend(testProposalID, 2), nowTs())
+	if n := len(c.sent()); n != 1 {
+		t.Fatalf("sent %d times", n)
+	}
+	if res := sendResults(h); len(res) != 2 || res[1]["outcome"] != waSendOutcomeUnknown {
+		t.Fatalf("results = %v, want the repeat reported unknown", res)
+	}
+	waitFor(t, "the outbox drained", func() bool { return ob.Depth() == 0 })
+	if uploadedMessage(h, string(c.sent()[0].ID)) != nil {
+		t.Fatal("the message was queued although its outcome was not recorded")
 	}
 }
 
@@ -329,13 +366,13 @@ func TestWhatsAppSendLedgerIsUnsealedAndOutlivesALostKey(t *testing.T) {
 	if put, err := ob.PutSendAttempting(testProposalID, "3EB0OTHER"); err != nil || put {
 		t.Fatalf("a second claim was put: %v %v", put, err)
 	}
-	if err := ob.RecordSendOutcome(testProposalID, whatsAppSendSent, waTS.UnixMilli(), ""); err != nil {
+	if err := ob.RecordSendOutcome(testProposalID, whatsAppSendSent, waTS.UnixMilli(), "", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := ob.RecordSendOutcome(testProposalID, whatsAppSendFailed, 0, waErrSendRefused); !errors.Is(err, errWhatsAppSendNotAttempting) {
+	if err := ob.RecordSendOutcome(testProposalID, whatsAppSendFailed, 0, waErrSendRefused, nil); !errors.Is(err, errWhatsAppSendNotAttempting) {
 		t.Fatalf("a recorded outcome was overwritten: %v", err)
 	}
-	if err := ob.RecordSendOutcome("PROPOSAL000000000099", whatsAppSendSent, 1, ""); !errors.Is(err, errWhatsAppSendNotAttempting) {
+	if err := ob.RecordSendOutcome("PROPOSAL000000000099", whatsAppSendSent, 1, "", nil); !errors.Is(err, errWhatsAppSendNotAttempting) {
 		t.Fatalf("an outcome without a claim was recorded: %v", err)
 	}
 	ob.Close()
@@ -355,6 +392,68 @@ func TestWhatsAppSendLedgerIsUnsealedAndOutlivesALostKey(t *testing.T) {
 	}
 	if _, found, _ := ob2.GetSend("PROPOSAL000000000099"); found {
 		t.Fatal("a refused outcome wrote a row")
+	}
+}
+
+// RecordSendOutcome queues a sent message's records in the transaction that
+// records `sent`: both land, durably, or neither does, and a write that failed
+// leaves the outbox numbering on as if it had never run.
+func TestWhatsAppSendOutcomeAndItsMessageCommitTogether(t *testing.T) {
+	withWhatsAppTestEnv(t)
+	ob, dir := openTestOutbox(t, "lnk_together")
+	claim := func(pid string) {
+		t.Helper()
+		if put, err := ob.PutSendAttempting(pid, "3EB0"+pid); err != nil || !put {
+			t.Fatalf("claim %s: %v %v", pid, put, err)
+		}
+	}
+	message := func(id string) []whatsAppRecord {
+		return []whatsAppRecord{textRecord(waPeer.String(), id, "see you at 6")}
+	}
+
+	// The message cannot be queued: the outcome is not recorded either.
+	claim("P1")
+	if _, err := ob.db.Exec(`CREATE TRIGGER fail_queue BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'disk said no'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := ob.RecordSendOutcome("P1", whatsAppSendSent, waTS.UnixMilli(), "", message("M1")); err == nil {
+		t.Fatal("sent recorded although its message was refused")
+	}
+	if _, err := ob.db.Exec(`DROP TRIGGER fail_queue`); err != nil {
+		t.Fatal(err)
+	}
+	if rec, found, err := ob.GetSend("P1"); err != nil || !found || rec.State != whatsAppSendAttempting || rec.SentAt != 0 {
+		t.Fatalf("P1 = %+v found=%v %v: recorded without its message", rec, found, err)
+	}
+	// The outcome cannot be recorded (no claim to settle): the message is not
+	// queued either.
+	if err := ob.RecordSendOutcome("P2", whatsAppSendSent, waTS.UnixMilli(), "", message("M2")); !errors.Is(err, errWhatsAppSendNotAttempting) {
+		t.Fatalf("an outcome without a claim: %v", err)
+	}
+	if ob.Depth() != 0 {
+		t.Fatalf("depth %d: a message was queued without its outcome", ob.Depth())
+	}
+
+	claim("P3")
+	if err := ob.RecordSendOutcome("P3", whatsAppSendSent, waTS.UnixMilli(), "", message("M3")); err != nil {
+		t.Fatal(err)
+	}
+	ob.Close()
+	reopened, _, err := openWhatsAppOutbox(dir, "lnk_together")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if rec, found, err := reopened.GetSend("P3"); err != nil || !found || rec.State != whatsAppSendSent || rec.SentAt != waTS.UnixMilli() {
+		t.Fatalf("P3 = %+v found=%v %v", rec, found, err)
+	}
+	batch, err := reopened.Next()
+	if err != nil || batch == nil || batch.SeqFrom != 1 || batch.SeqTo != 1 {
+		t.Fatalf("queued %+v %v: want the one message, numbered as if the failed writes never ran", batch, err)
+	}
+	var got whatsAppRecord
+	if err := json.Unmarshal(batch.Records[0], &got); err != nil || got.WaMessageID != "M3" || got.DeviceSeq != 1 {
+		t.Fatalf("queued %+v %v", got, err)
 	}
 }
 
