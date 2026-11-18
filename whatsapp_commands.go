@@ -61,6 +61,23 @@ var whatsAppProposalIDPattern = regexp.MustCompile(`^[A-Za-z0-9]{20}$`)
 //     the replacement process answers the redelivery, which the ledger makes
 //     safe: a recorded send is reported, never repeated, and an unrecorded one
 //     that is now too old is refused stale.
+//
+// whatsAppFrontDoorWorkspaceID is the workspace every WhatsApp command is
+// published under: terminal-service's WhatsApp front door sends them all
+// through publishDeviceCommand, which uses this device scope. The generic
+// command paths (/terminal/run, run-and-wait, session starts, the queue drain)
+// carry the caller's own workspace and refuse WhatsApp command names
+// themselves. A WhatsApp command under any other workspace did not come from
+// the front door - no owner check, capability gate, confirmation or rate
+// limit stood behind it - so it is refused here too, whatever its signature.
+const whatsAppFrontDoorWorkspaceID = "__device__"
+
+// isWhatsAppFrontDoorCommand reports whether a WhatsApp command was published
+// by terminal-service's WhatsApp front door.
+func isWhatsAppFrontDoorCommand(cmd commandMsg) bool {
+	return cmd.WorkspaceID == whatsAppFrontDoorWorkspaceID
+}
+
 func isWhatsAppCommand(command string) bool {
 	switch command {
 	case whatsAppLinkStartCommand, whatsAppLinkCancelCommand, whatsAppUnlinkCommand, whatsAppResyncStateCommand,

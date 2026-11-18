@@ -226,3 +226,23 @@ func TestParseWhatsAppCommandParams(t *testing.T) {
 		}
 	}
 }
+
+// Every WhatsApp command comes from terminal-service's front door, which
+// publishes under the device scope; a generic command path carries the
+// caller's workspace, and its WhatsApp command is refused.
+func TestWhatsAppCommandsOnlyFromTheFrontDoor(t *testing.T) {
+	for _, c := range []struct {
+		workspaceID string
+		want        bool
+	}{
+		{"__device__", true},
+		{"ws-1", false},
+		{"", false},
+		{"__DEVICE__", false},
+	} {
+		cmd := commandMsg{Command: whatsAppSendTextCommand, WorkspaceID: c.workspaceID}
+		if got := isWhatsAppFrontDoorCommand(cmd); got != c.want {
+			t.Errorf("workspaceID %q: got %v, want %v", c.workspaceID, got, c.want)
+		}
+	}
+}

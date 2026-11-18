@@ -2618,6 +2618,14 @@ func runPubSubConnection(cfg *Config) error {
 				m.Ack()
 				return
 			}
+			// Only terminal-service's WhatsApp front door publishes these
+			// (isWhatsAppFrontDoorCommand); one from a generic command path is
+			// dropped, never retried.
+			if !isWhatsAppFrontDoorCommand(cmd) {
+				logWhatsApp("-", "command "+cmd.Command+" refused: not published by the WhatsApp front door")
+				m.Ack()
+				return
+			}
 			if handleWhatsAppCommand(cmd) {
 				m.Ack()
 			} else {
