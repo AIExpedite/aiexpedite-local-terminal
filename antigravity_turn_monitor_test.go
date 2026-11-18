@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -212,8 +210,20 @@ func TestAntigravityMonitor_IgnoredInterruptIsForceKilled(t *testing.T) {
 	if pid <= 0 {
 		t.Fatal("no pid recorded")
 	}
-	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("the stopped process must be gone when the failure is published (kill -0: %v)", err)
+	// signalAlive (grok_acp_test.go) rather than syscall.Kill: the device runs
+	// on Windows, where there is no Kill and `go vet` fails the whole package.
+	// Polled briefly for the same reason the Grok ordering test polls — on
+	// Unix a just-killed child stays signalable until it is reaped.
+	gone := false
+	for i := 0; i < 40; i++ {
+		if signalAlive(pid) != nil {
+			gone = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !gone {
+		t.Fatalf("the stopped process must be gone when the failure is published (pid %d still signalable)", pid)
 	}
 }
 
