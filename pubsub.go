@@ -1333,6 +1333,11 @@ type resultMsg struct {
 	PromptText string `json:"promptText,omitempty"` // The question/approval text from CLI
 	PromptType string `json:"promptType,omitempty"` // "permission"|"question"|"unknown"
 	Seq        int    `json:"seq,omitempty"`        // Ordering sequence number for streaming
+	// FailureCategory classifies a failed one-shot Antigravity turn (set only
+	// on antigravity_native_error; antigravity_turn_failure.go). One of
+	// shared-constants ANTIGRAVITY_TURN_FAILURE_CATEGORIES; absent for errors
+	// outside that table. Readers ignore it when unknown.
+	FailureCategory string `json:"failureCategory,omitempty"`
 
 	// __cli_usage_refresh_result__ payload — populated only when
 	// Type == "__cli_usage_refresh_result__". The backend's results

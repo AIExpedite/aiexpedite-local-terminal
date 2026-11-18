@@ -61,6 +61,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -652,6 +653,73 @@ func (l *spawnLedger) UntrackProcess(sessionID string, pid int) {
 		l.touch(e)
 	}
 	l.persistLocked()
+}
+
+// TurnTreeAlive reports whether one turn's process tree — the recorded
+// process, and what it started in its process group (Unix) / kill-on-close
+// Job Object (Windows) — may still be running. It never looks at any other
+// process: an unrelated agy (a usage probe) is not this turn's.
+//
+// UntrackProcess keeps a record only while its tree is not proven empty, so a
+// missing record means the tree was proven gone. Without a record (the ledger
+// is disabled or full) the group / job is asked directly; a tree that cannot
+// be asked about is reported gone rather than blocking the session forever.
+func (l *spawnLedger) TurnTreeAlive(sessionID string, pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	job := l.jobs[pid]
+	if !l.disabled {
+		l.loadLocked()
+		if _, e := l.findLocked(sessionID, l.bootID); e != nil {
+			for _, p := range e.PIDs {
+				if p.PID == pid {
+					return !l.treeGone(p, job)
+				}
+			}
+		}
+		if job == 0 {
+			return false
+		}
+	}
+	if runtime.GOOS == "windows" && job == 0 {
+		return false
+	}
+	// agy leads its own process group (Setsid), so its group id is its PID.
+	return !l.treeGone(ledgerProcess{PID: pid, PGID: pid}, job)
+}
+
+// EndTurnLeftovers ends what one turn's recorded process left in its group /
+// job once that process itself is gone (endLeftovers never touches a live
+// recorded process). Used while a stopped turn's tree is being waited out.
+func (l *spawnLedger) EndTurnLeftovers(sessionID string, pid int) {
+	if l.endLeftovers == nil || pid <= 0 {
+		return
+	}
+	l.mu.Lock()
+	var target *ledgerProcess
+	var job uintptr
+	if !l.disabled {
+		l.loadLocked()
+		if _, e := l.findLocked(sessionID, l.bootID); e != nil {
+			for _, p := range e.PIDs {
+				if p.PID == pid {
+					p := p
+					target, job = &p, l.jobs[pid]
+				}
+			}
+		}
+	}
+	l.mu.Unlock()
+	if target != nil {
+		l.endLeftovers(*target, job, sessionOwnerValue(l.bootID, sessionID))
+	}
+}
+
+func sessionTurnTreeAlive(sessionID string, pid int) bool {
+	return globalSpawnLedger.TurnTreeAlive(sessionID, pid)
 }
 
 // ReleaseSession removes this boot's entry for a session that ended cleanly
