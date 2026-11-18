@@ -898,3 +898,137 @@ func TestWhatsAppSendPausedMidSendIsNackedAndAnsweredFromTheLedger(t *testing.T)
 		t.Fatalf("reported %v, want the recorded send", res)
 	}
 }
+
+// answerSendResults makes the cloud answer every sendResult with status (0 is
+// a transport error), and every other post as usual.
+func answerSendResults(h *supervisorHarness, status int) {
+	h.transport.mu.Lock()
+	defer h.transport.mu.Unlock()
+	h.transport.respond = func(p map[string]any) whatsAppSyncResult {
+		if p["kind"] != waSyncKindSendResult {
+			return acceptWASync(p)
+		}
+		return whatsAppSyncResult{Status: status, Body: whatsAppSyncResponse{Code: "WHATSAPP_TEST_REFUSAL"}}
+	}
+}
+
+// A recorded outcome whose report the cloud never answered (every retry
+// failed with a 5xx, a 429 or a transport error) is not acked: acked, the
+// message would read unknown however it went, and nothing would report it
+// again. Each redelivery reports the ledger's row, nothing goes out twice,
+// and once the cloud takes the report the command is acked.
+func TestWhatsAppSendUndeliveredResultIsNackedAndAnsweredFromTheLedger(t *testing.T) {
+	var mu sync.Mutex
+	var captured strings.Builder
+	prevSink := whatsAppLogSink
+	whatsAppLogSink = func(line string) {
+		mu.Lock()
+		captured.WriteString(line)
+		captured.WriteByte('\n')
+		mu.Unlock()
+	}
+	t.Cleanup(func() { whatsAppLogSink = prevSink })
+
+	h, c := pairedHarness(t)
+	prev := globalWhatsAppSupervisor
+	globalWhatsAppSupervisor = h.sup
+	t.Cleanup(func() { globalWhatsAppSupervisor = prev })
+	const secret = "TOP SECRET SEND BODY 4815162342"
+	chat := types.NewJID("15559876543", types.DefaultUserServer)
+	p := testSend(testProposalID, 1)
+	p.ChatJid, p.Text = chat.String(), secret
+	cmd := sendCommandMsg(p, nowTs())
+	statuses := []int{503, 429, 0} // the first delivery, then two redeliveries
+	for _, status := range statuses {
+		answerSendResults(h, status)
+		if handleWhatsAppCommand(cmd) {
+			t.Fatalf("a send whose result got no final answer (%d) was acked", status)
+		}
+	}
+	if n := len(c.sent()); n != 1 {
+		t.Fatalf("sent %d times", n)
+	}
+	if n, want := len(sendResults(h)), len(statuses)*whatsAppControlAttempts; n != want {
+		t.Fatalf("the result was posted %d times, want %d (every retry of every delivery)", n, want)
+	}
+	rec, found := ledgerRow(t, h, testProposalID)
+	if !found || rec.State != whatsAppSendSent {
+		t.Fatalf("ledger = %+v (found %v)", rec, found)
+	}
+
+	h.transport.mu.Lock()
+	h.transport.respond = nil // the sync endpoint is back
+	h.transport.mu.Unlock()
+	if !handleWhatsAppCommand(cmd) {
+		t.Fatal("the redelivery whose result the cloud took was not acked")
+	}
+	if n := len(c.sent()); n != 1 {
+		t.Fatalf("sent %d times", n)
+	}
+	for _, res := range sendResults(h) {
+		if res["outcome"] != waSendOutcomeSent || res["waMessageId"] != rec.WaMessageID ||
+			res["sentAt"] != float64(waTS.UnixMilli()) || res["attempt"] != 1.0 {
+			t.Fatalf("reported %v, want the recorded send", res)
+		}
+	}
+
+	mu.Lock()
+	out := captured.String()
+	mu.Unlock()
+	if n := strings.Count(out, "send proposal="+testProposalID+" attempt=1 result not delivered: left unacked"); n != len(statuses) {
+		t.Fatalf("want the undelivered result logged once per delivery, got %d:\n%s", n, out)
+	}
+	for _, leak := range []string{secret, "4815162342", chat.User} {
+		if strings.Contains(out, leak) {
+			t.Fatalf("log leaked %q:\n%s", leak, out)
+		}
+	}
+}
+
+// A report the cloud refuses (400, 401, 403) has its final answer, which a
+// redelivery would only get again: the send is acked after one post.
+func TestWhatsAppSendResultTheCloudRefusesIsAcked(t *testing.T) {
+	h, c := pairedHarness(t)
+	prev := globalWhatsAppSupervisor
+	globalWhatsAppSupervisor = h.sup
+	t.Cleanup(func() { globalWhatsAppSupervisor = prev })
+	for i, status := range []int{400, 401, 403} {
+		answerSendResults(h, status)
+		pid := fmt.Sprintf("PROPOSAL0000000000C%d", i+1)
+		if !handleWhatsAppCommand(sendCommandMsg(testSend(pid, 1), nowTs())) {
+			t.Fatalf("a send whose result the cloud refused (%d) was not acked", status)
+		}
+		if n := len(h.transport.find(func(p map[string]any) bool { return p["proposalId"] == pid })); n != 1 {
+			t.Fatalf("a result refused %d was posted %d times", status, n)
+		}
+	}
+	if n := len(c.sent()); n != 3 {
+		t.Fatalf("sent %d times, want once per proposal", n)
+	}
+}
+
+// A refusal that writes no ledger row (here: WhatsApp not connected) is acked
+// even when its report got no answer: the report may have reached the cloud
+// with only the answer lost, and a redelivery, decided afresh, might then send
+// a message the cloud already called failed.
+func TestWhatsAppSendUndeliveredRefusalWithoutARowIsAcked(t *testing.T) {
+	h, c := pairedHarness(t)
+	prev := globalWhatsAppSupervisor
+	globalWhatsAppSupervisor = h.sup
+	t.Cleanup(func() { globalWhatsAppSupervisor = prev })
+	answerSendResults(h, 503)
+	c.Disconnect()
+	if !handleWhatsAppCommand(sendCommandMsg(testSend(testProposalID, 1), nowTs())) {
+		t.Fatal("a refusal without a row was left for a redelivery that would decide it afresh")
+	}
+	results := sendResults(h)
+	if len(results) != whatsAppControlAttempts || results[0]["outcome"] != waSendOutcomeFailed || results[0]["errorCode"] != waErrSendNotConnected {
+		t.Fatalf("results = %v", results)
+	}
+	if _, found := ledgerRow(t, h, testProposalID); found {
+		t.Fatal("a refusal wrote a ledger row")
+	}
+	if n := len(c.sent()); n != 0 {
+		t.Fatalf("sent %d times", n)
+	}
+}

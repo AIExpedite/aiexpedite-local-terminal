@@ -1037,11 +1037,13 @@ func (s *whatsAppSupervisor) resyncState(linkID string, generation int64) {
 // sendText routes one __whatsapp_send_text__ to the link's runner, which
 // sends it at most once (whatsapp_send.go), and reports the result. Sends of
 // one proposal are serialized. It returns once the result is reported, or
-// known to go unanswered. retry is true only while the supervisor is paused
+// known to go unanswered. retry is true while the supervisor is paused
 // (disconnected from the cloud: nothing may be posted, so the command waits
 // for the resume, like a link start) or shutting down (the next start
-// answers it), when the command arrives or by the time its send is done;
-// every other outcome is final.
+// answers it), when the command arrives or by the time its send is done, and
+// when the report of a ledger row got no final answer from the cloud (every
+// retry failed with a transport error, 429 or 5xx): redelivered, the row is
+// reported again. Every other outcome is final.
 func (s *whatsAppSupervisor) sendText(p whatsAppSendTextParams, ts int64) (retry bool) {
 	tag := whatsAppSendLogTag(p)
 	if s.isPaused() {
@@ -1068,7 +1070,16 @@ func (s *whatsAppSupervisor) sendText(p whatsAppSendTextParams, ts int64) (retry
 	res, answer := r.sendText(p, ts)
 	unlock()
 	if answer {
-		s.reportSendResult(p, res)
+		if undelivered := s.reportSendResult(p, res); undelivered && res.Recorded {
+			// Acked now, the message would read unknown however it went, and
+			// nothing would report its row again; redelivered, the ledger
+			// answers it without sending. A refusal without a row is acked:
+			// its report may have reached the cloud with only the answer
+			// lost, and a redelivery, decided afresh, might then send a
+			// message the cloud already called failed.
+			logWhatsApp(p.LinkID, tag+" result not delivered: left unacked for a redelivery, which reports the recorded outcome")
+			return true
+		}
 	}
 	// A pause (the tray pauses at once and stops the links after) or a
 	// shutdown that began during the send kept its result from the cloud:
@@ -1082,14 +1093,16 @@ func (s *whatsAppSupervisor) sendText(p whatsAppSendTextParams, ts int64) (retry
 // NOW, under that runner's generation: the front door fences the post on the
 // generation, and whatsapp-service then applies the result by proposal id
 // and attempt, whatever generation the proposal was made at. A link this
-// computer no longer holds gets no report.
-func (s *whatsAppSupervisor) reportSendResult(p whatsAppSendTextParams, res whatsAppSendResult) {
+// computer no longer holds gets no report. undelivered is true when the report
+// got no final answer from the cloud (postControl), which a redelivery of the
+// command could still bring.
+func (s *whatsAppSupervisor) reportSendResult(p whatsAppSendTextParams, res whatsAppSendResult) (undelivered bool) {
 	r := s.runner(p.LinkID)
 	if r == nil {
 		logWhatsApp(p.LinkID, whatsAppSendLogTag(p)+" result not reported: this computer no longer holds the link")
-		return
+		return false
 	}
-	r.postControl(res.payload(p, r.generationNow()))
+	return !r.postControl(res.payload(p, r.generationNow()))
 }
 
 // ShutdownAll disconnects every client and flushes the outboxes within ctx's
@@ -2343,21 +2356,25 @@ func (r *whatsAppLinkRunner) reportState(extra map[string]any) {
 }
 
 // postControl sends a non-batch report with a few retries. 409 fences.
-func (r *whatsAppLinkRunner) postControl(payload map[string]any) {
+// answered is whether the cloud gave the report a final answer: accepted,
+// fenced (409) or refused (400, 401, 403). It is false when every attempt
+// failed with a transport error, 429 or 5xx, or a pause or a shutdown cut
+// the attempts short.
+func (r *whatsAppLinkRunner) postControl(payload map[string]any) (answered bool) {
 	for attempt := 0; attempt < whatsAppControlAttempts; attempt++ {
 		if r.sup.isPaused() {
-			return
+			return false
 		}
 		res := r.sup.transport.Post(r.sup.ctx, payload)
 		switch {
 		case res.Status/100 == 2:
-			return
+			return true
 		case res.Status == 409:
 			r.fence()
-			return
+			return true
 		case res.Status == 400 || res.Status == 401 || res.Status == 403:
 			r.log("report refused: " + res.Body.Code)
-			return
+			return true
 		}
 		wait := backoffWithJitter(attempt, whatsAppUploadBackoffMin, 30*time.Second)
 		if res.RetryAfter > wait {
@@ -2365,10 +2382,11 @@ func (r *whatsAppLinkRunner) postControl(payload map[string]any) {
 		}
 		select {
 		case <-r.sup.ctx.Done():
-			return
+			return false
 		case <-time.After(wait):
 		}
 	}
+	return false
 }
 
 func (r *whatsAppLinkRunner) heartbeat() {

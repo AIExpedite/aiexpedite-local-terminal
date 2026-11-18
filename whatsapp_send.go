@@ -36,7 +36,13 @@
 //     reaches the thread by normal ingest.
 //  5. The result is reported under the generation of the runner that holds
 //     the link then (whatsapp_supervisor.go, reportSendResult);
-//     whatsapp-service applies it by proposal id and attempt.
+//     whatsapp-service applies it by proposal id and attempt. When every
+//     retry of a row's report (step 1 or 3) fails with a transport error,
+//     429 or 5xx, the command is left unacked: Pub/Sub redelivers it while
+//     the subscription keeps it, and step 1 reports the row again, so a short
+//     outage of the sync endpoint does not leave a message WhatsApp accepted
+//     reading unknown. A step-2 refusal is acked all the same: it has no row,
+//     so a redelivery would be decided afresh and might send.
 //
 // A runner that cannot read its ledger (its stores are closed: dormant, or
 // held while they cannot open; or the read fails) cannot tell a proposal it
@@ -106,6 +112,9 @@ type whatsAppSendResult struct {
 	WaMessageID string // sent only
 	SentAt      int64  // sent only: WhatsApp's timestamp, Unix ms
 	ErrorCode   string // failed only
+	// Recorded: the proposal has a ledger row, so a redelivery of the command
+	// reports that row and sends nothing (step 5). Never reported.
+	Recorded bool
 }
 
 func whatsAppSendFailure(code string) whatsAppSendResult {
@@ -131,17 +140,19 @@ func (res whatsAppSendResult) payload(p whatsAppSendTextParams, generation int64
 
 // result is how a ledger row is reported.
 func (rec whatsAppSendRecord) result() whatsAppSendResult {
+	res := whatsAppSendResult{Outcome: waSendOutcomeUnknown}
 	switch rec.State {
 	case whatsAppSendSent:
-		return whatsAppSendResult{Outcome: waSendOutcomeSent, WaMessageID: rec.WaMessageID, SentAt: rec.SentAt}
+		res = whatsAppSendResult{Outcome: waSendOutcomeSent, WaMessageID: rec.WaMessageID, SentAt: rec.SentAt}
 	case whatsAppSendFailed:
 		code := rec.ErrorCode
 		if code == "" {
 			code = waErrSendRefused
 		}
-		return whatsAppSendFailure(code)
+		res = whatsAppSendFailure(code)
 	}
-	return whatsAppSendResult{Outcome: waSendOutcomeUnknown}
+	res.Recorded = true
+	return res
 }
 
 func whatsAppSendLogTag(p whatsAppSendTextParams) string {
@@ -237,6 +248,7 @@ func (r *whatsAppLinkRunner) sendText(p whatsAppSendTextParams, ts int64) (res w
 		// never sends again.
 		r.log(tag + ": outcome not recorded; a repeat will report unknown: " + err.Error())
 	}
+	res.Recorded = true // the claim's row, whichever outcome it holds
 
 	// 4. The message itself, into the thread.
 	if res.Outcome == waSendOutcomeSent {

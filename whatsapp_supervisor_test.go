@@ -171,6 +171,11 @@ func (f *fakeWATransport) Post(_ context.Context, payload any) whatsAppSyncResul
 	if respond != nil {
 		return respond(m)
 	}
+	return acceptWASync(m)
+}
+
+// acceptWASync is the cloud's healthy answer: accepted, a batch acked to its end.
+func acceptWASync(m map[string]any) whatsAppSyncResult {
 	res := whatsAppSyncResult{Status: 200, Body: whatsAppSyncResponse{OK: true}}
 	if m["kind"] == waSyncKindBatch {
 		to := int64(m["seqTo"].(float64))

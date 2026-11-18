@@ -137,9 +137,10 @@ func parseWhatsAppSendTextParams(cmd commandMsg) (whatsAppSendTextParams, error)
 // recorded outcome and report before returning; the other commands run on the
 // supervisor's goroutines. Either way it returns before the message is acked.
 // ack is false only for a link start or a send that arrived while the
-// supervisor is paused or shutting down, or a send it paused or began shutting
-// down during: the caller nacks it so Pub/Sub redelivers it (after the
-// resume, or to the next start) instead of dropping it.
+// supervisor is paused or shutting down, a send it paused or began shutting
+// down during, or a send whose recorded outcome the cloud never answered: the
+// caller nacks it so Pub/Sub redelivers it (after the resume, to the next
+// start, or at once) instead of dropping it.
 func handleWhatsAppCommand(cmd commandMsg) (ack bool) {
 	sup := globalWhatsAppSupervisor
 	if cmd.Command == whatsAppSendTextCommand {
