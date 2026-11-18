@@ -43,9 +43,15 @@
 // reconnect resumes them.
 //
 // Drain and shutdown: a WhatsApp link registers NO drain work source — it
-// must never hold up an agent update. Shutdown disconnects the clients,
+// must never hold up an agent update. (A confirmed send in flight does, for
+// at most one send and its report: its Pub/Sub callback is counted as
+// operational work, whatsapp_commands.go.) Shutdown disconnects the clients,
 // flushes what the deadline allows and leaves the session and the unflushed
 // outbox on disk for the next start.
+//
+// Sends: a confirmed text (whatsapp_send.go) goes out at most once per
+// proposal, decided by the link's durable send ledger, and its result is
+// reported under the generation of the runner holding the link.
 package main
 
 import (
@@ -79,12 +85,13 @@ const (
 	waErrSecureStorageUnavailable = "WHATSAPP_SECURE_STORAGE_UNAVAILABLE"
 	waErrLinkFenced               = "WHATSAPP_LINK_FENCED"
 
-	waSyncKindState     = "state"
-	waSyncKindHeartbeat = "heartbeat"
-	waSyncKindPairing   = "pairing"
-	waSyncKindBatch     = "batch"
-	waSyncKindAck       = "ack"
-	waAckUnlink         = "unlink"
+	waSyncKindState      = "state"
+	waSyncKindHeartbeat  = "heartbeat"
+	waSyncKindPairing    = "pairing"
+	waSyncKindBatch      = "batch"
+	waSyncKindAck        = "ack"
+	waSyncKindSendResult = "sendResult"
+	waAckUnlink          = "unlink"
 
 	waPairQR        = "qr"
 	waPairPhoneCode = "phoneCode"
@@ -172,6 +179,8 @@ type whatsAppSupervisor struct {
 	// still going (the process exits next); a test waits on it before
 	// tearing anything down under them.
 	runnersStopped chan struct{}
+	// sendLocks serializes the sends of one proposal (whatsapp_send.go).
+	sendLocks whatsAppSendLocks
 }
 
 var globalWhatsAppSupervisor = &whatsAppSupervisor{}
@@ -1025,6 +1034,58 @@ func (s *whatsAppSupervisor) resyncState(linkID string, generation int64) {
 	r.heartbeat()
 }
 
+// sendText routes one __whatsapp_send_text__ to the link's runner, which
+// sends it at most once (whatsapp_send.go), and reports the result. Sends of
+// one proposal are serialized. It returns once the result is reported, or
+// known to go unanswered. retry is true only while the supervisor is paused
+// (disconnected from the cloud: nothing may be posted, so the command waits
+// for the resume, like a link start) or shutting down (the next start
+// answers it); every other outcome is final.
+func (s *whatsAppSupervisor) sendText(p whatsAppSendTextParams, ts int64) (retry bool) {
+	tag := whatsAppSendLogTag(p)
+	if s.isPaused() {
+		logWhatsApp(p.LinkID, tag+" deferred: disconnected from cloud")
+		return true
+	}
+	if s.stopping() {
+		logWhatsApp(p.LinkID, tag+" deferred: agent shutting down")
+		return true
+	}
+	// No answer for a link this computer does not hold, or for a generation
+	// newer than the one it holds: the device is behind (the link start has
+	// not reached it), and a report under its own generation would fence it.
+	r := s.runner(p.LinkID)
+	if r == nil {
+		logWhatsApp(p.LinkID, tag+" not answered: this computer does not hold the link")
+		return false
+	}
+	if p.Generation > r.generationNow() {
+		r.log(tag + " not answered: the command is for a newer generation than this computer holds")
+		return false
+	}
+	unlock := s.sendLocks.lock(p.ProposalID)
+	res, answer := r.sendText(p, ts)
+	unlock()
+	if answer {
+		s.reportSendResult(p, res)
+	}
+	return false
+}
+
+// reportSendResult posts a send's result through the runner holding the link
+// NOW, under that runner's generation: the front door fences the post on the
+// generation, and whatsapp-service then applies the result by proposal id
+// and attempt, whatever generation the proposal was made at. A link this
+// computer no longer holds gets no report.
+func (s *whatsAppSupervisor) reportSendResult(p whatsAppSendTextParams, res whatsAppSendResult) {
+	r := s.runner(p.LinkID)
+	if r == nil {
+		logWhatsApp(p.LinkID, whatsAppSendLogTag(p)+" result not reported: this computer no longer holds the link")
+		return
+	}
+	r.postControl(res.payload(p, r.generationNow()))
+}
+
 // ShutdownAll disconnects every client and flushes the outboxes within ctx's
 // deadline (capped at whatsAppUpdateDrainFlush). Files stay on disk. It never
 // outlasts ctx's deadline (Windows gives the whole shutdown 2–4 s, and the
@@ -1268,10 +1329,16 @@ type whatsAppCapability struct {
 	Supported     bool `json:"supported"`
 	SecureStorage bool `json:"secureStorage"`
 	Protocol      int  `json:"protocol"`
+	// SendText: this build runs __whatsapp_send_text__ (whatsapp_send.go).
+	// terminal-service publishes a send only to a computer reporting it
+	// (shared-constants isWhatsAppSendCapable); an older agent would read the
+	// unknown command as a shell command. Never omitempty: a build that
+	// reports false must not read as one too old to say.
+	SendText bool `json:"sendText"`
 }
 
 func currentWhatsAppCapability() *whatsAppCapability {
-	return &whatsAppCapability{Supported: true, SecureStorage: whatsAppSecureStorageAvailable(), Protocol: whatsAppAgentProtocol}
+	return &whatsAppCapability{Supported: true, SecureStorage: whatsAppSecureStorageAvailable(), Protocol: whatsAppAgentProtocol, SendText: true}
 }
 
 /* --------------------------------------------------------------------------
@@ -1924,7 +1991,18 @@ func (r *whatsAppLinkRunner) completeHistory() {
 }
 
 func (r *whatsAppLinkRunner) onLiveMessage(evt *events.Message) {
-	records := normalizeWhatsAppMessage(evt, waSourceLive, r.normalizeContext())
+	name := ""
+	if !evt.Info.IsGroup && !evt.Info.IsFromMe {
+		name = evt.Info.PushName
+	}
+	r.appendLiveMessage(normalizeWhatsAppMessage(evt, waSourceLive, r.normalizeContext()), evt.Info.IsGroup, name)
+}
+
+// appendLiveMessage stores one live message's records, announcing the chat
+// (with name, for a direct chat whose peer wrote) the first time this runner
+// sees it live. A text this computer sent itself comes through here too
+// (whatsapp_send.go).
+func (r *whatsAppLinkRunner) appendLiveMessage(records []whatsAppRecord, isGroup bool, name string) {
 	if len(records) == 0 {
 		return
 	}
@@ -1934,11 +2012,7 @@ func (r *whatsAppLinkRunner) onLiveMessage(evt *events.Message) {
 	r.seenChats[chat] = true
 	r.mu.Unlock()
 	if first {
-		name := ""
-		if !evt.Info.IsGroup && !evt.Info.IsFromMe {
-			name = evt.Info.PushName
-		}
-		conv := whatsAppConversationRecord(chat, evt.Info.IsGroup, name)
+		conv := whatsAppConversationRecord(chat, isGroup, name)
 		records = append([]whatsAppRecord{conv}, records...)
 	}
 	r.appendLive(records)

@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -45,6 +47,15 @@ type whatsAppClient interface {
 	GetQRChannel(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error)
 	PairPhone(ctx context.Context, phone string) (string, error)
 	ParseWebMessage(chat types.JID, msg *waWeb.WebMessageInfo) (*events.Message, error)
+	// IsLoggedIn reports that WhatsApp authenticated the connection. A
+	// connected socket alone does not carry a send.
+	IsLoggedIn() bool
+	// GenerateMessageID picks the id of a message before it is sent, so the
+	// send ledger records the id first (whatsapp_send.go).
+	GenerateMessageID() types.MessageID
+	// SendText sends one plain text to `to` under id and returns WhatsApp's
+	// timestamp for it. classifyWhatsAppSendError reads its errors.
+	SendText(ctx context.Context, to types.JID, text string, id types.MessageID) (time.Time, error)
 	// Close releases the session database. The client must be disconnected.
 	Close() error
 }
@@ -145,7 +156,67 @@ func (c *whatsmeowClient) PairPhone(ctx context.Context, phone string) (string, 
 func (c *whatsmeowClient) ParseWebMessage(chat types.JID, msg *waWeb.WebMessageInfo) (*events.Message, error) {
 	return c.cli.ParseWebMessage(chat, msg)
 }
+func (c *whatsmeowClient) IsLoggedIn() bool                   { return c.cli.IsLoggedIn() }
+func (c *whatsmeowClient) GenerateMessageID() types.MessageID { return c.cli.GenerateMessageID() }
+
+// SendText sends the text as a plain `conversation` message under the id the
+// ledger already recorded: whatsmeow sends under SendRequestExtra.ID rather
+// than an id of its own, and waits for WhatsApp's acknowledgement (bounded by
+// ctx).
+func (c *whatsmeowClient) SendText(ctx context.Context, to types.JID, text string, id types.MessageID) (time.Time, error) {
+	resp, err := c.cli.SendMessage(ctx, to, &waE2E.Message{Conversation: &text}, whatsmeow.SendRequestExtra{ID: id})
+	if err != nil {
+		return time.Time{}, err
+	}
+	return resp.Timestamp, nil
+}
 func (c *whatsmeowClient) Close() error { return c.db.Close() }
+
+// classifyWhatsAppSendError sorts SendText's error into the outcome reported
+// for it (whatsapp_send.go): nil is sent; a definite refusal is failed, with
+// the code saying why; anything else is unknown.
+//
+// Only an answer WhatsApp gave is definite, because whatsmeow writes the
+// message node part-way through SendMessage, and a timeout or a dropped
+// connection on either side of that write reads the same. These are:
+//   - ErrServerReturnedError: WhatsApp answered the message itself with an
+//     error code, so it was refused. WHATSAPP_SEND_REFUSED.
+//   - An info query's coded answer (*IQError, ErrNotInGroup, ErrGroupNotFound):
+//     whatsmeow queries only BEFORE it sends (the group's members, the
+//     recipient's LID and devices, prekeys), so nothing went out. Not a
+//     member, no such group, gone (403 / 404 / 410) is
+//     WHATSAPP_SEND_RECIPIENT_UNAVAILABLE; any other code is
+//     WHATSAPP_SEND_REFUSED.
+//   - ErrRecipientADJID, ErrUnknownServer: an address whatsmeow refuses
+//     before sending anything. WHATSAPP_SEND_RECIPIENT_UNAVAILABLE.
+//   - ErrNotLoggedIn: refused before anything else, with no paired identity.
+//     WHATSAPP_SEND_NOT_CONNECTED.
+//
+// Everything else is unknown, and is never sent again: a context deadline,
+// ErrMessageTimedOut, a disconnect (whatsmeow retries the frame once after a
+// reconnect, so even ErrNotConnected can follow a write that reached
+// WhatsApp), a socket error, and any local failure this list does not name.
+func classifyWhatsAppSendError(err error) (outcome, code string) {
+	var iq *whatsmeow.IQError
+	switch {
+	case err == nil:
+		return waSendOutcomeSent, ""
+	case errors.Is(err, whatsmeow.ErrServerReturnedError):
+		return waSendOutcomeFailed, waErrSendRefused
+	case errors.Is(err, whatsmeow.ErrNotInGroup), errors.Is(err, whatsmeow.ErrGroupNotFound),
+		errors.Is(err, whatsmeow.ErrRecipientADJID), errors.Is(err, whatsmeow.ErrUnknownServer):
+		return waSendOutcomeFailed, waErrSendRecipientUnavailable
+	case errors.Is(err, whatsmeow.ErrNotLoggedIn):
+		return waSendOutcomeFailed, waErrSendNotConnected
+	case errors.As(err, &iq) && iq.Code != 0:
+		switch iq.Code {
+		case 403, 404, 410:
+			return waSendOutcomeFailed, waErrSendRecipientUnavailable
+		}
+		return waSendOutcomeFailed, waErrSendRefused
+	}
+	return waSendOutcomeUnknown, ""
+}
 
 func whatsAppOSDisplayName() string {
 	switch runtime.GOOS {

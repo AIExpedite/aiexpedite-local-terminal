@@ -93,6 +93,9 @@ type whatsAppRecord struct {
 	// conversation
 	ChatType string `json:"chatType,omitempty"`
 	Name     string `json:"name,omitempty"`
+	// MemberCount is how many people a group lists; set only from a history
+	// sync (whatsAppHistoryMemberCount), absent otherwise.
+	MemberCount int `json:"memberCount,omitempty"`
 	// message
 	SenderJid   string         `json:"senderJid,omitempty"`
 	FromMe      bool           `json:"fromMe,omitempty"`
@@ -630,6 +633,7 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 		}
 		records = append(records, whatsAppRecord{
 			Kind: waRecordConversation, ChatJid: chat.String(), ChatType: whatsAppChatType(chat), Name: name,
+			MemberCount: whatsAppHistoryMemberCount(conv, chat),
 		})
 		for _, hm := range conv.GetMessages() {
 			web := hm.GetMessage()
@@ -702,6 +706,25 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 	return records, skipped
 }
 
+// whatsAppHistoryMemberCount is how many people a history-sync group lists
+// (its participant list, each entry counted once), which the assistant names
+// a group by ("the group 'Design team' (8 people)"). 0, and so absent, for a
+// direct chat or a group that lists nobody. Only history carries the whole
+// list: a live group event names who joined or left, and asking WhatsApp for
+// the list would be a network call per group.
+func whatsAppHistoryMemberCount(conv *waHistorySync.Conversation, chat types.JID) int {
+	if chat.Server != types.GroupServer {
+		return 0
+	}
+	members := map[string]bool{}
+	for _, p := range conv.GetParticipant() {
+		if jid := p.GetUserJID(); jid != "" {
+			members[jid] = true
+		}
+	}
+	return len(members)
+}
+
 // whatsAppConversationPair is the (phone number, LID) pair a history
 // conversation names, empty where it names none. The conversation's own id
 // is one of the two forms, and usually only the OTHER form's field is set
@@ -740,4 +763,29 @@ func whatsAppConversationRecord(chatJid string, isGroup bool, name string) whats
 		chatType = waChatGroup
 	}
 	return whatsAppRecord{Kind: waRecordConversation, ChatJid: chatJid, ChatType: chatType, Name: strings.TrimSpace(name)}
+}
+
+// normalizeWhatsAppOwnSend is the record of a text this computer sent itself
+// (whatsapp_send.go). WhatsApp delivers a companion's own send to none of its
+// event handlers, so without this the thread would show it only after a
+// later history sync. It is the event whatsmeow would have dispatched for the
+// message, normalized like any live one: op new, fromMe, source live, the
+// chat and the linked account each resolved through the identity resolver,
+// so a history copy of it later collapses into the same message. Never
+// catch-up: it was sent just now. Nothing without a linked account.
+func normalizeWhatsAppOwnSend(chat types.JID, id string, at time.Time, text string, nc whatsAppNormalizeContext) []whatsAppRecord {
+	if nc.OwnJID.IsEmpty() {
+		return nil
+	}
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat: chat, Sender: nc.OwnJID, IsFromMe: true, IsGroup: chat.Server == types.GroupServer,
+			},
+			ID: types.MessageID(id), Timestamp: at,
+		},
+		Message: &waE2E.Message{Conversation: &text},
+	}
+	nc.ReconnectedAt = time.Time{}
+	return normalizeWhatsAppMessage(evt, waSourceLive, nc)
 }

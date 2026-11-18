@@ -17,6 +17,14 @@
 // message text and phone numbers never sit on disk in the clear outside
 // whatsmeow's own store.
 //
+// The one exception is the send ledger (`sends`, whatsapp_send.go): which
+// proposals this computer acted on, with WhatsApp's message id and the
+// outcome. It holds ids and outcomes only — no text, no chat, no number — and
+// is deliberately NOT sealed: a lost key discards the sealed rows, and losing
+// the ledger with them would let a proposal already sent be sent again. It
+// lives exactly as long as the outbox: across a session's end and a re-link,
+// gone with the link's directory.
+//
 // Caps (WHATSAPP_INGEST_LIMITS OUTBOX_MAX_RECORDS / OUTBOX_MAX_BYTES): past
 // them a HISTORY append is refused with errWhatsAppOutboxFull — the supervisor
 // then pauses consuming history-sync chunks rather than dropping messages —
@@ -34,6 +42,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -63,10 +72,10 @@ var errWhatsAppRebaseOutOfRange = errors.New("whatsapp outbox rebase passes the 
 // errWhatsAppOutboxClosed answers a write after Close.
 var errWhatsAppOutboxClosed = errors.New("whatsapp outbox is closed")
 
-// whatsAppWritesInFlight counts the outbox writes (Append, Rebase) inside
-// their transaction right now, on every outbox: a link's, or one a pause or a
-// retire has already taken off its runner. Shutdown's last step waits for it
-// to reach zero (waitWhatsAppWritesAtExit).
+// whatsAppWritesInFlight counts the outbox writes (Append, Rebase, a send
+// ledger write) inside their transaction right now, on every outbox: a
+// link's, or one a pause or a retire has already taken off its runner.
+// Shutdown's last step waits for it to reach zero (waitWhatsAppWritesAtExit).
 var whatsAppWritesInFlight atomic.Int64
 
 // errWhatsAppOutboxChunkTooLarge is the refusal of a history chunk the EMPTY
@@ -156,6 +165,18 @@ func openWhatsAppOutbox(dir, linkID string) (ob *whatsAppOutbox, discarded bool,
 		db.Close()
 		return nil, false, err
 	}
+	// The send ledger: ids and outcomes, in the clear (see the top of this
+	// file).
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS sends (
+		proposal_id TEXT PRIMARY KEY,
+		state TEXT,
+		wa_message_id TEXT,
+		sent_at INTEGER,
+		error_code TEXT,
+		updated_at INTEGER)`); err != nil {
+		db.Close()
+		return nil, false, err
+	}
 	ob = &whatsAppOutbox{db: db, linkID: linkID}
 	if err := ob.loadCounters(); err != nil {
 		db.Close()
@@ -169,7 +190,9 @@ func openWhatsAppOutbox(dir, linkID string) (ob *whatsAppOutbox, discarded bool,
 
 	key, keyErr := loadOrCreateWhatsAppOutboxKey(linkID, ob.count == 0 && identityRows == 0)
 	if errors.Is(keyErr, errWhatsAppKeyNotFound) {
-		// Rows exist but their key is gone: unreadable by construction.
+		// Rows exist but their key is gone: unreadable by construction. The
+		// send ledger is not sealed, and is kept: forgetting it would let a
+		// proposal already sent go out again.
 		for _, stmt := range []string{`DELETE FROM outbox`, `DELETE FROM identity`} {
 			if _, err := db.Exec(stmt); err != nil {
 				db.Close()
@@ -591,4 +614,93 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+/* --------------------------------------------------------------------------
+   The send ledger (whatsapp_send.go)
+   -------------------------------------------------------------------------- */
+
+// whatsAppSendRecord is one proposal's row in the send ledger.
+type whatsAppSendRecord struct {
+	State       string // whatsAppSendAttempting / Sent / Failed / Unknown
+	WaMessageID string // chosen before the send
+	SentAt      int64  // sent: WhatsApp's timestamp, Unix ms
+	ErrorCode   string // failed: why
+	UpdatedAt   int64  // Unix ms
+}
+
+// GetSend reads a proposal's row; found is false when the ledger has none.
+func (ob *whatsAppOutbox) GetSend(proposalID string) (rec whatsAppSendRecord, found bool, err error) {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	if ob.closed {
+		return rec, false, errWhatsAppOutboxClosed
+	}
+	var state, waMessageID, errorCode sql.NullString
+	var sentAt, updatedAt sql.NullInt64
+	err = ob.db.QueryRow(`SELECT state, wa_message_id, sent_at, error_code, updated_at FROM sends WHERE proposal_id = ?`, proposalID).
+		Scan(&state, &waMessageID, &sentAt, &errorCode, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return rec, false, nil
+	}
+	if err != nil {
+		return rec, false, err
+	}
+	return whatsAppSendRecord{State: state.String, WaMessageID: waMessageID.String, SentAt: sentAt.Int64,
+		ErrorCode: errorCode.String, UpdatedAt: updatedAt.Int64}, true, nil
+}
+
+// PutSendAttempting claims a proposal before its send: a row `attempting`
+// under the message id the send will use, on disk (synchronous FULL) before
+// this returns. A proposal that already has a row is left as it is, and put
+// is false: what that row records is the answer.
+func (ob *whatsAppOutbox) PutSendAttempting(proposalID, waMessageID string) (put bool, err error) {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	if ob.closed {
+		return false, errWhatsAppOutboxClosed
+	}
+	defer ob.beginWrite()()
+	res, err := ob.db.Exec(`INSERT INTO sends (proposal_id, state, wa_message_id, updated_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(proposal_id) DO NOTHING`, proposalID, whatsAppSendAttempting, waMessageID, time.Now().UnixMilli())
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// errWhatsAppSendNotAttempting refuses an outcome for a proposal whose row is
+// not `attempting`: an outcome, once recorded, is final.
+var errWhatsAppSendNotAttempting = errors.New("whatsapp send ledger: the proposal has no attempt to settle")
+
+// RecordSendOutcome settles a claimed send as sent (with WhatsApp's time),
+// failed (with its code) or unknown. Only an `attempting` row moves.
+func (ob *whatsAppOutbox) RecordSendOutcome(proposalID, state string, sentAt int64, errorCode string) error {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	if ob.closed {
+		return errWhatsAppOutboxClosed
+	}
+	defer ob.beginWrite()()
+	var sent, code any // NULL unless set
+	if sentAt > 0 {
+		sent = sentAt
+	}
+	if errorCode != "" {
+		code = errorCode
+	}
+	res, err := ob.db.Exec(`UPDATE sends SET state = ?, sent_at = ?, error_code = ?, updated_at = ? WHERE proposal_id = ? AND state = ?`,
+		state, sent, code, time.Now().UnixMilli(), proposalID, whatsAppSendAttempting)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errWhatsAppSendNotAttempting
+	}
+	return nil
 }
