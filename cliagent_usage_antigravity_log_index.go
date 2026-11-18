@@ -517,19 +517,27 @@ func antigravityLogPIDs(body []byte) []int {
 // antigravityPIDBlockIn returns the block the run with pid wrote: from its
 // startup line to the next run's startup line, or the end of the file.
 func antigravityPIDBlockIn(body []byte, pid int) ([]byte, bool) {
+	block, _, found := antigravityPIDBlockInBounded(body, pid)
+	return block, found
+}
+
+// antigravityPIDBlockInBounded is antigravityPIDBlockIn that also reports
+// whether a later run's startup line already closes the block (ended), so a
+// caller following the file knows the bytes after it are not pid's.
+func antigravityPIDBlockInBounded(body []byte, pid int) ([]byte, bool, bool) {
 	want := strconv.Itoa(pid)
 	starts := antigravityLanguageServerPIDPattern.FindAllSubmatchIndex(body, -1)
 	for i, loc := range starts {
 		if string(body[loc[2]:loc[3]]) != want {
 			continue
 		}
-		end := len(body)
+		end, ended := len(body), false
 		if i+1 < len(starts) {
-			end = starts[i+1][0]
+			end, ended = starts[i+1][0], true
 		}
-		return body[loc[0]:end], true
+		return body[loc[0]:end], ended, true
 	}
-	return nil, false
+	return nil, false, false
 }
 
 // antigravityPIDBlock returns pid's block from the logs under base whose
@@ -549,20 +557,22 @@ func antigravityPIDBlockIn(body []byte, pid int) ([]byte, bool) {
 // legacy log is still read when the stamped names at or after its floor alone
 // would fill the cap.
 func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bool) {
-	_, block, ok := antigravityPIDBlockFile(base, pid, sinceFloor)
+	_, block, _, ok := antigravityPIDBlockFile(base, pid, sinceFloor)
 	return block, ok
 }
 
 // antigravityPIDBlockFile is antigravityPIDBlock that also names the log the
 // block is in, so a caller can follow what the run writes next
-// (antigravity_turn_monitor.go).
-func antigravityPIDBlockFile(base string, pid int, sinceFloor time.Time) (string, []byte, bool) {
+// (antigravity_turn_monitor.go), and reports whether a later run's block
+// already follows it in that file (ended): nothing appended after an ended
+// block is the run's.
+func antigravityPIDBlockFile(base string, pid int, sinceFloor time.Time) (string, []byte, bool, bool) {
 	if pid <= 0 {
-		return "", nil, false
+		return "", nil, false, false
 	}
 	names, ok := antigravityListLogNames(base)
 	if !ok {
-		return "", nil, false
+		return "", nil, false, false
 	}
 	dir := antigravityLogDir(base)
 	floorSecond := sinceFloor.Truncate(time.Second)
@@ -621,11 +631,11 @@ func antigravityPIDBlockFile(base string, pid int, sinceFloor time.Time) (string
 		if !ok {
 			continue
 		}
-		if block, found := antigravityPIDBlockIn(body, pid); found {
-			return path, block, true
+		if block, ended, found := antigravityPIDBlockInBounded(body, pid); found {
+			return path, block, ended, true
 		}
 	}
-	return "", nil, false
+	return "", nil, false, false
 }
 
 // antigravityLegacyLogsSince keeps the unstamped names written at or after

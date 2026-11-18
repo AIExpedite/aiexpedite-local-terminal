@@ -339,3 +339,84 @@ func TestAntigravityMonitor_LogSearchIsBounded(t *testing.T) {
 		t.Fatalf("searches = %d, want %d", mon.logSearches, antigravityMonitorLogSearchMax)
 	}
 }
+
+// writeMonitorLog puts body in a fresh agy log dir under a stamped name for
+// now, and points the monitor's log base at it.
+func writeMonitorLog(t *testing.T, now time.Time, body string) string {
+	t.Helper()
+	base := filepath.Join(t.TempDir(), ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(antigravityLogDir(base), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := antigravityRunLogBase
+	antigravityRunLogBase = func() string { return base }
+	resetAntigravityLogIndex()
+	t.Cleanup(func() { antigravityRunLogBase = prev; resetAntigravityLogIndex() })
+	name := "cli-" + now.In(antigravityLogZone()).Format("20060102_150405") + ".log"
+	path := filepath.Join(antigravityLogDir(base), name)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func appendMonitorLog(t *testing.T, path, text string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(text); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A later run's block that already follows this run's at the first lookup
+// ends the follow there: what that run appends next is never this turn's.
+func TestAntigravityMonitor_EndedBlockAtFirstLookupStopsFollowing(t *testing.T) {
+	shortenAntigravityMonitor(t, antigravityInteractionEnforce)
+	now := time.Now()
+	stamp := now.Format("0102 15:04:05")
+	path := writeMonitorLog(t, now, fmt.Sprintf(
+		"I%s.000000 111 main.go:1] Starting language server process with pid 111\n"+
+			"I%s.000000 111 x.go:1] working\n"+
+			"I%s.000000 222 main.go:1] Starting language server process with pid 222\n", stamp, stamp, stamp))
+	mon := newAntigravityTurnMonitor("s", now.Add(-time.Second), 1024, nil, nil)
+	mon.pid = 111
+	mon.followLog(now)
+	if mon.stopped.Load() || !mon.logForeign {
+		t.Fatalf("first lookup: stopped=%v foreign=%v, want false/true", mon.stopped.Load(), mon.logForeign)
+	}
+	appendMonitorLog(t, path, fmt.Sprintf("E%s.000000 222 x.go:1] ask_question pending: waiting for an answer\n", stamp))
+	mon.followLog(now)
+	if mon.stopped.Load() {
+		t.Fatal("a later run's pending line stopped this turn")
+	}
+}
+
+// A line split across reads is read whole on the next tick: the offset never
+// moves past the incomplete suffix.
+func TestAntigravityMonitor_PartialLineIsReadWholeNextTick(t *testing.T) {
+	shortenAntigravityMonitor(t, antigravityInteractionEnforce)
+	now := time.Now()
+	stamp := now.Format("0102 15:04:05")
+	path := writeMonitorLog(t, now, fmt.Sprintf(
+		"I%s.000000 111 main.go:1] Starting language server process with pid 111\n", stamp))
+	mon := newAntigravityTurnMonitor("s", now.Add(-time.Second), 1024, nil, nil)
+	mon.pid = 111
+	mon.followLog(now)
+	if mon.logPath == "" || mon.stopped.Load() {
+		t.Fatalf("first lookup: path=%q stopped=%v", mon.logPath, mon.stopped.Load())
+	}
+	appendMonitorLog(t, path, fmt.Sprintf("I%s.000000 111 x.go:1] working\nE%s.000000 111 x.go:1] ask_question pend", stamp, stamp))
+	mon.followLog(now)
+	if mon.stopped.Load() {
+		t.Fatal("stopped on an incomplete line")
+	}
+	appendMonitorLog(t, path, "ing: waiting for an answer\n")
+	mon.followLog(now)
+	if !mon.stopped.Load() {
+		t.Fatal("the completed pending line was lost across reads")
+	}
+}

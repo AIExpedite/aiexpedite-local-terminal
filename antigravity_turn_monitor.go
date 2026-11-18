@@ -362,7 +362,7 @@ func (mon *antigravityTurnMonitor) followLog(now time.Time) {
 	}
 	var fresh []byte
 	if path == "" {
-		p, block, ok := antigravityPIDBlockFile(mon.logBase, pid, mon.spawnedAt)
+		p, block, ended, ok := antigravityPIDBlockFile(mon.logBase, pid, mon.spawnedAt)
 		if !ok {
 			return
 		}
@@ -371,7 +371,9 @@ func (mon *antigravityTurnMonitor) followLog(now time.Time) {
 			return
 		}
 		mon.mu.Lock()
-		mon.logPath, mon.logOffset = p, info.Size()
+		// A later run's block already follows this one: what is appended
+		// from here on is that run's, so the follow stops at the boundary.
+		mon.logPath, mon.logOffset, mon.logForeign = p, info.Size(), ended
 		mon.mu.Unlock()
 		fresh = block
 	} else {
@@ -388,12 +390,14 @@ func (mon *antigravityTurnMonitor) followLog(now time.Time) {
 		n, _ := f.ReadAt(data, offset)
 		f.Close()
 		data = data[:n]
-		// Only whole lines; the rest is read next tick.
+		// Only whole lines; the rest is read next tick, so the offset
+		// advances only past what is consumed here.
 		if i := bytes.LastIndexByte(data, '\n'); i >= 0 {
 			data = data[:i+1]
 		} else if len(data) < antigravityMonitorLogChunk {
 			return
 		}
+		consumed := int64(len(data))
 		// A later run's block in the same file ends this run's block.
 		want := strconv.Itoa(pid)
 		for _, loc := range antigravityLanguageServerPIDPattern.FindAllSubmatchIndex(data, -1) {
@@ -406,7 +410,7 @@ func (mon *antigravityTurnMonitor) followLog(now time.Time) {
 			}
 		}
 		mon.mu.Lock()
-		mon.logOffset = offset + int64(n)
+		mon.logOffset = offset + consumed
 		if !mon.initAt.IsZero() && len(bytes.TrimSpace(data)) > 0 {
 			mon.afterIni = true
 		}

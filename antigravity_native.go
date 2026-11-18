@@ -1113,7 +1113,7 @@ func (m *AntigravityNativeManager) runOneShot(
 	// read cap; an unreadable log only leaves the other evidence. A stopped
 	// turn keeps its stop cause, so it skips the read.
 	if run.failed() && run.stopCause == "" {
-		if path, block, ok := antigravityPIDBlockFile(antigravityRunLogBase(), pid, spawnedAt); ok {
+		if path, block, _, ok := antigravityPIDBlockFile(antigravityRunLogBase(), pid, spawnedAt); ok {
 			run.agyLog = path
 			run.logReasons = antigravityRunFailureReasons(block)
 		}
