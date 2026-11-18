@@ -49,6 +49,11 @@ import (
 //	                         sleeps that long, then writes the rest
 //	OPENCODE_STUB_MODELS     stdout for `models` (a diagnostic, not a run)
 //	OPENCODE_STUB_AUTH       stdout for `auth …` (a diagnostic, not a run)
+//	OPENCODE_STUB_API        stdout for `api …` (a diagnostic, not a run):
+//	                         OpenCode 2's server API, e.g. the model.list
+//	                         answer opencode_variant.go reads variants from
+//	OPENCODE_STUB_API_EXIT   exit code for `api …` (default 0)
+//	OPENCODE_STUB_API_LOG    append the argv of every `api …` call to this file
 //	OPENCODE_STUB_DONE_LOG   written AFTER the sleep, just before exit — absent
 //	                         iff the child was killed mid-run, which is how a
 //	                         deadline test proves the tree was actually reaped
@@ -101,6 +106,17 @@ func main() {
 		case "auth":
 			fmt.Print(env("OPENCODE_STUB_AUTH", "anthropic" + newline))
 			return
+		case "api":
+			if p := os.Getenv("OPENCODE_STUB_API_LOG"); p != "" {
+				f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+				if err == nil {
+					fmt.Fprintln(f, strings.Join(os.Args[1:], " "))
+					f.Close()
+				}
+			}
+			fmt.Print(os.Getenv("OPENCODE_STUB_API"))
+			code, _ := strconv.Atoi(env("OPENCODE_STUB_API_EXIT", "0"))
+			os.Exit(code)
 		}
 	}
 
@@ -361,10 +377,12 @@ func installOpenCodeStub(t *testing.T) string {
 	resetOpenCodeCapabilityCache()
 	resetOpenCodeReadinessCache()
 	resetVersionProbeCache()
+	resetOpenCodeModelVariantsCache()
 	t.Cleanup(func() {
 		resetOpenCodeCapabilityCache()
 		resetOpenCodeReadinessCache()
 		resetVersionProbeCache()
+		resetOpenCodeModelVariantsCache()
 	})
 	return binDir
 }
