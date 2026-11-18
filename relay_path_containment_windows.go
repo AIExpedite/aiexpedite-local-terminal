@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 
 	"golang.org/x/sys/windows"
@@ -44,12 +45,24 @@ func realDirPath(path string) (string, error) {
 		return "", err
 	}
 	defer windows.CloseHandle(handle)
-	buf := make([]uint16, finalPathMax)
-	n, err := windows.GetFinalPathNameByHandle(handle, &buf[0], uint32(len(buf)), finalPathVolumeNameDOS)
-	if err != nil {
-		return "", err
+	// A buffer too small is answered with the size it needs (terminator
+	// included), so a typical path costs one call and a long one two.
+	buf := make([]uint16, windows.MAX_PATH)
+	for {
+		n, err := windows.GetFinalPathNameByHandle(handle, &buf[0], uint32(len(buf)), finalPathVolumeNameDOS)
+		if err != nil {
+			return "", err
+		}
+		if int(n) < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		if int(n) > finalPathMax {
+			return "", fmt.Errorf("final path of %q is longer than %d characters", path, finalPathMax)
+		}
+		buf = make([]uint16, n)
 	}
-	final := windows.UTF16ToString(buf[:n])
+	final := windows.UTF16ToString(buf)
 	switch {
 	case strings.HasPrefix(final, `\\?\UNC\`):
 		final = `\\` + final[len(`\\?\UNC\`):]
