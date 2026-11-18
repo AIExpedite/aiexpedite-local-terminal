@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -659,5 +660,44 @@ func TestOpenCodeSessionStart_ReadsTheModelListOutsideTheManagerLock(t *testing.
 	}
 	if runs := readLogLines(t, argvLog); len(runs) != 1 || runs[0] != "run --format json --model opencode/flint-40b-free#medium" {
 		t.Fatalf("the session ran %q", runs)
+	}
+}
+
+// A session started as `./opencode` runs the binary in its own working
+// directory (resolveExecutable leaves a relative path for exec to resolve
+// there), so the effort must be read from that binary, not from whatever
+// `./opencode` names beside the agent.
+func TestOpenCodeSessionStart_ReadsARelativeExecutableInTheSessionDirectory(t *testing.T) {
+	argvLog, apiLog := installOpenCodeStubAt(t, "opencode v2.2.7")
+	cwd := t.TempDir()
+	name := "opencode"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	stub, err := os.ReadFile(buildOpenCodeStub(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, name), stub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	sm := NewSessionManager(nil)
+	id := fmt.Sprintf("opencode-effort-relative-%d", time.Now().UnixNano())
+	ended, publishFn := openCodeSessionEndedSignal()
+	args := []string{"--model", "opencode/flint-40b-free", "--variant", "medium", "address the review comments"}
+	if err := sm.StartSession(id, "./"+name, args, cwd, "ws", "uid", 30000, false, publishFn); err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	select {
+	case <-ended:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the session never ended")
+	}
+	if runs := readLogLines(t, argvLog); len(runs) != 1 || runs[0] != "run --format json --model opencode/flint-40b-free#medium" {
+		t.Fatalf("the session ran %q: the effort was not read from the binary in the session directory", runs)
+	}
+	if api := readLogLines(t, apiLog); len(api) != 1 {
+		t.Fatalf("the model list must be read once from that binary, read %d times", len(api))
 	}
 }

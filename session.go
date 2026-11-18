@@ -445,7 +445,7 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 	if isOpenCodeCommand(command) && !readOnly {
 		cleaned, _ := extractOpenCodeMaintenanceSmokeControl(args)
 		runArgs, _ := buildOpenCodeInteractiveArgs(cleaned)
-		openCodeEffort = readOpenCodeEffort(resolveExecutable(command), cwd, runArgs)
+		openCodeEffort = readOpenCodeEffort(resolveExecutableIn(command, cwd), cwd, runArgs)
 	}
 
 	sm.mu.Lock()
@@ -5055,6 +5055,19 @@ func resolveExecutable(command string) string {
 // resolved against PATH.
 func isExplicitPath(command string) bool {
 	return strings.ContainsAny(command, `/\`)
+}
+
+// resolveExecutableIn is resolveExecutable as the child will see it. A
+// relative explicit path (`./opencode`), which resolveExecutable leaves for exec
+// to resolve inside the child's working directory, is joined to dir here. A
+// caller that inspects the binary before it runs (its version, say) must read
+// the file the child will exec, not one that happens to sit beside the agent.
+func resolveExecutableIn(command, dir string) string {
+	executable := resolveExecutable(command)
+	if dir != "" && isRelativeExplicitPath(executable) {
+		return filepath.Join(dir, executable)
+	}
+	return executable
 }
 
 // isRelativeExplicitPath reports whether command is an explicit path that
