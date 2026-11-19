@@ -401,3 +401,23 @@ func TestLinkTargetPath(t *testing.T) {
 		}
 	}
 }
+
+// A granted folder that no longer exists on disk refuses: the fence fails
+// closed rather than admitting a working directory it cannot compare.
+func TestCwdFenceRefusalReason_MissingFenceFailsClosed(t *testing.T) {
+	base := resolvedTempDir(t)
+	cwd := filepath.Join(base, "frontend")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if reason := cwdFenceRefusalReason(cwd, filepath.Join(base, "gone")); reason == "" {
+		t.Fatalf("a missing granted folder must refuse")
+	}
+	if res := fenceRefusal(t, filepath.Join(base, "gone"), cwd); res == nil ||
+		res.RejectionReason != cwdOutsideGrantFolderRejectionCode {
+		t.Fatalf("a missing granted folder must refuse CWD_OUTSIDE_GRANT_FOLDER, got %+v", res)
+	}
+	if reason := cwdFenceRefusalReason(cwd, base); reason != "" {
+		t.Fatalf("a sub-folder of an existing fence must be admitted: %s", reason)
+	}
+}
