@@ -203,3 +203,73 @@ func TestOpenCodeProbeAndWriterEvidence(t *testing.T) {
 		t.Fatalf("store clock = %d, want the row's time_updated", got)
 	}
 }
+
+// The watcher's busy decision reads OpenCode's store through the owner's live
+// write-ahead log (cliSessionSQLiteDSN): while OpenCode runs, a turn's write
+// its log alone holds yet is a writer mid-turn. An immutable open would read
+// the store file without it and call a busy session idle, releasing a held
+// message beside its writer. Once OpenCode closes (its last connection
+// checkpoints the write and removes the log) the store is read immutable,
+// still says when the session was last written, and gains nothing beside it.
+func TestOpenCodeWatcherReadsAWriteStillOnlyInTheOwnersLog(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("OPENCODE_DATA", root)
+	pinCliSessionProcesses(t, func() []cliSessionProcess {
+		return []cliSessionProcess{{PID: 91, Name: "opencode", Args: []string{"opencode", "--session", ocBoth}}}
+	})
+	path := filepath.Join(root, "opencode.db")
+	owner, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.SetMaxOpenConns(1)
+	defer owner.Close()
+	exec := func(stmt string, args ...any) {
+		t.Helper()
+		if _, err := owner.Exec(stmt, args...); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	hourAgo := time.Now().Add(-time.Hour).UnixMilli()
+	exec(`PRAGMA journal_mode=WAL`)
+	exec(`CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER)`)
+	exec(`INSERT INTO session_v2 VALUES (?, 'Fix the session store', '/w/app', ?, ?)`, ocBoth, hourAgo, hourAgo)
+	// Everything so far is in the store file; from here on only the log holds
+	// a write, until the owner closes.
+	exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	exec(`PRAGMA wal_autocheckpoint=0`)
+
+	clock := openCodeWriterEvidence.storeClock(ocBoth)
+	stateNow := func() string {
+		state, _, _ := claudeOutsideWriterState(cliSessionOutsideWriters(openCodeWriterEvidence, ocBoth, clock, nil, time.Now()))
+		return state
+	}
+	if got := stateNow(); got != claudeOutsideWriterIdle {
+		t.Fatalf("a session OpenCode holds open, last written an hour ago, reads %s, want idle", got)
+	}
+
+	turnAt := time.Now().UnixMilli()
+	exec(`UPDATE session_v2 SET time_updated = ? WHERE id = ?`, turnAt, ocBoth)
+	if !cliSessionSQLiteWALLive(path) {
+		t.Fatalf("OpenCode's log is not live while it runs: %v", sqliteSideFiles(t, root))
+	}
+	if got := clock(); got != turnAt {
+		t.Fatalf("store clock = %d, want the write only the owner's log holds (%d)", got, turnAt)
+	}
+	if got := stateNow(); got != claudeOutsideWriterBusy {
+		t.Fatalf("a session OpenCode is writing reads %s, want busy", got)
+	}
+
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := sqliteSideFiles(t, root); len(got) != 1 {
+		t.Fatalf("after OpenCode closed its folder holds %v, want the store alone", got)
+	}
+	if got := clock(); got != turnAt {
+		t.Fatalf("store clock after OpenCode closed = %d, want the checkpointed write (%d)", got, turnAt)
+	}
+	if got := sqliteSideFiles(t, root); len(got) != 1 {
+		t.Fatalf("the immutable read left %v beside the store", got)
+	}
+}

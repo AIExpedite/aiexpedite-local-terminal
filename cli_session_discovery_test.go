@@ -1180,6 +1180,47 @@ func TestCliSessionSQLiteReadCreatesNothingBesideTheStore(t *testing.T) {
 	}
 }
 
+// Only a live log is read through: a -wal with no -shm beside it (an owner in
+// exclusive locking mode, or a log a crash left behind) is read immutable, as
+// of the store file. Reading through it would CREATE the -shm SQLite needs to
+// read a log, in the owner's folder.
+func TestCliSessionSQLiteReadOfALoneLogCreatesNoSharedMemory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+	owner, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.SetMaxOpenConns(1)
+	for _, stmt := range []string{`PRAGMA journal_mode=WAL`, `CREATE TABLE t (v TEXT)`, `INSERT INTO t VALUES ('checkpointed')`} {
+		if _, err := owner.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+"-wal", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cliSessionSQLiteWALLive(path) {
+		t.Fatal("a -wal with no -shm reads as a live log")
+	}
+	db, err := openCliSessionSQLite(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	var n int
+	err = db.QueryRow(`SELECT count(*) FROM t`).Scan(&n)
+	_ = db.Close()
+	if err != nil || n != 1 {
+		t.Fatalf("read %d rows (%v), want the checkpointed one", n, err)
+	}
+	if got := sqliteSideFiles(t, dir); len(got) != 2 || got[0] != "store.db" || got[1] != "store.db-wal" {
+		t.Fatalf("the read left %v in the owner's folder, want the store and its lone log only", got)
+	}
+}
+
 // cutAfterContext is a listing budget that runs out after its first `left`
 // checks, whatever the clock says: a listing the budget cuts short, at a
 // place the test chooses.
