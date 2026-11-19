@@ -184,11 +184,13 @@ func parseCliSessionTimeRaw(raw json.RawMessage) int64 {
 //     read-only connection never checkpoints;
 //   - otherwise the store is read `immutable`, as the editors' databases are
 //     (claude_session_sources_editor.go): no lock is taken, so a rollback-
-//     journal owner's commit never waits on a discovery. Without a live log
-//     the file holds every committed write, and a plain read-only open of a
-//     WAL store whose owner is not running would CREATE its -wal and -shm
-//     (SQLite opens them read-write to read through them) and leave both
-//     behind in the owner's folder.
+//     journal owner's commit never waits on a discovery (one landing
+//     mid-read can spoil only that read: unreadable, or a row a moment
+//     stale). Without a live log the file holds every committed write — but
+//     for a log a crash left behind, which the owner's next start recovers —
+//     and a plain read-only open of a WAL store whose owner is not running
+//     would CREATE its -wal and -shm (SQLite opens them read-write to read
+//     through them) and leave both behind in the owner's folder.
 func cliSessionSQLiteDSN(path string) string {
 	dsn := openCodeSQLiteReadOnlyDSN(path)
 	if !cliSessionSQLiteWALLive(path) {
