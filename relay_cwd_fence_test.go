@@ -272,31 +272,8 @@ func TestRefuseCwdOutsideFence(t *testing.T) {
 	if msgs[5].Status != "denied" || msgs[5].RejectionReason != cwdOutsideGrantFolderRejectionCode {
 		t.Errorf("unexpected denial payload: %+v", msgs[5])
 	}
-
-	// 11. Symlinks (if supported on this environment)
-	linkInside := filepath.Join(fenceDir, "linkInside")
-	if err := os.Symlink(subDir, linkInside); err == nil {
-		cmd = cmdBase
-		cmd.CwdFence = fenceDir
-		cmd.Cwd = linkInside
-		if refuseCwdOutsideFence(context.Background(), nil, nil, cmd, cfg) {
-			t.Errorf("symlink staying inside fence should be allowed")
-		}
-	} else {
-		t.Logf("skipping symlink inside test: %v", err)
-	}
-
-	linkOutside := filepath.Join(fenceDir, "linkOutside")
-	if err := os.Symlink(outsideDir, linkOutside); err == nil {
-		cmd = cmdBase
-		cmd.CwdFence = fenceDir
-		cmd.Cwd = linkOutside
-		if !refuseCwdOutsideFence(context.Background(), nil, nil, cmd, cfg) {
-			t.Errorf("symlink escaping fence must be refused")
-		}
-	} else {
-		t.Logf("skipping symlink escape test: %v", err)
-	}
+	// Links (symlinks, and junctions on Windows): TestRefuseCwdOutsideFence_SymlinkEscapes
+	// and relay_cwd_fence_windows_test.go.
 }
 
 // fenceRefusal runs the fence for one start and returns the rejection it

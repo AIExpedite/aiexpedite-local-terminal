@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"cloud.google.com/go/pubsub/v2"
 )
@@ -42,8 +43,11 @@ func fenceRealPath(p string) (string, error) {
 			return "", err
 		}
 		vol := filepath.VolumeName(resolved)
+		// Only an ASCII rune can be a separator: uint8(r) alone would read
+		// U+015C as '\' and split a name such as "aŜlink" in two,
+		// hiding a junction named that from the walk below.
 		segments := strings.FieldsFunc(resolved[len(vol):], func(r rune) bool {
-			return os.IsPathSeparator(uint8(r))
+			return r < utf8.RuneSelf && os.IsPathSeparator(uint8(r))
 		})
 		cur := vol + string(filepath.Separator)
 		next := ""

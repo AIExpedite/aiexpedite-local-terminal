@@ -81,6 +81,13 @@ func TestRefuseCwdOutsideFence_WindowsJunctionEscape(t *testing.T) {
 	if res := fenceRefusal(t, fence, stay); res != nil {
 		t.Errorf("a junction that stays inside the granted folder must be admitted: %+v", *res)
 	}
+	// A junction whose name holds a rune whose low byte is a separator
+	// (U+015C -> 0x5C) is still found and refused.
+	tricky := filepath.Join(fence, "aŜlink")
+	makeJunction(t, tricky, other)
+	if res := fenceRefusal(t, fence, tricky); res == nil {
+		t.Errorf("a junction named %q leads out of the granted folder and must be refused", tricky)
+	}
 	// A fence that is itself a junction resolves to its real folder.
 	fenceJunction := filepath.Join(base, "fence-junction")
 	makeJunction(t, fenceJunction, fence)
