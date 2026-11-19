@@ -2,7 +2,8 @@
 //
 // Chrome grants a DevTools client the whole browser; cdpAllowlist is the
 // narrowing: every method this agent may send, refused locally otherwise. No
-// Network.*, Storage.*, cookies, Browser.* or closing tabs, ever.
+// Network.*, Storage.*, cookies, closing tabs or Browser.* (but the read-only
+// Browser.getVersion), ever.
 //
 // Chrome asks "Allow remote debugging?" once per connection, so ONE connection
 // is kept open while commands use it and closed after browserCDPIdleClose
@@ -28,10 +29,14 @@ import (
 )
 
 var cdpAllowlist = map[string]bool{
-	"Target.getTargets":           true,
-	"Target.attachToTarget":       true,
-	"Target.detachFromTarget":     true,
-	"Target.createTarget":         true,
+	"Target.getTargets":       true,
+	"Target.attachToTarget":   true,
+	"Target.detachFromTarget": true,
+	"Target.createTarget":     true,
+	// Read-only: tab targets' activation events feed the focus memory, and
+	// Chrome's version is reported with `current` (browser_focus.go).
+	"Target.setDiscoverTargets":   true,
+	"Browser.getVersion":          true,
 	"Page.getFrameTree":           true,
 	"Page.createIsolatedWorld":    true,
 	"Page.navigate":               true,
@@ -250,10 +255,35 @@ type cdpConn struct {
 	ep    cdpEndpoint
 	mu    sync.Mutex
 	pages map[string]*cdpPage // targetId -> page
+	// mem is this Chrome's focus memory; disc is what target discovery said.
+	mem         *browserFocusMemory
+	disc        cdpDiscovery
+	versionOnce sync.Once
+	version     string
+}
+
+// shut closes the connection: no switch is seen until the next one.
+func (cn *cdpConn) shut() {
+	cn.mem.interrupt()
+	cn.c.close()
 }
 
 func (cn *cdpConn) onEvent(method, sessionID string, params json.RawMessage) {
 	switch method {
+	case "Target.targetCreated", "Target.targetInfoChanged":
+		var p struct {
+			TargetInfo cdpTarget `json:"targetInfo"`
+		}
+		if json.Unmarshal(params, &p) == nil {
+			cn.disc.target(p.TargetInfo, time.Now(), cn.mem)
+		}
+	case "Target.targetDestroyed":
+		var p struct {
+			TargetID string `json:"targetId"`
+		}
+		if json.Unmarshal(params, &p) == nil {
+			cn.disc.destroyed(p.TargetID, time.Now(), cn.mem)
+		}
 	case "Target.detachedFromTarget":
 		var p struct {
 			SessionID string `json:"sessionId"`
@@ -297,6 +327,11 @@ type cdpTarget struct {
 	Type     string `json:"type"`
 	Title    string `json:"title"`
 	URL      string `json:"url"`
+	// ParentID: a page's tab target. Subtype and EmbedderData (experimental,
+	// "only set for targets of type tab") are read only by browser_cdp_focus.go.
+	ParentID     string          `json:"parentId,omitempty"`
+	Subtype      string          `json:"subtype,omitempty"`
+	EmbedderData json.RawMessage `json:"embedderData,omitempty"`
 }
 
 func (cn *cdpConn) targets(ctx context.Context) ([]cdpTarget, error) {
@@ -336,6 +371,11 @@ func (cn *cdpConn) page(ctx context.Context, targetID string) (*cdpPage, error) 
 	if !found {
 		return nil, browserErr(browserErrTabNotFound, "that tab is closed or is not a web page; list the tabs again")
 	}
+	return cn.attach(ctx, targetID)
+}
+
+// attach attaches a session to a target just listed (page checks it first).
+func (cn *cdpConn) attach(ctx context.Context, targetID string) (*cdpPage, error) {
 	var a struct {
 		SessionID string `json:"sessionId"`
 	}
@@ -386,7 +426,7 @@ func (m *cdpManager) acquire(ctx context.Context, ep cdpEndpoint) (*cdpConn, fun
 			if m.users == 0 || !m.conn.c.alive() {
 				old := m.conn
 				m.conn = nil
-				go old.c.close()
+				go old.shut()
 			}
 		}
 		if m.conn != nil && m.conn.ep.Port == ep.Port && m.conn.ep.WSPath == ep.WSPath {
@@ -413,7 +453,7 @@ func (m *cdpManager) acquire(ctx context.Context, ep cdpEndpoint) (*cdpConn, fun
 		m.dialing = ch
 		m.mu.Unlock()
 
-		cn := &cdpConn{ep: ep, pages: map[string]*cdpPage{}}
+		cn := &cdpConn{ep: ep, pages: map[string]*cdpPage{}, mem: browserFocusMemoryFor(ep.focusKey())}
 		dctx, cancel := context.WithTimeout(ctx, cdpConsentWait)
 		c, err := m.dial(dctx, ep.wsURL(), cn.onEvent)
 		cancel()
@@ -425,9 +465,11 @@ func (m *cdpManager) acquire(ctx context.Context, ep cdpEndpoint) (*cdpConn, fun
 			return nil, nil, err
 		}
 		cn.c = c
+		// Off the dial path: the first op never waits for it.
+		go cn.startDiscovery()
 		if m.conn != nil {
 			old := m.conn
-			go old.c.close()
+			go old.shut()
 		}
 		m.conn = cn
 		m.users++
@@ -500,7 +542,7 @@ func (m *cdpManager) closeIfIdle() {
 		m.armIdleLocked()
 		return
 	}
-	m.conn.c.close()
+	m.conn.shut()
 	m.conn = nil
 }
 
@@ -514,7 +556,7 @@ func (m *cdpManager) closeAll() {
 		m.idle = nil
 	}
 	if m.conn != nil {
-		m.conn.c.close()
+		m.conn.shut()
 		m.conn = nil
 	}
 }
@@ -827,6 +869,12 @@ func (b *cdpBackend) Tabs(ctx context.Context) ([]browserTabInfo, error) {
 	}
 	return out, nil
 }
+
+func (b *cdpBackend) FocusSnapshot(ctx context.Context, cheapOnly bool) (browserFocusSnapshot, error) {
+	return b.conn.focusSnapshot(ctx, cheapOnly)
+}
+
+func (b *cdpBackend) FocusMemory() *browserFocusMemory { return b.conn.mem }
 
 func (b *cdpBackend) Open(ctx context.Context, url string) (browserPage, error) {
 	var r struct {

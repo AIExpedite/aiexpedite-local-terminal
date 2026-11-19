@@ -131,7 +131,26 @@ type fakeBackend struct {
 	route string
 	pages map[string]*fakePage
 	tabs  []browserTabInfo
+	// snap / snapErr: what FocusSnapshot returns (default: not cheap, so
+	// tabs uses the plain list). mem: the focus memory.
+	snap    *browserFocusSnapshot
+	snapErr error
+	mem     *browserFocusMemory
 }
+
+func (b *fakeBackend) FocusSnapshot(ctx context.Context, cheapOnly bool) (browserFocusSnapshot, error) {
+	if b.snapErr != nil {
+		return browserFocusSnapshot{}, b.snapErr
+	}
+	if b.snap == nil {
+		if cheapOnly {
+			return browserFocusSnapshot{}, errBrowserFocusNotCheap
+		}
+		return browserFocusSnapshot{Tabs: b.tabs}, nil
+	}
+	return *b.snap, nil
+}
+func (b *fakeBackend) FocusMemory() *browserFocusMemory { return b.mem }
 
 func (b *fakeBackend) Route() string { return b.route }
 func (b *fakeBackend) Tabs(ctx context.Context) ([]browserTabInfo, error) {
@@ -539,5 +558,109 @@ func TestClassifyBrowserError(t *testing.T) {
 	}
 	if got := classifyBrowserOpenError(context.DeadlineExceeded, expired); got.Code != browserErrChromeDenied {
 		t.Errorf("unanswered dialog: %s", got.Code)
+	}
+}
+
+// ---------------------------------------------------------------- current
+
+func TestBrowserCurrentOp(t *testing.T) {
+	long := strings.Repeat("t", 400)
+	focused := browserFocusSnapshot{Complete: true, HasSignal: true, Source: browserFocusSourcePageProbe, ChromeVersion: "Chrome/149.0", Tabs: []browserTabInfo{
+		{TabID: "d:A", Title: long, URL: "https://mail.example.com/", Focused: boolPtr(true), Visible: boolPtr(true)},
+		{TabID: "d:B", Title: "Docs", URL: "https://docs.example.com/", Focused: boolPtr(false), Visible: boolPtr(false)},
+	}}
+	mem := &browserFocusMemory{}
+	be := &fakeBackend{route: browserRouteDevTools, snap: &focused, mem: mem}
+	r := &browserOpRun{p: browserParams{Op: browserOpCurrent, AppOrigin: "https://app.test"}, be: be, stop: &atomic.Bool{}}
+	res, err := r.run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := res.(browserCurrentResult)
+	if cur.Tab.TabID != "d:A" || cur.Basis != browserCurrentBasisFocused || cur.Tab.Title != clipString(long, 300) || cur.ChromeVersion != "Chrome/149.0" {
+		t.Fatalf("%+v", cur)
+	}
+	raw, _ := json.Marshal(cur)
+	for _, key := range []string{`"tab":{`, `"basis":"focused"`, `"source":"pageProbe"`, `"focused":{`, `"lastActive":null`} {
+		if !strings.Contains(string(raw), key) {
+			t.Errorf("result %s lacks %s", raw, key)
+		}
+	}
+	if len(mem.ring) != 1 || mem.ring[0].TabID != "d:A" || mem.ring[0].FromEvent {
+		t.Fatalf("the snapshot's focused tab is recorded (not as an event): %+v", mem.ring)
+	}
+
+	// Both refusals carry candidates, never the app's own tab.
+	for _, c := range []struct {
+		snap browserFocusSnapshot
+		code string
+	}{
+		{browserFocusSnapshot{Complete: true, HasSignal: true, Tabs: []browserTabInfo{
+			{TabID: "d:A", Title: long, URL: "https://mail.example.com/", Focused: boolPtr(false), Visible: boolPtr(true)},
+			{TabID: "d:B", Title: "Docs", URL: "https://docs.example.com/", Focused: boolPtr(false), Visible: boolPtr(true)},
+			{TabID: "d:APP", Title: "Chat", URL: "https://app.test/c", Focused: boolPtr(true), Visible: boolPtr(true)},
+		}}, browserErrCurrentPageAmbiguous},
+		{browserFocusSnapshot{Tabs: []browserTabInfo{
+			{TabID: "d:A", Title: long, URL: "https://mail.example.com/"},
+			{TabID: "d:APP", Title: "Chat", URL: "https://app.test/c"},
+		}}, browserErrCurrentPageUnavailable},
+	} {
+		snap := c.snap
+		be.snap = &snap
+		_, err := r.run(context.Background())
+		var berr *browserError
+		if !errors.As(err, &berr) || berr.Code != c.code {
+			t.Fatalf("%v, want %s", err, c.code)
+		}
+		if len(berr.Candidates) == 0 || berr.Candidates[0].TabID != "d:A" || berr.Candidates[0].Title != clipString(long, 300) {
+			t.Fatalf("%+v", berr.Candidates)
+		}
+		for _, cand := range berr.Candidates {
+			if cand.TabID == "d:APP" {
+				t.Fatal("the app's own tab is never a candidate")
+			}
+		}
+		raw, _ := json.Marshal(browserResultBody{V: 1, CommandID: "c", Error: berr})
+		if !strings.Contains(string(raw), `"candidates":[`) {
+			t.Fatalf("the refusal posts its candidates: %s", raw)
+		}
+	}
+
+	// A route failure is the route's own error.
+	be.snapErr = browserErr(browserErrChromeNotReachable, "gone")
+	if _, err := r.run(context.Background()); browserCode(err) != browserErrChromeNotReachable {
+		t.Fatalf("%v", err)
+	}
+}
+
+// tabs carries focused / window only when the route can tell cheaply.
+func TestBrowserTabsFocusEnrichment(t *testing.T) {
+	plain := []browserTabInfo{{TabID: "d:1", Title: "Mail", URL: "https://mail.example.com/"}}
+	be := &fakeBackend{route: browserRouteDevTools, tabs: plain}
+	r := &browserOpRun{p: browserParams{Op: browserOpTabs}, be: be, stop: &atomic.Bool{}}
+	res, err := r.run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(res)
+	if strings.Contains(string(raw), "focused") || strings.Contains(string(raw), "active") || strings.Contains(string(raw), "window") {
+		t.Fatalf("not cheap: the plain list, unknown flags omitted: %s", raw)
+	}
+	be.snap = &browserFocusSnapshot{Tabs: []browserTabInfo{
+		{TabID: "a:1", Title: "Mail", URL: "https://mail.example.com/", Active: boolPtr(true), Focused: boolPtr(true), Window: 1},
+		{TabID: "a:2", Title: "Docs", URL: "https://docs.example.com/", Active: boolPtr(false), Focused: boolPtr(false), Window: 1},
+		{TabID: "a:3", Title: "Settings", URL: "chrome://settings/", Active: boolPtr(true), Window: 2},
+	}}
+	res, err = r.run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tabs := res.(browserTabsResult).Tabs
+	if len(tabs) != 2 || !isTrue(tabs[0].Focused) || tabs[0].Window != 1 || tabs[1].Active == nil || *tabs[1].Active {
+		t.Fatalf("%+v", tabs)
+	}
+	be.snapErr = browserErr(browserErrChromeNotReachable, "gone")
+	if _, err := r.run(context.Background()); browserCode(err) != browserErrChromeNotReachable {
+		t.Fatalf("%v", err)
 	}
 }

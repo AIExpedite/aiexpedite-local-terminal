@@ -7,8 +7,6 @@ import (
 	"time"
 )
 
-func boolPtr(b bool) *bool { return &b }
-
 // healthyMachine returns a MachineInfo that should evaluate to "ready".
 func healthyMachine() *MachineInfo {
 	return &MachineInfo{

@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -286,6 +287,13 @@ func isBrowserCode(err error, code string) bool {
 // points discovery at it; the test's cleanup kills it and removes the profile.
 func launchSmokeChrome(t *testing.T, chromePath string) {
 	t.Helper()
+	launchSmokeChromeWith(t, chromePath, false)
+}
+
+// launchSmokeChromeWith launches the throwaway Chrome; headed shows real
+// windows (focus and visibility need them: browser_smoke_current_test.go).
+func launchSmokeChromeWith(t *testing.T, chromePath string, headed bool) {
+	t.Helper()
 	root := os.Getenv("AIX_BROWSER_SMOKE_DIR")
 	if root == "" {
 		root = t.TempDir()
@@ -294,8 +302,16 @@ func launchSmokeChrome(t *testing.T, chromePath string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(chromePath, "--headless=new", "--user-data-dir="+profile, "--remote-debugging-port=0",
-		"--use-mock-keychain", "--no-first-run", "--no-default-browser-check", "--disable-gpu", "about:blank")
+	args := []string{"--user-data-dir=" + profile, "--remote-debugging-port=0",
+		"--no-first-run", "--no-default-browser-check", "about:blank"}
+	if runtime.GOOS == "darwin" {
+		args = append([]string{"--use-mock-keychain"}, args...)
+	}
+	if !headed {
+		args = append([]string{"--headless=new", "--disable-gpu"}, args...)
+	}
+	cmd := exec.Command(chromePath, args...)
+	cmd.Env = smokeChromeEnv()
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +327,7 @@ func launchSmokeChrome(t *testing.T, chromePath string) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("headless Chrome wrote no DevToolsActivePort")
+			t.Fatal("the smoke Chrome wrote no DevToolsActivePort")
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -319,6 +335,32 @@ func launchSmokeChrome(t *testing.T, chromePath string) {
 	browserChromeUserDataDirOverride = profile
 	t.Cleanup(func() { browserChromeUserDataDirOverride = prev })
 
+}
+
+// smokeChromeEnv is the environment for the throwaway Chrome: the suite's own,
+// but with the profile, app-data and temp variables TestMain sandboxed put
+// back. On Windows a Chrome launched under the sandboxed USERPROFILE hands the
+// launch to the person's own running Chrome instead of starting on its
+// --user-data-dir. The throwaway profile is still the only one it uses.
+func smokeChromeEnv() []string {
+	real := map[string]string{
+		"HOME": realHomeAtStartup, "USERPROFILE": realHomeAtStartup, "APPDATA": realAppDataAtStartup,
+		"TEMP": realTempAtStartup, "TMP": realTempAtStartup, "TMPDIR": realTempAtStartup,
+	}
+	var env []string
+	for _, kv := range os.Environ() {
+		key, _, _ := strings.Cut(kv, "=")
+		if v, ok := real[strings.ToUpper(key)]; ok && v != "" {
+			continue
+		}
+		env = append(env, kv)
+	}
+	for key, v := range real {
+		if v != "" {
+			env = append(env, key+"="+v)
+		}
+	}
+	return env
 }
 
 func smokeChromePath(t *testing.T) string {

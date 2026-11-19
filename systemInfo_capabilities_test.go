@@ -75,7 +75,7 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			waRaw, _ := json.Marshal(&whatsAppCapability{Supported: true, SecureStorage: caps.WhatsApp.SecureStorage, Protocol: 2, SendText: true})
 			// browserControl's routes depend on the OS (applescript on macOS
 			// only); browser_contract_test.go pins both lists.
-			bcRaw, _ := json.Marshal(&browserControlCapability{Supported: true, Protocol: 1, Routes: browserRoutesFor(runtime.GOOS)})
+			bcRaw, _ := json.Marshal(&browserControlCapability{Supported: true, Protocol: 2, Routes: browserRoutesFor(runtime.GOOS)})
 			raw, _ := json.Marshal(caps)
 			// The literal IS the assertion: this pins the exact wire shape, so
 			// adding a capability has to be a deliberate edit here rather than

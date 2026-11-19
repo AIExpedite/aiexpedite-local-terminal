@@ -31,6 +31,7 @@ func TestBrowserContractPins(t *testing.T) {
 		{browserRouteDevTools, "devtools"},
 		{browserRouteAppleScript, "applescript"},
 		{browserOpTabs, "tabs"},
+		{browserOpCurrent, "current"},
 		{browserOpOpen, "open"},
 		{browserOpRead, "read"},
 		{browserOpFill, "fill"},
@@ -54,6 +55,14 @@ func TestBrowserContractPins(t *testing.T) {
 		{browserErrSubmitFormChanged, "BROWSER_SUBMIT_FORM_CHANGED"},
 		{browserErrScreenshotUnsupport, "BROWSER_SCREENSHOT_UNSUPPORTED"},
 		{browserErrScreenshotNotFound, "BROWSER_SCREENSHOT_NOT_FOUND"},
+		{browserErrCurrentPageAmbiguous, "BROWSER_CURRENT_PAGE_AMBIGUOUS"},
+		{browserErrCurrentPageUnavailable, "BROWSER_CURRENT_PAGE_UNAVAILABLE"},
+		{browserCurrentBasisFocused, "focused"},
+		{browserCurrentBasisVisible, "visible"},
+		{browserCurrentBasisLastActive, "lastActive"},
+		{browserFocusSourceTabActive, "tabActive"},
+		{browserFocusSourcePageProbe, "pageProbe"},
+		{browserFocusSourceWindowOrder, "windowOrder"},
 		{browserOutcomeFilled, "filled"},
 		{browserOutcomeFilledThenHidden, "filled-then-hidden"},
 		{browserOutcomeMismatch, "mismatch"},
@@ -76,15 +85,17 @@ func TestBrowserContractPins(t *testing.T) {
 		}
 	}
 	limits := map[string][2]int{
-		"MAX_PLAN_VALUES":      {browserMaxPlanValues, 100},
-		"MAX_VALUE_CHARS":      {browserMaxValueChars, 4000},
-		"MAX_LABEL_CHARS":      {browserMaxLabelChars, 300},
-		"MAX_URL_CHARS":        {browserMaxURLChars, 4096},
-		"MAX_PAGE_TEXT_CHARS":  {browserMaxPageTextChars, 20000},
-		"MAX_READ_ITEMS":       {browserMaxReadItems, 300},
-		"MAX_SCREENSHOT_BYTES": {browserMaxScreenshot, 8 * 1024 * 1024},
-		"MAX_RESULT_BYTES":     {browserMaxResultBytes, 1024 * 1024},
-		"COMMAND_TTL_MS":       {int(browserCommandTTL.Milliseconds()), 180000},
+		"MAX_PLAN_VALUES":        {browserMaxPlanValues, 100},
+		"MAX_VALUE_CHARS":        {browserMaxValueChars, 4000},
+		"MAX_LABEL_CHARS":        {browserMaxLabelChars, 300},
+		"MAX_URL_CHARS":          {browserMaxURLChars, 4096},
+		"MAX_PAGE_TEXT_CHARS":    {browserMaxPageTextChars, 20000},
+		"MAX_READ_ITEMS":         {browserMaxReadItems, 300},
+		"MAX_SCREENSHOT_BYTES":   {browserMaxScreenshot, 8 * 1024 * 1024},
+		"MAX_RESULT_BYTES":       {browserMaxResultBytes, 1024 * 1024},
+		"COMMAND_TTL_MS":         {int(browserCommandTTL.Milliseconds()), 180000},
+		"MAX_CURRENT_CANDIDATES": {browserMaxCurrentCandidates, 10},
+		"MAX_APP_ORIGIN_CHARS":   {browserMaxAppOriginChars, 200},
 	}
 	for name, v := range limits {
 		if v[0] != v[1] {
@@ -95,11 +106,13 @@ func TestBrowserContractPins(t *testing.T) {
 
 // capabilities.browserControl is what isBrowserControlCapable reads:
 // `supported === true` and a numeric protocol >= BROWSER_CONTROL_MIN_AGENT_PROTOCOL (1).
+// Protocol 2 is BROWSER_OP_MIN_AGENT_PROTOCOL.current: terminal-service sends
+// `current` only to an agent at 2 or above.
 func TestBrowserControlCapabilityShape(t *testing.T) {
 	for goos, want := range map[string]string{
-		"darwin":  `{"supported":true,"protocol":1,"routes":["devtools","applescript"]}`,
-		"windows": `{"supported":true,"protocol":1,"routes":["devtools"]}`,
-		"linux":   `{"supported":true,"protocol":1,"routes":["devtools"]}`,
+		"darwin":  `{"supported":true,"protocol":2,"routes":["devtools","applescript"]}`,
+		"windows": `{"supported":true,"protocol":2,"routes":["devtools"]}`,
+		"linux":   `{"supported":true,"protocol":2,"routes":["devtools"]}`,
 	} {
 		raw, _ := json.Marshal(&browserControlCapability{Supported: true, Protocol: browserAgentProtocol, Routes: browserRoutesFor(goos)})
 		if string(raw) != want {
@@ -108,7 +121,7 @@ func TestBrowserControlCapabilityShape(t *testing.T) {
 	}
 	// newMachineCapabilities carries it: systemInfo_capabilities_test.go pins
 	// the whole capabilities object, browserControl included.
-	if c := currentBrowserControlCapability(); !c.Supported || c.Protocol != 1 || c.Routes[0] != browserRouteDevTools {
+	if c := currentBrowserControlCapability(); !c.Supported || c.Protocol != 2 || c.Routes[0] != browserRouteDevTools {
 		t.Fatalf("%+v", c)
 	}
 }
@@ -139,9 +152,13 @@ func TestBrowserKitEmbedded(t *testing.T) {
 }
 
 // The DevTools allowlist is the narrowing of what Chrome grants: nothing that
-// reads cookies, storage or the network, nothing that closes a tab.
+// reads cookies, storage or the network, nothing that closes a tab. The only
+// Browser.* method is the read-only Browser.getVersion.
 func TestBrowserCDPAllowlist(t *testing.T) {
 	for m := range cdpAllowlist {
+		if m == "Browser.getVersion" {
+			continue
+		}
 		for _, banned := range []string{"Network.", "Storage.", "Browser.", "Cookie", "Target.closeTarget", "Runtime.callFunctionOn", "Page.setDownloadBehavior"} {
 			if strings.Contains(m, banned) {
 				t.Errorf("%s must not be allowed", m)
@@ -149,7 +166,8 @@ func TestBrowserCDPAllowlist(t *testing.T) {
 		}
 	}
 	for _, need := range []string{"Target.createTarget", "Page.navigate", "Page.navigateToHistoryEntry", "Page.getNavigationHistory",
-		"Page.reload", "Page.captureScreenshot", "Page.getLayoutMetrics", "Input.dispatchMouseEvent", "Runtime.evaluate"} {
+		"Page.reload", "Page.captureScreenshot", "Page.getLayoutMetrics", "Input.dispatchMouseEvent", "Runtime.evaluate",
+		"Target.setDiscoverTargets", "Browser.getVersion"} {
 		if !cdpAllowlist[need] {
 			t.Errorf("%s missing from the allowlist", need)
 		}
