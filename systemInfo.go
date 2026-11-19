@@ -189,9 +189,9 @@ type capabilitiesInfo struct {
 	ReadOnlySessions bool `json:"readOnlySessions"`
 	// CliSessionDiscovery (shared-constants CLI_SESSION_DISCOVERY_CAPABILITY):
 	// this build answers __cli_sessions_discover__ / __cli_session_probe__ for
-	// the listed engines (cli_session_discovery.go): Claude Code first, then
-	// each other engine whose reader this build has and whose CLI is
-	// installed here (newCliSessionDiscoveryCapability). terminal-service asks
+	// the listed engines (cli_session_discovery.go): every engine this build
+	// has a reader for, Claude Code first, installed here or not
+	// (newCliSessionDiscoveryCapability). terminal-service asks
 	// for an engine other than Claude Code only at `protocol` 3 or newer
 	// (CLI_SESSION_MULTI_ENGINE_PROTOCOL). Absent on an older agent, which
 	// terminal-service refuses with DISCOVERY_AGENT_TOO_OLD before publishing.

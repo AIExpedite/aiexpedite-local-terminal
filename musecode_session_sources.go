@@ -81,7 +81,6 @@ var museCodeInstalledLauncher = func() string {
 
 var museCodeSessionReader = &cliSessionReader{
 	engine:  cliSessionEngineMuseCode,
-	command: "muse",
 	sources: []string{cliSessionSourceMuseListing},
 	discover: func(ctx context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
 		return discoverMuseCodeSessions(ctx, req)

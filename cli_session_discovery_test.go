@@ -257,17 +257,17 @@ func TestDiscoverAndProbeAreInternalDemandCommands(t *testing.T) {
 // frame's agentId) and 3 (every engine with a reader, `engine` on every row)
 // are additive: terminal-service accepts any protocol at or above its own
 // CLI_SESSION_DISCOVERY_PROTOCOL (1), so older servers keep discovering
-// Claude Code through a newer agent. With no other agent installed the
-// capability is Claude Code's alone.
+// Claude Code through a newer agent: Claude Code stays the first engine
+// listed, and one that reads protocol 1-2 only takes that one
+// (cliSessionDiscoveryEnginesOf).
 func TestCapabilityAdvertisesClaudeDiscovery(t *testing.T) {
-	pinCliSessionEnginesInstalled(t)
 	caps := newMachineCapabilities()
 	if caps.CliSessionDiscovery == nil || caps.CliSessionDiscovery.Protocol != 3 ||
-		len(caps.CliSessionDiscovery.Engines) != 1 || caps.CliSessionDiscovery.Engines[0] != "claudeCode" {
+		len(caps.CliSessionDiscovery.Engines) == 0 || caps.CliSessionDiscovery.Engines[0] != "claudeCode" {
 		t.Fatalf("capability = %+v", caps.CliSessionDiscovery)
 	}
 	b, _ := json.Marshal(caps)
-	if !strings.Contains(string(b), `"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":3}`) {
+	if !strings.Contains(string(b), `"cliSessionDiscovery":{"engines":["claudeCode",`) || !strings.Contains(string(b), `],"protocol":3}`) {
 		t.Fatalf("wire shape: %s", b)
 	}
 }
@@ -779,21 +779,6 @@ func TestEditorWindowsAreReadNewestFirstBeforeTheCap(t *testing.T) {
 /* Protocol 3: the engine registry, one budget, per-engine truncation         */
 /* -------------------------------------------------------------------------- */
 
-// pinCliSessionEnginesInstalled reports exactly engines installed (Claude Code
-// is listed regardless) for the rest of the test.
-func pinCliSessionEnginesInstalled(t *testing.T, engines ...string) {
-	t.Helper()
-	cliSessionInstalledMu.Lock()
-	prev := cliSessionInstalled
-	cliSessionInstalled = func(r *cliSessionReader) bool { return r != nil && containsString(engines, r.engine) }
-	cliSessionInstalledMu.Unlock()
-	t.Cleanup(func() {
-		cliSessionInstalledMu.Lock()
-		cliSessionInstalled = prev
-		cliSessionInstalledMu.Unlock()
-	})
-}
-
 // standInReader replaces engine's reader (or adds one) for the rest of the test.
 func standInReader(t *testing.T, r *cliSessionReader) {
 	t.Helper()
@@ -841,7 +826,7 @@ func TestCliSessionEnginesAndSourcesMatchSharedConstants(t *testing.T) {
 	got := []string{}
 	for _, r := range cliSessionReaders {
 		got = append(got, r.engine)
-		if r.discover == nil || r.probe == nil || len(r.sources) == 0 || r.command == "" {
+		if r.discover == nil || r.probe == nil || len(r.sources) == 0 {
 			t.Errorf("%s: reader incomplete: %+v", r.engine, r)
 		}
 	}
@@ -868,17 +853,21 @@ func TestCliSessionEnginesAndSourcesMatchSharedConstants(t *testing.T) {
 	}
 }
 
-// Claude Code first and always; every other engine only while installed,
-// in the registry's order.
-func TestCapabilityListsInstalledEnginesClaudeFirst(t *testing.T) {
-	pinCliSessionEnginesInstalled(t, cliSessionEngineMuseCode, cliSessionEngineCodex)
+// Every engine this build has a reader for, Claude Code first, whether or not
+// its CLI is installed here (CONTRACT: `engines: [...six]`): terminal-service
+// answers "not installed" only for a listed engine, and reads one missing at
+// protocol 3 as an agent whose sessions this app cannot read at all. The PATH
+// here holds no agent's CLI, which must not shorten the list.
+func TestCapabilityListsEveryEngineClaudeFirst(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
 	got := newCliSessionDiscoveryCapability()
-	if strings.Join(got.Engines, ",") != "claudeCode,codex,museCode" || got.Protocol != 3 {
-		t.Fatalf("capability = %+v, want claudeCode,codex,museCode at 3", got)
+	want := `{"engines":["claudeCode","codex","grok","opencode","antigravity","museCode"],"protocol":3}`
+	if raw, _ := json.Marshal(got); string(raw) != want {
+		t.Fatalf("capability = %s, want %s", raw, want)
 	}
-	raw, _ := json.Marshal(got)
-	if string(raw) != `{"engines":["claudeCode","codex","museCode"],"protocol":3}` {
-		t.Fatalf("wire shape: %s", raw)
+	standInReader(t, &cliSessionReader{engine: "someNewAgent", sources: []string{"someStore"}})
+	if got := newCliSessionDiscoveryCapability(); got.Engines[len(got.Engines)-1] != "someNewAgent" || got.Engines[0] != cliSessionEngineClaudeCode {
+		t.Fatalf("capability = %+v, want every reader listed, Claude Code first", got)
 	}
 }
 
@@ -893,7 +882,7 @@ func TestDiscoverCommandDispatchesByEngine(t *testing.T) {
 	published := capturePublished(t)
 	var gotReq cliSessionDiscoverRequest
 	standInReader(t, &cliSessionReader{
-		engine: cliSessionEngineCodex, command: "codex", sources: []string{cliSessionSourceCodexStore},
+		engine: cliSessionEngineCodex, sources: []string{cliSessionSourceCodexStore},
 		discover: func(_ context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
 			gotReq = req
 			res := newCliSessionsResult("", req.now)
@@ -1039,7 +1028,7 @@ func TestProbeCommandDispatchesByEngine(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	standInReader(t, &cliSessionReader{
-		engine: cliSessionEngineMuseCode, command: "muse", sources: []string{cliSessionSourceMuseListing},
+		engine: cliSessionEngineMuseCode, sources: []string{cliSessionSourceMuseListing},
 		discover: func(context.Context, cliSessionDiscoverRequest) cliSessionsDiscoverResult {
 			return cliSessionsDiscoverResult{}
 		},

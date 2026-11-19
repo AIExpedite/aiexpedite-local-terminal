@@ -61,7 +61,6 @@ var openCodeSessionTables = []string{"session_v2", "session"}
 
 var openCodeSessionReader = &cliSessionReader{
 	engine:  cliSessionEngineOpenCode,
-	command: "opencode",
 	sources: []string{cliSessionSourceOpenCodeStore},
 	discover: func(ctx context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
 		return discoverOpenCodeSessions(ctx, openCodeStorageDir(), req)

@@ -36,7 +36,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
@@ -786,12 +785,6 @@ type cliSessionProbeRequest struct {
 // reports a source it could not read as skipped rather than guessing.
 type cliSessionReader struct {
 	engine string
-	// command is the agent's CLI, as the CLI Agents catalog names it: the
-	// capability lists the engine only while it is installed.
-	command string
-	// alwaysListed: the capability lists the engine whether or not its CLI is
-	// on PATH (Claude Code, see newCliSessionDiscoveryCapability).
-	alwaysListed bool
 	// sources are the sources discover reads, reported timed out when it
 	// never answers.
 	sources  []string
@@ -806,9 +799,7 @@ type cliSessionReader struct {
 // claudeSessionReader is Claude Code's reader: the sources above, as protocol
 // 2 read them.
 var claudeSessionReader = &cliSessionReader{
-	engine:       cliSessionEngineClaudeCode,
-	command:      "claude",
-	alwaysListed: true,
+	engine: cliSessionEngineClaudeCode,
 	sources: []string{
 		cliSessionSourceVSCode, cliSessionSourceVSCodeInsiders, cliSessionSourceCursor,
 		cliSessionSourceClaudeRegistry, cliSessionSourceClaudeStore,
@@ -844,45 +835,21 @@ func cliSessionReaderFor(engine string) *cliSessionReader {
 	return nil
 }
 
-// cliSessionEngineInstalled reports whether a reader's CLI is on this
-// computer, the way the CLI Agents card detects one (gatherCLIAgents): on
-// PATH, else in its installer's own bin directory. No version is probed.
-func cliSessionEngineInstalled(r *cliSessionReader) bool {
-	cliSessionInstalledMu.RLock()
-	installed := cliSessionInstalled
-	cliSessionInstalledMu.RUnlock()
-	return installed(r)
-}
-
-// cliSessionInstalled is cliSessionEngineInstalled's source, swappable by a
-// test under its lock (a machine-info gather reads it from another goroutine).
-var (
-	cliSessionInstalledMu sync.RWMutex
-	cliSessionInstalled   = func(r *cliSessionReader) bool {
-		if r == nil || r.command == "" {
-			return false
-		}
-		if _, err := exec.LookPath(r.command); err == nil {
-			return true
-		}
-		return resolveInstallerBinary(r.command, installerBinDirFor(r.command)) != ""
-	}
-)
-
 // newCliSessionDiscoveryCapability is capabilitiesInfo.CliSessionDiscovery:
-// Claude Code, then every other engine this build has a reader for whose CLI
-// is installed, at this build's protocol. Claude Code is listed whether or not
-// `claude` is on PATH, as it was before protocol 3: the VS Code extension runs
-// a Claude Code of its own that leaves sessions to find, and terminal-service
-// tells "not installed" (CLAUDE_NOT_INSTALLED, from the CLI Agents report)
-// from "this app is too old" (an engine missing here) itself. Read at every
-// machine-info gather.
+// every engine this build has a reader for, Claude Code first, at this
+// build's protocol, whether or not the agent's CLI is installed here (the
+// shared contract's six). terminal-service answers "not installed"
+// (CLAUDE_NOT_INSTALLED / AGENT_NOT_INSTALLED) from the CLI Agents report,
+// which its demand-driven refresh keeps current, but only for an engine
+// listed here: one missing from this list at protocol 3 reads as an agent
+// whose sessions this app cannot read at all (providerUnsupported), and this
+// list is gathered again only every machineInfoRefreshInterval, so a CLI
+// installed in between would read that way for hours. A reader whose agent is
+// missing still says so itself (Muse Code's `notInstalled`).
 func newCliSessionDiscoveryCapability() *cliSessionDiscoveryCapability {
-	engines := []string{}
+	engines := make([]string, 0, len(cliSessionReaders))
 	for _, r := range cliSessionReaders {
-		if r.alwaysListed || cliSessionEngineInstalled(r) {
-			engines = append(engines, r.engine)
-		}
+		engines = append(engines, r.engine)
 	}
 	return &cliSessionDiscoveryCapability{Engines: engines, Protocol: cliSessionDiscoveryProtocol}
 }

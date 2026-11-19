@@ -49,7 +49,6 @@ const (
 
 var antigravitySessionReader = &cliSessionReader{
 	engine:  cliSessionEngineAntigravity,
-	command: "agy",
 	sources: []string{cliSessionSourceAntigravityStore},
 	discover: func(ctx context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
 		return discoverAntigravitySessions(ctx, antigravityHomeBase(), req)

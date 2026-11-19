@@ -58,7 +58,6 @@ const (
 
 var codexSessionReader = &cliSessionReader{
 	engine:  cliSessionEngineCodex,
-	command: "codex",
 	sources: []string{cliSessionSourceCodexStore},
 	discover: func(ctx context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
 		return discoverCodexSessions(ctx, codexHomeBase(), req)

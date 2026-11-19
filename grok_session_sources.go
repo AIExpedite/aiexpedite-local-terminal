@@ -57,7 +57,6 @@ var grokSessionFiles = []string{"updates.jsonl", "chat_history.jsonl", "events.j
 
 var grokSessionReader = &cliSessionReader{
 	engine:  cliSessionEngineGrok,
-	command: "grok",
 	sources: []string{cliSessionSourceGrokStore},
 	discover: func(ctx context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
 		return discoverGrokSessions(ctx, grokPersistentHome(), req)
