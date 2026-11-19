@@ -401,10 +401,26 @@ func cliSessionOutsideWriterPoll(t cliOutsideWriterTarget) func() []cliSessionWr
 	}
 	var clock func() int64
 	if ev.storeClock != nil {
-		clock = ev.storeClock(t.sessionID)
+		clock = lastGoodStoreClock(ev.storeClock(t.sessionID))
 	}
 	return func() []cliSessionWriter {
 		return cliSessionOutsideWriters(ev, t.sessionID, clock, t.ownActiveAt, time.Now())
+	}
+}
+
+// lastGoodStoreClock keeps the newest store time a read returned: a read that
+// fails (0, unknown) answers the last good one, so one failed poll never turns
+// a busy session quiet — which, with the cloud's writer hold on, would release
+// a held message beside a writer still mid-turn. The session still goes quiet
+// once writerQuietMs passes after that last good write, as a quiet store does.
+func lastGoodStoreClock(read func() int64) func() int64 {
+	var last atomic.Int64
+	return func() int64 {
+		if ms := read(); ms > 0 {
+			last.Store(ms)
+			return ms
+		}
+		return last.Load()
 	}
 }
 

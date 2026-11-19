@@ -486,3 +486,34 @@ func TestOutsideWriterReplacesTheWatcherOfAnEndedSession(t *testing.T) {
 		t.Fatal("the new session's watcher was refused while the ended one unwound")
 	}
 }
+
+// A store read that fails (0) between two good ones must not read as quiet: the
+// last good write time stands until writerQuietMs passes, as a real quiet does.
+func TestLastGoodStoreClockSurvivesAFailedRead(t *testing.T) {
+	now := time.Now()
+	written := now.Add(-2 * time.Second).UnixMilli()
+	reads := []int64{written, 0}
+	i := 0
+	clock := lastGoodStoreClock(func() int64 {
+		v := reads[i]
+		if i < len(reads)-1 {
+			i++
+		}
+		return v
+	})
+	if got := clock(); got != written {
+		t.Fatalf("first read = %d, want %d", got, written)
+	}
+	if got := clock(); got != written {
+		t.Fatalf("failed read = %d, want the last good %d", got, written)
+	}
+	if !cliSessionStoreWrittenByOther(clock(), now, nil) {
+		t.Fatal("a failed read turned a session written 2 s ago quiet")
+	}
+	if cliSessionStoreWrittenByOther(clock(), now.Add(cliSessionWriterQuiet), nil) {
+		t.Fatal("the last good write must still go quiet after writerQuietMs")
+	}
+	if got := lastGoodStoreClock(func() int64 { return 0 })(); got != 0 {
+		t.Fatalf("never read = %d, want 0 (unknown)", got)
+	}
+}
