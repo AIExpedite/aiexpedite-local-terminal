@@ -359,3 +359,27 @@ func TestFenceRealPath_CycleFailsClosed(t *testing.T) {
 		t.Fatalf("a link cycle must not resolve")
 	}
 }
+
+// A fenced start that names ".." is refused unread, even one that reads as
+// inside the granted folder: POSIX resolves ".." after a link, Windows by name,
+// and the server never fences such a path.
+func TestRefuseCwdOutsideFence_ParentSegmentRefused(t *testing.T) {
+	base := resolvedTempDir(t)
+	fence := filepath.Join(base, "AIExpedite")
+	inside := filepath.Join(fence, "frontend")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	stillInside := fence + string(filepath.Separator) + "frontend" + string(filepath.Separator) + ".." + string(filepath.Separator) + "frontend"
+	if res := fenceRefusal(t, fence, stillInside); res == nil {
+		t.Fatalf("a fenced cwd naming .. must be refused: %s", stillInside)
+	} else if res.RejectionReason != cwdOutsideGrantFolderRejectionCode {
+		t.Fatalf("unexpected refusal %+v", *res)
+	}
+	if res := fenceRefusal(t, fence+string(filepath.Separator)+"..", inside); res == nil {
+		t.Fatalf("a fence naming .. must be refused")
+	}
+	if res := fenceRefusal(t, fence, inside); res != nil {
+		t.Fatalf("a plain sub-folder must be admitted: %+v", *res)
+	}
+}

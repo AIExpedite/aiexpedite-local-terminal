@@ -81,6 +81,14 @@ func TestRefuseCwdOutsideFence_WindowsJunctionEscape(t *testing.T) {
 	if res := fenceRefusal(t, fence, stay); res != nil {
 		t.Errorf("a junction that stays inside the granted folder must be admitted: %+v", *res)
 	}
+	// A folder reached THROUGH a junction that stays inside is admitted too
+	// (EvalSymlinks alone fails on such a path).
+	if err := os.MkdirAll(filepath.Join(frontend, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if res := fenceRefusal(t, fence, filepath.Join(stay, "src")); res != nil {
+		t.Errorf("a folder under a junction that stays inside must be admitted: %+v", *res)
+	}
 	// A junction whose name holds a rune whose low byte is a separator
 	// (U+015C -> 0x5C) is still found and refused.
 	tricky := filepath.Join(fence, "aŜlink")
@@ -96,5 +104,27 @@ func TestRefuseCwdOutsideFence_WindowsJunctionEscape(t *testing.T) {
 	}
 	if res := fenceRefusal(t, fenceJunction, other); res == nil {
 		t.Errorf("a fence spelled through a junction must still refuse a folder outside it")
+	}
+}
+
+// A junction cycle refuses rather than looping (junctions need no privilege,
+// so this runs where the symlink cycle test is skipped).
+func TestFenceRealPath_WindowsJunctionCycleFailsClosed(t *testing.T) {
+	base := resolvedTempDir(t)
+	a := filepath.Join(base, "a")
+	b := filepath.Join(base, "b")
+	if err := os.MkdirAll(b, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	makeJunction(t, a, b)
+	if err := os.Remove(b); err != nil {
+		t.Skipf("cannot replace the junction target: %v", err)
+	}
+	makeJunction(t, b, a)
+	if _, err := fenceRealPath(filepath.Join(a, "sub")); err == nil {
+		t.Fatalf("a junction cycle must not resolve")
+	}
+	if res := fenceRefusal(t, base, a); res == nil {
+		t.Fatalf("a start in a junction cycle must be refused")
 	}
 }
