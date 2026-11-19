@@ -130,15 +130,20 @@ type cdpLinkedTargets struct {
 	Pages []cdpTarget
 	// Active: page target id -> its tab's tabActive (only when Usable).
 	Active map[string]bool
-	// Usable: every window tab carries a boolean tabActive, every web page and
-	// every web tab is linked, and at least one tab is active. The schema has
-	// no window id, so the number of active tabs is not checked.
+	// Unlinked: web pages whose tab could not be told (two tabs on one URL).
+	// Nothing is assumed about them: the probe asks each one.
+	Unlinked map[string]bool
+	// Usable: every window tab carries a boolean tabActive and at least one
+	// linked tab is active. The schema has no window id, so the number of
+	// active tabs is not checked.
 	Usable bool
 }
 
 func linkTabTargets(infos []cdpTarget) cdpLinkedTargets {
-	out := cdpLinkedTargets{Active: map[string]bool{}}
-	notUsable := func() cdpLinkedTargets { return cdpLinkedTargets{Pages: out.Pages, Active: map[string]bool{}} }
+	out := cdpLinkedTargets{Active: map[string]bool{}, Unlinked: map[string]bool{}}
+	notUsable := func() cdpLinkedTargets {
+		return cdpLinkedTargets{Pages: out.Pages, Active: map[string]bool{}, Unlinked: map[string]bool{}}
+	}
 	tabs := map[string]cdpTarget{}
 	tabURLs := map[string]string{}
 	pages := map[string]cdpTarget{}
@@ -166,24 +171,19 @@ func linkTabTargets(infos []cdpTarget) cdpLinkedTargets {
 		if !ok {
 			return notUsable()
 		}
-		page, linked := pageOf[id]
-		if !linked {
-			if isBrowserHTTPURL(tab.URL) {
-				return notUsable()
-			}
-			continue
+		if page, linked := pageOf[id]; linked {
+			out.Active[page] = active
+			anyActive = anyActive || active
 		}
-		out.Active[page] = active
-		anyActive = anyActive || active
 	}
 	for _, p := range out.Pages {
 		if _, ok := tabOfPage[p.TargetID]; !ok && isBrowserHTTPURL(p.URL) {
-			return notUsable()
+			out.Unlinked[p.TargetID] = true
 		}
 	}
 	out.Usable = anyActive
 	if !out.Usable {
-		out.Active = map[string]bool{}
+		return notUsable()
 	}
 	return out
 }
@@ -268,8 +268,13 @@ func buildCDPFocusSnapshot(ctx context.Context, infos []cdpTarget, cheapOnly boo
 
 	if linked.Usable {
 		snap.Source = browserFocusSourceTabActive
+		// Each window's active page, and every page whose tab is not known.
 		var active []string
 		for _, id := range web {
+			if linked.Unlinked[id] {
+				active = append(active, id)
+				continue
+			}
 			a := linked.Active[id]
 			t := &snap.Tabs[index[id]]
 			t.Active = boolPtr(a)

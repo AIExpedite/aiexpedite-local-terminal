@@ -60,12 +60,8 @@ func TestLinkTabTargets(t *testing.T) {
 		"missing key":                   {tabTarget("T1", `{}`), pageTarget("P1", "T1", mailURL)},
 		"no embedderData":               {tabTarget("T1", ""), pageTarget("P1", "T1", mailURL)},
 		"non-boolean":                   {tabTarget("T1", `{"tabActive":1}`), pageTarget("P1", "T1", mailURL)},
-		"a web tab with no page": {tabTarget("T1", `{"tabActive":true}`), tabWithURL("T2", `{"tabActive":false}`, docsURL),
-			pageTarget("P1", "T1", mailURL)},
-		"two tabs on one URL (never guessed)": {tabWithURL("T1", `{"tabActive":true}`, mailURL), tabWithURL("T2", `{"tabActive":false}`, mailURL),
-			pageTarget("P1", "", mailURL), pageTarget("P2", "", mailURL)},
-		"a web page with no tab": {tabTarget("T1", `{"tabActive":true}`), pageTarget("P1", "T1", mailURL),
-			pageTarget("P2", "", docsURL)},
+		"only tabs on one shared URL (no linked tab is active)": {tabWithURL("T1", `{"tabActive":true}`, mailURL),
+			tabWithURL("T2", `{"tabActive":false}`, mailURL), pageTarget("P1", "", mailURL), pageTarget("P2", "", mailURL)},
 		"none active": {tabTarget("T1", `{"tabActive":false}`), pageTarget("P1", "T1", mailURL)},
 		"one tab of two without the key": {tabTarget("T1", `{"tabActive":true}`), tabTarget("T2", `{}`),
 			pageTarget("P1", "T1", mailURL), pageTarget("P2", "T2", docsURL)},
@@ -101,6 +97,41 @@ func TestLinkTabTargetsChrome157Shape(t *testing.T) {
 	}
 	if n, ok := countTabActive(infos); !ok || n != 2 {
 		t.Fatalf("windows %d %v (the extension tab is not a window tab)", n, ok)
+	}
+}
+
+// Tabs that cannot be linked (two on one URL) never make the snapshot fall back
+// to probing everything: those pages are probed, the rest still narrowed.
+func TestLinkTabTargetsKeepsNarrowingAroundUnlinkedPages(t *testing.T) {
+	fastProbe(t)
+	infos := []cdpTarget{
+		tabWithURL("TA", `{"tabActive":true}`, docsURL), pageTarget("PA", "", docsURL),
+		tabWithURL("TB", `{"tabActive":false}`, newsURL), pageTarget("PB", "", newsURL),
+		tabWithURL("T1", `{"tabActive":false}`, mailURL), pageTarget("P1", "", mailURL),
+		tabWithURL("T2", `{"tabActive":true}`, mailURL), pageTarget("P2", "", mailURL),
+		pageTarget("PX", "", "https://no-tab.example.com/"),
+	}
+	l := linkTabTargets(infos)
+	if !l.Usable || !l.Active["PA"] || l.Active["PB"] || !l.Unlinked["P1"] || !l.Unlinked["P2"] || !l.Unlinked["PX"] {
+		t.Fatalf("%+v", l)
+	}
+	p := &fakeProbe{answers: map[string][2]*bool{
+		"PA": {no(), yes()}, "P1": {no(), no()}, "P2": {yes(), yes()}, "PX": {no(), no()},
+	}}
+	snap, err := buildCDPFocusSnapshot(t.Context(), infos, false, p.probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked := p.askedSet()
+	if asked["PB"] || !asked["PA"] || !asked["P1"] || !asked["P2"] || !asked["PX"] {
+		t.Fatalf("probe the active and the unlinked pages only: %v", p.asked)
+	}
+	if snapTab(snap, "d:P1").Active != nil || snap.Source != browserFocusSourceTabActive || !snap.Complete {
+		t.Fatalf("an unlinked page carries no tabActive: %+v", snap)
+	}
+	res, berr := resolveCurrentPage(snap, "", nil)
+	if berr != nil || res.Tab.TabID != "d:P2" {
+		t.Fatalf("%+v %v", res, berr)
 	}
 }
 
