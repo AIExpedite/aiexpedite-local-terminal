@@ -15,14 +15,16 @@
 // this file only reports what each local source says.
 //
 // READ-ONLY by construction: every source is opened read-only (SQLite
-// `mode=ro`, plain os.Open on files) and nothing is ever written, locked or
-// renamed. No agent documents its session storage, so every reader parses
-// through an allowlist and reports a source it cannot read as skipped
-// (`unreadable` / `unrecognised` / `timeout`) rather than guessing; one bad
-// source never fails the request. Every reader shares the one budget
-// (cliSessionDiscoverBudget, cliSessionMaxRows): a scan the budget cuts short
-// answers what it read, marked `truncated`, and a reader that does not
-// answer at all is reported timed out instead of holding the answer.
+// `mode=ro`, and `immutable` unless its owner's write-ahead log is live,
+// cliSessionSQLiteDSN; plain os.Open on files) and nothing is ever written,
+// created, renamed or locked against its owner. No agent documents its
+// session storage, so every reader parses through an allowlist and reports a
+// source it cannot read as skipped (`unreadable` / `unrecognised` /
+// `timeout`) rather than guessing; one bad source never fails the request.
+// Every reader shares the one budget (cliSessionDiscoverBudget,
+// cliSessionMaxRows): a scan the budget cuts short answers what it read,
+// marked `truncated`, and a reader that does not answer at all is reported
+// timed out instead of holding the answer.
 //
 // Privacy: a row carries a title or a short, masked prompt-based fallback
 // label — never conversation content, tool output or file contents. Only the

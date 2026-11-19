@@ -1108,3 +1108,85 @@ func TestParseCliSessionTimeSpellings(t *testing.T) {
 		t.Fatal("unknown spellings read as 0, seconds and milliseconds both as ms")
 	}
 }
+
+// sqliteSideFiles lists what lies beside a store in its folder.
+func sqliteSideFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{}
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// Another program's SQLite store is read without leaving anything behind in
+// its folder: a WAL store whose owner is not running is read `immutable` (a
+// plain read-only open creates its -wal and -shm and leaves them there), and
+// one whose owner runs is read through the owner's live log, so the writes it
+// has not checkpointed yet are seen and its next write still goes through.
+func TestCliSessionSQLiteReadCreatesNothingBesideTheStore(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+	owner, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.SetMaxOpenConns(1)
+	for _, stmt := range []string{`PRAGMA journal_mode=WAL`, `CREATE TABLE t (v TEXT)`, `INSERT INTO t VALUES ('checkpointed')`} {
+		if _, err := owner.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The owner's last connection closes: SQLite checkpoints and removes the log.
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	count := func() int {
+		t.Helper()
+		db, err := openCliSessionSQLite(context.Background(), path)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer db.Close()
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM t`).Scan(&n); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return n
+	}
+	if got := sqliteSideFiles(t, dir); len(got) != 1 {
+		t.Fatalf("before the read the folder holds %v, want the store alone", got)
+	}
+	if n := count(); n != 1 {
+		t.Fatalf("read %d rows, want the checkpointed one", n)
+	}
+	if got := sqliteSideFiles(t, dir); len(got) != 1 || got[0] != "store.db" {
+		t.Fatalf("the read left %v in the owner's folder, want the store alone", got)
+	}
+
+	// The owner runs again and writes past its last checkpoint.
+	owner, err = sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.SetMaxOpenConns(1)
+	defer owner.Close()
+	for _, stmt := range []string{`PRAGMA wal_autocheckpoint=0`, `INSERT INTO t VALUES ('in the log')`} {
+		if _, err := owner.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !cliSessionSQLiteWALLive(path) {
+		t.Fatalf("the running owner's log is not live: %v", sqliteSideFiles(t, dir))
+	}
+	if n := count(); n != 2 {
+		t.Fatalf("read %d rows, want the row still only in the owner's log too", n)
+	}
+	if _, err := owner.Exec(`INSERT INTO t VALUES ('after the read')`); err != nil {
+		t.Fatalf("the owner's write after the read failed: %v", err)
+	}
+}

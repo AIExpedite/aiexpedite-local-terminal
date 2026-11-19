@@ -4,7 +4,7 @@
 // musecode_session_sources.go; the registry is cli_session_discovery.go):
 // the session id shape, the title precedence and its masked, capped labels,
 // the stores' timestamp spellings, a bounded head read of a JSONL file, and
-// a read-only SQLite open. Read-only.
+// a read-only SQLite open that never leaves a file behind. Read-only.
 package main
 
 import (
@@ -147,11 +147,38 @@ func parseCliSessionTimeRaw(raw json.RawMessage) int64 {
 }
 
 // cliSessionSQLiteDSN opens another program's SQLite store read-only
-// (mode=ro, query_only) with a short busy timeout. Unlike `immutable`, a store
-// in WAL mode is read with the writes its owner has not checkpointed yet; the
-// owner's own lock is never taken for writing.
+// (mode=ro, query_only, a short busy timeout) without creating, writing or
+// locking anything of its owner's:
+//
+//   - while the owner's write-ahead log is live beside the store (its -wal
+//     and -shm both exist: the owner runs in WAL mode), the store is read
+//     through that log, so the writes the owner has not checkpointed yet are
+//     seen. A WAL reader's lock never blocks the owner's writer, and a
+//     read-only connection never checkpoints;
+//   - otherwise the store is read `immutable`, as the editors' databases are
+//     (claude_session_sources_editor.go): no lock is taken, so a rollback-
+//     journal owner's commit never waits on a discovery. Without a live log
+//     the file holds every committed write, and a plain read-only open of a
+//     WAL store whose owner is not running would CREATE its -wal and -shm
+//     (SQLite opens them read-write to read through them) and leave both
+//     behind in the owner's folder.
 func cliSessionSQLiteDSN(path string) string {
-	return openCodeSQLiteReadOnlyDSN(path)
+	dsn := openCodeSQLiteReadOnlyDSN(path)
+	if !cliSessionSQLiteWALLive(path) {
+		dsn += "&immutable=1"
+	}
+	return dsn
+}
+
+// cliSessionSQLiteWALLive reports whether path's owner keeps a write-ahead log
+// beside it: both path-wal and path-shm are there.
+func cliSessionSQLiteWALLive(path string) bool {
+	for _, side := range []string{"-wal", "-shm"} {
+		if fi, err := os.Lstat(path + side); err != nil || !fi.Mode().IsRegular() {
+			return false
+		}
+	}
+	return true
 }
 
 // openCliSessionSQLite opens path read-only, one connection; nil and an error

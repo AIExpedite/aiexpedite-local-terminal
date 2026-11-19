@@ -23,7 +23,8 @@
 // newest time_updated wins), so neither family can hide the other's
 // sessions. A child session (parent_id) or an archived one is not listed.
 // OpenCode's own placeholder title ("New session - <date>") is no title.
-// Read-only (mode=ro, query_only).
+// Read-only: opencode.db through cliSessionSQLiteDSN (nothing created or
+// locked).
 package main
 
 import (

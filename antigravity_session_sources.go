@@ -22,7 +22,9 @@
 // so a title falls back to the newest of those prompts, and otherwise to
 // none: the conversation is still listed (by folder and recency) and never
 // given a title of the device's own making. Sub-conversations and internal
-// ones are not listed. Read-only; every SQLite store is opened mode=ro.
+// ones are not listed. Read-only: the one SQLite store opened, the summaries
+// database, is read through cliSessionSQLiteDSN (nothing created or locked);
+// a conversation's own database is only ever stat-ed.
 package main
 
 import (
