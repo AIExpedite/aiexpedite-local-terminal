@@ -116,6 +116,8 @@ func TestBrowserSmokeCurrent(t *testing.T) {
 		}
 	}
 
+	// "linux": the DevTools route on every OS, AppleScript included on a Mac
+	// (this matrix is about tabActive and the page probe).
 	choice, berr := chooseBrowserRoute(ctx, "linux", "", discoverChromeDevTools)
 	if berr != nil || choice.Route != browserRouteDevTools {
 		t.Fatalf("route: %+v %v", choice, berr)
