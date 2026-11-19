@@ -383,19 +383,32 @@ func (cn *cdpConn) attach(ctx context.Context, targetID string) (*cdpPage, error
 		return nil, err
 	}
 	pg := &cdpPage{conn: cn, targetID: targetID, sessionID: a.SessionID}
-	if err := pg.ensureWorld(ctx); err != nil && !isNotResponding(err) {
-		_ = cn.c.Call(ctx, "", "Target.detachFromTarget", map[string]any{"sessionId": a.SessionID}, nil)
+	// A page too slow to make the world in time (it is not responding, or the
+	// caller's own deadline ran out: the focus probe allows 1.5 s) keeps its
+	// session, so the next call reuses it instead of attaching another; Eval
+	// makes the world on first use.
+	if err := pg.ensureWorld(ctx); err != nil && !isNotResponding(err) && ctx.Err() == nil {
+		cn.detach(ctx, a.SessionID)
 		return nil, err
 	}
 	cn.mu.Lock()
 	if old := cn.pages[targetID]; old != nil && !old.detached.Load() {
 		cn.mu.Unlock()
-		_ = cn.c.Call(ctx, "", "Target.detachFromTarget", map[string]any{"sessionId": a.SessionID}, nil)
+		cn.detach(ctx, a.SessionID)
 		return old, nil
 	}
 	cn.pages[targetID] = pg
 	cn.mu.Unlock()
 	return pg, nil
+}
+
+// detach drops a session this connection does not keep. It runs on its own
+// short deadline: the caller's may already be over, and a session left
+// attached would stay for the connection's life.
+func (cn *cdpConn) detach(ctx context.Context, sessionID string) {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	_ = cn.c.Call(dctx, "", "Target.detachFromTarget", map[string]any{"sessionId": sessionID}, nil)
 }
 
 // ---------------------------------------------------------------- the manager

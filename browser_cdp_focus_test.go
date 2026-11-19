@@ -3,10 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 func tabTarget(id, embedder string) cdpTarget {
@@ -409,5 +414,58 @@ func TestBrowserCDPFocusAllowlist(t *testing.T) {
 	}
 	if browserMethods != 1 {
 		t.Fatalf("exactly one Browser.* method, got %d", browserMethods)
+	}
+}
+
+// A page too slow to make the kit's world within the probe's deadline keeps
+// its session: the next probe reuses it instead of attaching another, and no
+// detach is sent with an expired context.
+func TestCDPAttachKeepsASlowPagesSession(t *testing.T) {
+	var mu sync.Mutex
+	var methods []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		for {
+			_, data, err := c.Read(context.Background())
+			if err != nil {
+				return
+			}
+			var m struct {
+				ID     int64  `json:"id"`
+				Method string `json:"method"`
+			}
+			_ = json.Unmarshal(data, &m)
+			mu.Lock()
+			methods = append(methods, m.Method)
+			mu.Unlock()
+			if m.Method == "Target.attachToTarget" {
+				reply, _ := json.Marshal(map[string]any{"id": m.ID, "result": map[string]any{"sessionId": "S1"}})
+				_ = c.Write(context.Background(), websocket.MessageText, reply)
+			}
+			// Page.getFrameTree (the page's own call) is never answered.
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := dialCDP(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.close)
+	cn := &cdpConn{c: client, pages: map[string]*cdpPage{}}
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	pg, err := cn.attach(ctx, "P1")
+	if err != nil || pg == nil || cn.pages["P1"] != pg {
+		t.Fatalf("the session is kept for reuse: %v %v", pg, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, m := range methods {
+		if m == "Target.detachFromTarget" {
+			t.Fatalf("a kept session must not be detached: %v", methods)
+		}
 	}
 }

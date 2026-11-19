@@ -26,6 +26,7 @@
 package main
 
 import (
+	"errors"
 	"net/url"
 	"sort"
 	"strings"
@@ -54,7 +55,9 @@ type browserFocusSnapshot struct {
 	WindowOrderLast string
 }
 
-var errBrowserFocusNotCheap = browserErr(browserErrCommandInvalid, "this route cannot report focus cheaply")
+// errBrowserFocusNotCheap: FocusSnapshot(cheapOnly) would have to probe every
+// page; the tabs op lists them plainly instead. Never reported to the cloud.
+var errBrowserFocusNotCheap = errors.New("this route cannot report focus cheaply")
 
 // browserCurrentTab is a resolved or candidate page.
 type browserCurrentTab struct {
