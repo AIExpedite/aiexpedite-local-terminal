@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -365,6 +366,13 @@ func TestBrowserFocusMemory(t *testing.T) {
 	}
 	if browserFocusMemoryFor("k") != browserFocusMemoryFor("k") || browserFocusMemoryFor("k") == browserFocusMemoryFor("other") {
 		t.Fatal("one memory per Chrome instance")
+	}
+	first := browserFocusMemoryFor("instance-0")
+	for i := 1; i <= browserFocusMaxMemories; i++ {
+		browserFocusMemoryFor(fmt.Sprintf("instance-%d", i))
+	}
+	if len(browserFocusMemories) > browserFocusMaxMemories || browserFocusMemoryFor("instance-0") == first {
+		t.Fatal("restarted Chromes' memories are bounded; the oldest is forgotten")
 	}
 	var nilMem *browserFocusMemory
 	nilMem.record("d:a", t0, true)

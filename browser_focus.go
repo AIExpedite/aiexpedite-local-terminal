@@ -356,9 +356,14 @@ func (m *browserFocusMemory) recall(lookup func(tabID string) (known, app bool))
 	return e, false, false
 }
 
+// browserFocusMaxMemories bounds the Chrome instances remembered: a DevTools
+// endpoint is new each time Chrome restarts, so the oldest are forgotten.
+const browserFocusMaxMemories = 8
+
 var (
 	browserFocusMemoriesMu sync.Mutex
 	browserFocusMemories   = map[string]*browserFocusMemory{}
+	browserFocusKeys       []string // oldest first
 )
 
 // browserFocusMemoryFor returns the memory of one Chrome instance: keyed by its
@@ -366,10 +371,15 @@ var (
 func browserFocusMemoryFor(key string) *browserFocusMemory {
 	browserFocusMemoriesMu.Lock()
 	defer browserFocusMemoriesMu.Unlock()
-	m := browserFocusMemories[key]
-	if m == nil {
-		m = &browserFocusMemory{}
-		browserFocusMemories[key] = m
+	if m := browserFocusMemories[key]; m != nil {
+		return m
+	}
+	m := &browserFocusMemory{}
+	browserFocusMemories[key] = m
+	browserFocusKeys = append(browserFocusKeys, key)
+	for len(browserFocusKeys) > browserFocusMaxMemories {
+		delete(browserFocusMemories, browserFocusKeys[0])
+		browserFocusKeys = browserFocusKeys[1:]
 	}
 	return m
 }
