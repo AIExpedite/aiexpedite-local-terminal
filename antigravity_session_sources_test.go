@@ -48,6 +48,12 @@ func writeAntigravityJSON(t *testing.T, path string, v any) {
 	}
 }
 
+// antigravityFolderB is conversation B's folder in the fixture. It is built
+// under base so it is absolute on every OS: the reader keeps a folder from
+// last_conversations.json or history.jsonl only when it is absolute, and a
+// bare "/w/b" has no drive on Windows.
+func antigravityFolderB(base string) string { return filepath.Join(base, "w", "b") }
+
 func antigravityFixture(t *testing.T) (base string, now time.Time) {
 	t.Helper()
 	base = t.TempDir()
@@ -81,11 +87,13 @@ func antigravityFixture(t *testing.T) (base string, now time.Time) {
 		agC: map[string]any{"summary": map[string]any{"Title": "From the cache", "WorkspaceURIs": []string{"file:///w/c"}, "UpdatedAt": "2026-11-19T09:00:00.000000Z"}, "is_internal": false},
 		agE: map[string]any{"summary": map[string]any{"Title": "Internal"}, "is_internal": true},
 	}})
-	writeAntigravityJSON(t, filepath.Join(base, "cache", "last_conversations.json"), map[string]string{"/w/b": agB})
+	folderB := antigravityFolderB(base)
+	writeAntigravityJSON(t, filepath.Join(base, "cache", "last_conversations.json"), map[string]string{folderB: agB})
+	ws, _ := json.Marshal(folderB) // a Windows path's backslashes, escaped
 	history := strings.Join([]string{
-		`{"display":"first prompt for b","timestamp":1795000000000,"workspace":"/w/b","conversationId":"` + agB + `"}`,
-		`{"display":"/model","timestamp":1795000000001,"workspace":"/w/b","conversationId":"` + agB + `","type":"slash_command"}`,
-		`{"display":"latest prompt for b","timestamp":1795000000002,"workspace":"/w/b","conversationId":"` + agB + `"}`,
+		`{"display":"first prompt for b","timestamp":1795000000000,"workspace":` + string(ws) + `,"conversationId":"` + agB + `"}`,
+		`{"display":"/model","timestamp":1795000000001,"workspace":` + string(ws) + `,"conversationId":"` + agB + `","type":"slash_command"}`,
+		`{"display":"latest prompt for b","timestamp":1795000000002,"workspace":` + string(ws) + `,"conversationId":"` + agB + `"}`,
 		`{"display":"a prompt of no conversation","timestamp":1795000000003,"workspace":"/w/x"}`,
 	}, "\n")
 	if err := os.WriteFile(filepath.Join(base, "history.jsonl"), []byte(history+"\n"), 0o644); err != nil {
@@ -114,7 +122,7 @@ func TestAntigravityDiscoveryTitlesFallBack(t *testing.T) {
 	if a := byID[agA]; a.Title != "Fix the crash on startup" || a.TitleSource != cliSessionTitleSavedTitle || a.Cwd != filepath.FromSlash("/w/app") || !a.Resumable || a.TitleSavedAt == 0 {
 		t.Fatalf("A = %+v", a)
 	}
-	if b := byID[agB]; b.Title != "latest prompt for b" || b.TitleSource != cliSessionTitleLastPrompt || b.Cwd != "/w/b" {
+	if b := byID[agB]; b.Title != "latest prompt for b" || b.TitleSource != cliSessionTitleLastPrompt || b.Cwd != antigravityFolderB(base) {
 		t.Fatalf("B = %+v, want the newest prompt history names for it", b)
 	}
 	if c := byID[agC]; c.Title != "From the cache" || c.TitleSource != cliSessionTitleSavedTitle || c.Cwd != filepath.FromSlash("/w/c") {
