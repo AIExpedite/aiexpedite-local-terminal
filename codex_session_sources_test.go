@@ -234,3 +234,39 @@ func TestCodexWriterEvidenceReadsTheRolloutsWrites(t *testing.T) {
 		t.Fatal("a thread with no rollout has no write time")
 	}
 }
+
+// Rollouts are listed newest day first — every day, since a resumed thread
+// keeps appending to the rollout of the day it started — and a listing the
+// budget cuts short still answers the newest threads it listed (truncated):
+// the heads are read under the reader's own budget, not the listing's.
+func TestCodexListingIsNewestFirstAndACutListingStillAnswers(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	now := time.Now()
+	day := func(y int, m time.Month, d int) time.Time { return time.Date(y, m, d, 10, 0, 0, 0, time.Local) }
+	writeCodexSessionRollout(t, home, cxA, day(2026, 11, 19), now.Add(-time.Hour), nil, codexUserEvent("the newest day's thread"))
+	writeCodexSessionRollout(t, home, cxB, day(2026, 11, 2), now.Add(-2*time.Hour), nil, codexUserEvent("earlier this month"))
+	writeCodexSessionRollout(t, home, cxC, day(2025, 12, 31), now.Add(-30*time.Minute), nil, codexUserEvent("started last year, resumed today"))
+	pinCliSessionProcesses(t, func() []cliSessionProcess { return nil })
+
+	files, complete, err := listCodexRollouts(context.Background(), filepath.Join(home, "sessions"))
+	if err != nil || !complete || len(files) != 3 {
+		t.Fatalf("listing = %+v complete=%v err=%v, want all three", files, complete, err)
+	}
+	if files[0].threadID != cxA || files[1].threadID != cxB || files[2].threadID != cxC {
+		t.Fatalf("listing order = %s %s %s, want the newest day first", files[0].threadID, files[1].threadID, files[2].threadID)
+	}
+	full := discoverCodexSessions(context.Background(), home, newCliSessionDiscoverRequest(30, 500))
+	if len(full.Rows) != 3 || full.Rows[0].SessionID != cxC || full.Truncated {
+		t.Fatalf("full read = %+v, want all three, the one resumed today newest", full)
+	}
+
+	pinCliSessionListing(t, 1) // the listing's budget ends after the first day
+	cut := discoverCodexSessions(context.Background(), home, newCliSessionDiscoverRequest(30, 500))
+	if len(cut.Rows) != 1 || cut.Rows[0].SessionID != cxA || cut.Rows[0].Title != "the newest day's thread" {
+		t.Fatalf("cut listing rows = %+v, want the newest day's thread, read", cut.Rows)
+	}
+	if !cut.Truncated || skipReason(cut, cliSessionSourceCodexStore) != cliSessionSkipTimeout {
+		t.Fatalf("cut listing = %+v, want truncated and timed out", cut)
+	}
+}

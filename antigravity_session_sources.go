@@ -269,12 +269,15 @@ func discoverAntigravitySessions(ctx context.Context, base string, req cliSessio
 	}
 	res.SourcesChecked = append(res.SourcesChecked, src)
 	since := req.since().UnixMilli()
-	found, known, other := []antigravityConversation{}, 0, 0
+	// The conversations found are read under ctx itself: a listing cut short
+	// still answers the ones it found.
+	listCtx, cancelList := cliSessionListingContext(ctx)
+	defer cancelList()
+	found, known, other, timedOut := []antigravityConversation{}, 0, 0, false
 	for _, e := range entries {
-		if ctx.Err() != nil {
-			res.Truncated = true
-			res.skip(src, cliSessionSkipTimeout)
-			return res
+		if listCtx.Err() != nil {
+			timedOut = true
+			break
 		}
 		id, isDB := strings.CutSuffix(e.Name(), ".db")
 		if e.IsDir() || !isDB || !isCliSessionUUID(id) {
@@ -289,7 +292,7 @@ func discoverAntigravitySessions(ctx context.Context, base string, req cliSessio
 			found = append(found, antigravityConversation{id: id, modified: at})
 		}
 	}
-	if known == 0 && other > 0 {
+	if known == 0 && other > 0 && !timedOut {
 		// Files are there, none a conversation database this build knows.
 		res.skip(src, cliSessionSkipUnrecognised)
 		return res
@@ -299,8 +302,7 @@ func discoverAntigravitySessions(ctx context.Context, base string, req cliSessio
 	running := cliSessionRunningByID(antigravityWriterEvidence)
 	for _, c := range found {
 		if ctx.Err() != nil {
-			res.Truncated = true
-			res.skip(src, cliSessionSkipTimeout)
+			timedOut = true
 			break
 		}
 		e := meta.of(c.id)
@@ -321,6 +323,10 @@ func discoverAntigravitySessions(ctx context.Context, base string, req cliSessio
 		}
 		row.Title, row.TitleSource, row.TitleSavedAt = antigravityRowTitle(e)
 		res.Rows = append(res.Rows, row)
+	}
+	if timedOut {
+		res.Truncated = true
+		res.skip(src, cliSessionSkipTimeout)
 	}
 	return res
 }

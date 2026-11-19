@@ -1190,3 +1190,68 @@ func TestCliSessionSQLiteReadCreatesNothingBesideTheStore(t *testing.T) {
 		t.Fatalf("the owner's write after the read failed: %v", err)
 	}
 }
+
+// cutAfterContext is a listing budget that runs out after its first `left`
+// checks, whatever the clock says: a listing the budget cuts short, at a
+// place the test chooses.
+type cutAfterContext struct {
+	context.Context
+	left atomic.Int32
+}
+
+func (c *cutAfterContext) Err() error {
+	if c.left.Add(-1) < 0 {
+		return context.DeadlineExceeded
+	}
+	return c.Context.Err()
+}
+
+// pinCliSessionListing makes every store listing in the test run out after
+// `checks` budget checks; the reader's own budget is untouched.
+func pinCliSessionListing(t *testing.T, checks int32) {
+	t.Helper()
+	cliSessionListingContextMu.Lock()
+	prev := cliSessionListingContextOf
+	cliSessionListingContextOf = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		c := &cutAfterContext{Context: ctx}
+		c.left.Store(checks)
+		return c, func() {}
+	}
+	cliSessionListingContextMu.Unlock()
+	t.Cleanup(func() {
+		cliSessionListingContextMu.Lock()
+		cliSessionListingContextOf = prev
+		cliSessionListingContextMu.Unlock()
+	})
+}
+
+// A store's listing may use half of what is left of the reader's budget, so
+// a listing cut short still leaves time to read what it found; a reader with
+// no deadline lists under its own cancellation.
+func TestCliSessionListingContextEndsHalfwayThroughTheBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	listCtx, cancelList := cliSessionListingContext(ctx)
+	defer cancelList()
+	outer, _ := ctx.Deadline()
+	inner, ok := listCtx.Deadline()
+	if !ok {
+		t.Fatal("the listing has no deadline")
+	}
+	if left := time.Until(inner); left > 2100*time.Millisecond || left < 1500*time.Millisecond {
+		t.Fatalf("the listing ends in %v, want about half of the 4s budget", left)
+	}
+	if !inner.Before(outer) {
+		t.Fatalf("the listing ends at %v, not before the budget's %v", inner, outer)
+	}
+	bare, cancelBare := context.WithCancel(context.Background())
+	listBare, cancelListBare := cliSessionListingContext(bare)
+	defer cancelListBare()
+	if _, ok := listBare.Deadline(); ok {
+		t.Fatal("a listing under no deadline got one")
+	}
+	cancelBare()
+	if listBare.Err() == nil {
+		t.Fatal("the listing outlived its reader's cancellation")
+	}
+}

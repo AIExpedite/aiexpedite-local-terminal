@@ -103,32 +103,28 @@ type codexRolloutHead struct {
 	prompt     string
 }
 
-// listCodexRollouts lists every rollout under root (newest file per thread).
-// complete is false when ctx ended first.
+// listCodexRollouts lists every rollout under root (newest file per thread),
+// newest day first: os.ReadDir sorts by name, so Codex's zero-padded
+// YYYY/MM/DD layout read backwards is newest first (as the usage reader walks
+// it, cliagent_ratelimit_codex_rollout.go). Every day is listed — a thread a
+// person resumes keeps appending to the rollout of the day it started — but a
+// listing ctx cuts short has the newest days, not the oldest. complete is
+// false when ctx ended first.
 func listCodexRollouts(ctx context.Context, root string) (files []codexRolloutFile, complete bool, err error) {
 	years, err := os.ReadDir(root)
 	if err != nil {
 		return nil, false, err
 	}
 	newest := map[string]int{}
-	for _, y := range years {
-		if !y.IsDir() {
-			continue
-		}
-		months, _ := os.ReadDir(filepath.Join(root, y.Name()))
-		for _, m := range months {
-			if !m.IsDir() {
-				continue
-			}
-			days, _ := os.ReadDir(filepath.Join(root, y.Name(), m.Name()))
-			for _, d := range days {
+	for _, y := range codexDirNamesNewestFirst(years) {
+		months, _ := os.ReadDir(filepath.Join(root, y))
+		for _, m := range codexDirNamesNewestFirst(months) {
+			days, _ := os.ReadDir(filepath.Join(root, y, m))
+			for _, d := range codexDirNamesNewestFirst(days) {
 				if ctx.Err() != nil {
 					return files, false, nil
 				}
-				if !d.IsDir() {
-					continue
-				}
-				dir := filepath.Join(root, y.Name(), m.Name(), d.Name())
+				dir := filepath.Join(root, y, m, d)
 				entries, _ := os.ReadDir(dir)
 				for _, e := range entries {
 					id, ok := codexRolloutThreadID(e.Name())
@@ -153,6 +149,18 @@ func listCodexRollouts(ctx context.Context, root string) (files []codexRolloutFi
 		}
 	}
 	return files, ctx.Err() == nil, nil
+}
+
+// codexDirNamesNewestFirst is one date level's directory names, the newest
+// (the last by name) first.
+func codexDirNamesNewestFirst(entries []os.DirEntry) []string {
+	names := make([]string, 0, len(entries))
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].IsDir() {
+			names = append(names, entries[i].Name())
+		}
+	}
+	return names
 }
 
 // codexRolloutThreadID is the thread id a rollout's file name ends with.
@@ -345,7 +353,11 @@ func discoverCodexSessions(ctx context.Context, home string, req cliSessionDisco
 		}
 		return res
 	}
-	files, complete, err := listCodexRollouts(ctx, filepath.Join(home, "sessions"))
+	// The heads are read under ctx itself: a listing cut short still answers
+	// the newest threads it found.
+	listCtx, cancelList := cliSessionListingContext(ctx)
+	files, complete, err := listCodexRollouts(listCtx, filepath.Join(home, "sessions"))
+	cancelList()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			res.SourcesChecked = append(res.SourcesChecked, src) // no thread yet

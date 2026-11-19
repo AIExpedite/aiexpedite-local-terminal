@@ -185,3 +185,28 @@ func TestAntigravityProbeAndWriterEvidence(t *testing.T) {
 		t.Fatalf("written at %v, want the fresh -wal", time.UnixMilli(got))
 	}
 }
+
+// A listing the budget cuts short still answers the conversations it listed
+// (truncated), titled from the metadata read under the reader's own budget;
+// a cut listing is never taken for a store of no known conversation.
+func TestAntigravityListingCutShortStillAnswersWhatItListed(t *testing.T) {
+	base, _ := antigravityFixture(t)
+	pinCliSessionProcesses(t, func() []cliSessionProcess { return nil })
+	pinCliSessionListing(t, 2) // the listing's budget ends after A's and B's databases (by name)
+	res := discoverAntigravitySessions(context.Background(), base, newCliSessionDiscoverRequest(30, 500))
+	if len(res.Rows) != 2 || res.Rows[0].SessionID != agA || res.Rows[1].SessionID != agB || res.Rows[0].Title != "Fix the crash on startup" || res.Rows[1].Title != "latest prompt for b" {
+		t.Fatalf("cut listing rows = %+v, want A then B, titled", res.Rows)
+	}
+	if !res.Truncated || skipReason(res, cliSessionSourceAntigravityStore) != cliSessionSkipTimeout {
+		t.Fatalf("cut listing = %+v, want truncated and timed out", res)
+	}
+	// Cut after a file that is no conversation database (it sorts first): the
+	// store is not one of no known conversation, only one not listed in full.
+	if err := os.WriteFile(filepath.Join(base, "conversations", "0-notes.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pinCliSessionListing(t, 1)
+	if res := discoverAntigravitySessions(context.Background(), base, newCliSessionDiscoverRequest(30, 500)); skipReason(res, cliSessionSourceAntigravityStore) != cliSessionSkipTimeout || !res.Truncated {
+		t.Fatalf("a listing cut after an unknown file = %+v, want truncated and timed out, not unrecognised", res)
+	}
+}

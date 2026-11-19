@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -34,6 +35,32 @@ var errCliSessionUnrecognised = errors.New("unrecognised session record")
 var cliSessionUUIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 func isCliSessionUUID(id string) bool { return cliSessionUUIDPattern.MatchString(id) }
+
+// cliSessionListingContext is the context a reader lists its store under (the
+// rollouts, folders or databases it then reads): it ends halfway through what
+// is left of ctx, so a listing the budget cuts short still leaves the reader
+// time to read the sessions it did list, and the answer is those, marked
+// truncated, rather than none. Without a deadline on ctx the listing simply
+// shares its cancellation.
+func cliSessionListingContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	cliSessionListingContextMu.RLock()
+	derive := cliSessionListingContextOf
+	cliSessionListingContextMu.RUnlock()
+	return derive(ctx)
+}
+
+// cliSessionListingContextOf is cliSessionListingContext's source, swappable
+// by a test under its lock (a reader runs on its own goroutine).
+var (
+	cliSessionListingContextMu sync.RWMutex
+	cliSessionListingContextOf = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			return context.WithCancel(ctx)
+		}
+		return context.WithDeadline(ctx, deadline.Add(-time.Until(deadline)/2))
+	}
+)
 
 // cliSessionPromptLabel is a prompt as a fallback label: masked, one line,
 // cut to fallbackLabelMaxChars.

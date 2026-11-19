@@ -297,3 +297,18 @@ func TestPruneUnlinksAnExpiredAdoptedLinkAndKeepsItsFolder(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A listing the budget cuts short still answers the sessions it listed
+// (truncated): their folders are read under the reader's own budget.
+func TestGrokListingCutShortStillAnswersWhatItListed(t *testing.T) {
+	home, _ := grokFixture(t)
+	pinCliSessionProcesses(t, func() []cliSessionProcess { return nil })
+	pinCliSessionListing(t, 1) // the listing's budget ends after the first folder (/w/app)
+	res := discoverGrokSessions(context.Background(), home, newCliSessionDiscoverRequest(30, 500))
+	if len(res.Rows) != 1 || res.Rows[0].SessionID != gkS1 || res.Rows[0].Title != "Refactor the billing module" {
+		t.Fatalf("cut listing rows = %+v, want /w/app's session, read", res.Rows)
+	}
+	if !res.Truncated || skipReason(res, cliSessionSourceGrokStore) != cliSessionSkipTimeout {
+		t.Fatalf("cut listing = %+v, want truncated and timed out", res)
+	}
+}

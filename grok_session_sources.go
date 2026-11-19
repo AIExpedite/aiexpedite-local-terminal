@@ -273,7 +273,11 @@ func discoverGrokSessions(ctx context.Context, home string, req cliSessionDiscov
 		return res
 	}
 	root := filepath.Join(home, grokSessionsDirName)
-	folders, complete, err := listGrokSessionFolders(ctx, root)
+	// The folders are read under ctx itself: a listing cut short still
+	// answers the sessions it found.
+	listCtx, cancelList := cliSessionListingContext(ctx)
+	folders, complete, err := listGrokSessionFolders(listCtx, root)
+	cancelList()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			res.SourcesChecked = append(res.SourcesChecked, src) // no session yet
