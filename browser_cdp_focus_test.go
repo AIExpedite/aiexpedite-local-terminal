@@ -135,6 +135,44 @@ func TestLinkTabTargetsKeepsNarrowingAroundUnlinkedPages(t *testing.T) {
 	}
 }
 
+// A switch to a tab whose page cannot be told (two tabs on one URL) never lets
+// the memory answer with the tab the person left.
+func TestCDPDiscoveryUnresolvedSwitchEndsContinuity(t *testing.T) {
+	t0 := time.Now().Add(-time.Second)
+	mem := &browserFocusMemory{}
+	cn := &cdpConn{mem: mem}
+	ev := func(info cdpTarget) {
+		raw, _ := json.Marshal(map[string]any{"targetInfo": info})
+		cn.onEvent("Target.targetInfoChanged", "", raw)
+	}
+	for _, info := range []cdpTarget{
+		tabWithURL("TX", `{"tabActive":false}`, docsURL), pageTarget("PX", "", docsURL),
+		tabWithURL("TD1", `{"tabActive":false}`, mailURL), pageTarget("PD1", "", mailURL),
+		tabWithURL("TD2", `{"tabActive":true}`, mailURL), pageTarget("PD2", "", mailURL),
+		tabWithURL("TAPP", `{"tabActive":false}`, appURL), pageTarget("PAPP", "", appURL),
+	} {
+		ev(info)
+	}
+	cn.disc.started(t0, mem)
+	// X (recorded), then one of the two mail tabs (unlinkable), then the chat.
+	ev(tabWithURL("TD2", `{"tabActive":false}`, mailURL))
+	ev(tabWithURL("TX", `{"tabActive":true}`, docsURL))
+	if e, cont, ok := mem.recall(func(string) (bool, bool) { return true, false }); !ok || !cont || e.TabID != "d:PX" {
+		t.Fatalf("X is a recorded, continuous switch: %+v %v %v", e, cont, ok)
+	}
+	ev(tabWithURL("TX", `{"tabActive":false}`, docsURL))
+	ev(tabWithURL("TD1", `{"tabActive":true}`, mailURL))
+	if !cn.disc.unresolved() {
+		t.Fatal("the switch to a shared-URL tab is unresolved")
+	}
+	ev(tabWithURL("TD1", `{"tabActive":false}`, mailURL))
+	ev(tabWithURL("TAPP", `{"tabActive":true}`, appURL))
+	open := func(id string) (bool, bool) { return id != "", id == "d:PAPP" }
+	if e, cont, ok := mem.recall(open); ok && cont {
+		t.Fatalf("lastActive must not be %s: the person left it for a mail tab", e.TabID)
+	}
+}
+
 func TestParseFocusProbe(t *testing.T) {
 	cases := map[string][2]string{ // raw -> focused, visible ("t", "f", "")
 		`{"f":true,"v":"visible"}`:    {"t", "t"},

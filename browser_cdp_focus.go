@@ -341,8 +341,9 @@ func (cn *cdpConn) focusSnapshot(ctx context.Context, cheapOnly bool) (browserFo
 		}
 		r.TargetInfos = pages
 	}
-	if active, ok := countTabActive(r.TargetInfos); !ok || active != 1 {
-		// Not one window right now: what the memory holds may miss a switch.
+	if active, ok := countTabActive(r.TargetInfos); !ok || active != 1 || cn.disc.unresolved() {
+		// Not one window right now, or the latest switch went to a page that
+		// could not be told: what the memory holds may miss a switch.
 		cn.mem.interrupt()
 	}
 	snap, err := buildCDPFocusSnapshot(ctx, r.TargetInfos, cheapOnly, cn.probeFocus)
@@ -475,6 +476,12 @@ func (d *cdpDiscovery) target(t cdpTarget, at time.Time, mem *browserFocusMemory
 		d.tabActive[t.TargetID] = active
 		d.tabURL[t.TargetID] = t.URL
 		if d.on && active && (!had || !was) {
+			if d.pendingTab != "" && d.pendingTab != t.TargetID {
+				// The previous switch never reached the memory (its page could
+				// not be told): the memory's newest record is not where the
+				// person went, so it is not continuous any more.
+				mem.interrupt()
+			}
 			d.pendingTab, d.pendingAt = t.TargetID, at
 		}
 		d.resolvePendingLocked(mem)
@@ -499,6 +506,13 @@ func (d *cdpDiscovery) destroyed(targetID string, at time.Time, mem *browserFocu
 		d.pendingTab = ""
 	}
 	d.continuityLocked(at, mem)
+}
+
+// unresolved: the latest switch went to a tab whose page is not known yet.
+func (d *cdpDiscovery) unresolved() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.pendingTab != ""
 }
 
 // started marks the initial burst over: from now on, a flip is an activation.
