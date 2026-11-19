@@ -43,9 +43,15 @@
 // reconnect resumes them.
 //
 // Drain and shutdown: a WhatsApp link registers NO drain work source — it
-// must never hold up an agent update. Shutdown disconnects the clients,
+// must never hold up an agent update. (A confirmed send in flight does, for
+// at most one send and its report: its Pub/Sub callback is counted as
+// operational work, whatsapp_commands.go.) Shutdown disconnects the clients,
 // flushes what the deadline allows and leaves the session and the unflushed
 // outbox on disk for the next start.
+//
+// Sends: a confirmed text (whatsapp_send.go) goes out at most once per
+// proposal, decided by the link's durable send ledger, and its result is
+// reported under the generation of the runner holding the link.
 package main
 
 import (
@@ -79,12 +85,13 @@ const (
 	waErrSecureStorageUnavailable = "WHATSAPP_SECURE_STORAGE_UNAVAILABLE"
 	waErrLinkFenced               = "WHATSAPP_LINK_FENCED"
 
-	waSyncKindState     = "state"
-	waSyncKindHeartbeat = "heartbeat"
-	waSyncKindPairing   = "pairing"
-	waSyncKindBatch     = "batch"
-	waSyncKindAck       = "ack"
-	waAckUnlink         = "unlink"
+	waSyncKindState      = "state"
+	waSyncKindHeartbeat  = "heartbeat"
+	waSyncKindPairing    = "pairing"
+	waSyncKindBatch      = "batch"
+	waSyncKindAck        = "ack"
+	waSyncKindSendResult = "sendResult"
+	waAckUnlink          = "unlink"
 
 	waPairQR        = "qr"
 	waPairPhoneCode = "phoneCode"
@@ -172,6 +179,8 @@ type whatsAppSupervisor struct {
 	// still going (the process exits next); a test waits on it before
 	// tearing anything down under them.
 	runnersStopped chan struct{}
+	// sendLocks serializes the sends of one proposal (whatsapp_send.go).
+	sendLocks whatsAppSendLocks
 }
 
 var globalWhatsAppSupervisor = &whatsAppSupervisor{}
@@ -1025,6 +1034,77 @@ func (s *whatsAppSupervisor) resyncState(linkID string, generation int64) {
 	r.heartbeat()
 }
 
+// sendText routes one __whatsapp_send_text__ to the link's runner, which
+// sends it at most once (whatsapp_send.go), and reports the result. Sends of
+// one proposal are serialized. It returns once the result is reported, or
+// known to go unanswered. retry is true while the supervisor is paused
+// (disconnected from the cloud: nothing may be posted, so the command waits
+// for the resume, like a link start) or shutting down (the next start
+// answers it), when the command arrives or by the time its send is done, and
+// when the report of a ledger row got no final answer from the cloud (every
+// retry failed with a transport error, 429 or 5xx): redelivered, the row is
+// reported again. Every other outcome is final.
+func (s *whatsAppSupervisor) sendText(p whatsAppSendTextParams, ts int64) (retry bool) {
+	tag := whatsAppSendLogTag(p)
+	if s.isPaused() {
+		logWhatsApp(p.LinkID, tag+" deferred: disconnected from cloud")
+		return true
+	}
+	if s.stopping() {
+		logWhatsApp(p.LinkID, tag+" deferred: agent shutting down")
+		return true
+	}
+	// No answer for a link this computer does not hold, or for a generation
+	// newer than the one it holds: the device is behind (the link start has
+	// not reached it), and a report under its own generation would fence it.
+	r := s.runner(p.LinkID)
+	if r == nil {
+		logWhatsApp(p.LinkID, tag+" not answered: this computer does not hold the link")
+		return false
+	}
+	if p.Generation > r.generationNow() {
+		r.log(tag + " not answered: the command is for a newer generation than this computer holds")
+		return false
+	}
+	unlock := s.sendLocks.lock(p.ProposalID)
+	res, answer := r.sendText(p, ts)
+	unlock()
+	if answer {
+		if undelivered := s.reportSendResult(p, res); undelivered && res.Recorded {
+			// Acked now, the message would read unknown however it went, and
+			// nothing would report its row again; redelivered, the ledger
+			// answers it without sending. A refusal without a row is acked:
+			// its report may have reached the cloud with only the answer
+			// lost, and a redelivery, decided afresh, might then send a
+			// message the cloud already called failed.
+			logWhatsApp(p.LinkID, tag+" result not delivered: left unacked for a redelivery, which reports the recorded outcome")
+			return true
+		}
+	}
+	// A pause (the tray pauses at once and stops the links after) or a
+	// shutdown that began during the send kept its result from the cloud:
+	// nothing is posted while paused, shutdown cancels the posts, and either
+	// may close the stores under the send. Acked now, the message would read
+	// unknown however it went; redelivered, the ledger answers it.
+	return s.isPaused() || s.stopping()
+}
+
+// reportSendResult posts a send's result through the runner holding the link
+// NOW, under that runner's generation: the front door fences the post on the
+// generation, and whatsapp-service then applies the result by proposal id
+// and attempt, whatever generation the proposal was made at. A link this
+// computer no longer holds gets no report. undelivered is true when the report
+// got no final answer from the cloud (postControl), which a redelivery of the
+// command could still bring.
+func (s *whatsAppSupervisor) reportSendResult(p whatsAppSendTextParams, res whatsAppSendResult) (undelivered bool) {
+	r := s.runner(p.LinkID)
+	if r == nil {
+		logWhatsApp(p.LinkID, whatsAppSendLogTag(p)+" result not reported: this computer no longer holds the link")
+		return false
+	}
+	return !r.postControl(res.payload(p, r.generationNow()))
+}
+
 // ShutdownAll disconnects every client and flushes the outboxes within ctx's
 // deadline (capped at whatsAppUpdateDrainFlush). Files stay on disk. It never
 // outlasts ctx's deadline (Windows gives the whole shutdown 2–4 s, and the
@@ -1268,10 +1348,16 @@ type whatsAppCapability struct {
 	Supported     bool `json:"supported"`
 	SecureStorage bool `json:"secureStorage"`
 	Protocol      int  `json:"protocol"`
+	// SendText: this build runs __whatsapp_send_text__ (whatsapp_send.go).
+	// terminal-service publishes a send only to a computer reporting it
+	// (shared-constants isWhatsAppSendCapable); an older agent would read the
+	// unknown command as a shell command. Never omitempty: a build that
+	// reports false must not read as one too old to say.
+	SendText bool `json:"sendText"`
 }
 
 func currentWhatsAppCapability() *whatsAppCapability {
-	return &whatsAppCapability{Supported: true, SecureStorage: whatsAppSecureStorageAvailable(), Protocol: whatsAppAgentProtocol}
+	return &whatsAppCapability{Supported: true, SecureStorage: whatsAppSecureStorageAvailable(), Protocol: whatsAppAgentProtocol, SendText: true}
 }
 
 /* --------------------------------------------------------------------------
@@ -1924,9 +2010,26 @@ func (r *whatsAppLinkRunner) completeHistory() {
 }
 
 func (r *whatsAppLinkRunner) onLiveMessage(evt *events.Message) {
-	records := normalizeWhatsAppMessage(evt, waSourceLive, r.normalizeContext())
+	name := ""
+	if !evt.Info.IsGroup && !evt.Info.IsFromMe {
+		name = evt.Info.PushName
+	}
+	r.appendLiveMessage(normalizeWhatsAppMessage(evt, waSourceLive, r.normalizeContext()), evt.Info.IsGroup, name)
+}
+
+// appendLiveMessage stores one live message's records, announcing the chat
+// the first time this runner sees it live (withConversationRecord).
+func (r *whatsAppLinkRunner) appendLiveMessage(records []whatsAppRecord, isGroup bool, name string) {
+	r.appendLive(r.withConversationRecord(records, isGroup, name))
+}
+
+// withConversationRecord is one live message's records, led by the record
+// announcing its chat (with name, for a direct chat whose peer wrote) the
+// first time this runner sees the chat live. A text this computer sent itself
+// is queued this way too (whatsapp_send.go).
+func (r *whatsAppLinkRunner) withConversationRecord(records []whatsAppRecord, isGroup bool, name string) []whatsAppRecord {
 	if len(records) == 0 {
-		return
+		return records
 	}
 	chat := records[0].ChatJid
 	r.mu.Lock()
@@ -1934,14 +2037,10 @@ func (r *whatsAppLinkRunner) onLiveMessage(evt *events.Message) {
 	r.seenChats[chat] = true
 	r.mu.Unlock()
 	if first {
-		name := ""
-		if !evt.Info.IsGroup && !evt.Info.IsFromMe {
-			name = evt.Info.PushName
-		}
-		conv := whatsAppConversationRecord(chat, evt.Info.IsGroup, name)
+		conv := whatsAppConversationRecord(chat, isGroup, name)
 		records = append([]whatsAppRecord{conv}, records...)
 	}
-	r.appendLive(records)
+	return records
 }
 
 func (r *whatsAppLinkRunner) appendLive(records []whatsAppRecord) {
@@ -1958,6 +2057,12 @@ func (r *whatsAppLinkRunner) appendLive(records []whatsAppRecord) {
 		r.log("live message not stored: " + err.Error())
 		return
 	}
+	r.liveAppended(records)
+}
+
+// liveAppended counts live records just stored in the outbox and wakes the
+// uploader for them.
+func (r *whatsAppLinkRunner) liveAppended(records []whatsAppRecord) {
 	r.mu.Lock()
 	r.liveSynced += int64(countWhatsAppMessages(records))
 	r.mu.Unlock()
@@ -2263,21 +2368,25 @@ func (r *whatsAppLinkRunner) reportState(extra map[string]any) {
 }
 
 // postControl sends a non-batch report with a few retries. 409 fences.
-func (r *whatsAppLinkRunner) postControl(payload map[string]any) {
+// answered is whether the cloud gave the report a final answer: accepted,
+// fenced (409) or refused (400, 401, 403). It is false when every attempt
+// failed with a transport error, 429 or 5xx, or a pause or a shutdown cut
+// the attempts short.
+func (r *whatsAppLinkRunner) postControl(payload map[string]any) (answered bool) {
 	for attempt := 0; attempt < whatsAppControlAttempts; attempt++ {
 		if r.sup.isPaused() {
-			return
+			return false
 		}
 		res := r.sup.transport.Post(r.sup.ctx, payload)
 		switch {
 		case res.Status/100 == 2:
-			return
+			return true
 		case res.Status == 409:
 			r.fence()
-			return
+			return true
 		case res.Status == 400 || res.Status == 401 || res.Status == 403:
 			r.log("report refused: " + res.Body.Code)
-			return
+			return true
 		}
 		wait := backoffWithJitter(attempt, whatsAppUploadBackoffMin, 30*time.Second)
 		if res.RetryAfter > wait {
@@ -2285,10 +2394,11 @@ func (r *whatsAppLinkRunner) postControl(payload map[string]any) {
 		}
 		select {
 		case <-r.sup.ctx.Done():
-			return
+			return false
 		case <-time.After(wait):
 		}
 	}
+	return false
 }
 
 func (r *whatsAppLinkRunner) heartbeat() {

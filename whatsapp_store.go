@@ -4,7 +4,9 @@
 //	<ConfigDir>/whatsapp/links.json           which links are loaded (no secrets)
 //	<ConfigDir>/whatsapp/<linkId>/session.db  whatsmeow sqlstore (Signal keys)
 //	<ConfigDir>/whatsapp/<linkId>/outbox.db   not-yet-uploaded records and the
-//	                                          link's identity table, AES-GCM
+//	                                          link's identity table, AES-GCM;
+//	                                          its send ledger (ids and outcomes
+//	                                          only, unsealed)
 //
 // session.db belongs to one generation (one pairing) and is wiped when that
 // session ends (wipeWhatsAppSessionFiles); outbox.db and its key belong to

@@ -202,9 +202,17 @@ func makeRejectionResult(cmd commandMsg, agentID, status, reason, output string)
 // path already redacts it via redactGrokACPArgsForLog. Route grok_acp_start
 // rejections through the same family-specific masker so the dialog and
 // rejection paths agree; everything else falls back to redactArgs.
+//
+// A WhatsApp command's one argument (whatsapp_commands.go) is the person's
+// own data — a confirmed message and its chat, a phone number, the browser's
+// pairing key — which no pattern-based redaction can tell apart, so none of
+// it is echoed. The command name still is.
 func redactRejectionArgs(cmd commandMsg) []string {
 	if cmd.Type == "grok_acp_start" {
 		return redactGrokACPArgsForLog(cmd.Args)
+	}
+	if isWhatsAppCommand(cmd.Command) {
+		return []string{}
 	}
 	return redactArgs(cmd.Args)
 }
@@ -1132,7 +1140,8 @@ func pubSubMessageSizeLimit(cmd commandMsg) int {
 
 // isInternalDemandCommand reports whether cmd is a server-internal, read-only
 // demand command (CLI-usage refresh, environment inspection, a CLI smoke
-// probe, or a WhatsApp link command — whatsapp_commands.go). These are exempt from staleness and rate-limiting because they are
+// probe, or a WhatsApp command — whatsapp_commands.go, whose confirmed send
+// applies the staleness rule itself). These are exempt from staleness and rate-limiting because they are
 // dispatched by the backend's own state machines (not the LLM) and MUST always
 // run so the correlated result clears the backend's in-flight / pending marker.
 func isInternalDemandCommand(command string) bool {
@@ -2590,13 +2599,33 @@ func runPubSubConnection(cfg *Config) error {
 		}
 
 		if isWhatsAppCommand(cmd.Command) {
-			// Personal WhatsApp link commands (whatsapp_commands.go). The
+			// Personal WhatsApp commands (whatsapp_commands.go). The
 			// device reports back over POST /device/:agentId/whatsapp/sync,
 			// so nothing is published here. A link start is acked only once
 			// its runner is persisted and pairing has begun (a crash before
-			// that redelivers it); the others once the supervisor has them.
-			// A link start that lands before a reconnect clears the pause is
-			// nacked so it is redelivered rather than dropped.
+			// that redelivers it), a confirmed send once its outcome is
+			// recorded and reported (whatsapp_send.go); the others once the
+			// supervisor has them. A link start or a send that lands before a
+			// reconnect clears the pause is nacked so it is redelivered rather
+			// than dropped.
+			//
+			// A send acts for the person in their own WhatsApp, so like a
+			// worktree or browser command it never runs unsigned (its result
+			// could not be signed either): refused when this agent holds no
+			// command secret.
+			if cmd.Command == whatsAppSendTextCommand && cfg.CommandSecret == "" {
+				logWhatsApp("-", "send refused: this agent has no command secret, so the command is unauthenticated")
+				m.Ack()
+				return
+			}
+			// Only terminal-service's WhatsApp front door publishes these
+			// (isWhatsAppFrontDoorCommand); one from a generic command path is
+			// dropped, never retried.
+			if !isWhatsAppFrontDoorCommand(cmd) {
+				logWhatsApp("-", "command "+cmd.Command+" refused: not published by the WhatsApp front door")
+				m.Ack()
+				return
+			}
 			if handleWhatsAppCommand(cmd) {
 				m.Ack()
 			} else {

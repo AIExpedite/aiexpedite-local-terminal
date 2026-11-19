@@ -72,7 +72,7 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			if caps.WhatsApp == nil || !caps.WhatsApp.Supported {
 				t.Fatalf("caps = %+v, want the WhatsApp capability reported", *caps)
 			}
-			waRaw, _ := json.Marshal(&whatsAppCapability{Supported: true, SecureStorage: caps.WhatsApp.SecureStorage, Protocol: 2})
+			waRaw, _ := json.Marshal(&whatsAppCapability{Supported: true, SecureStorage: caps.WhatsApp.SecureStorage, Protocol: 2, SendText: true})
 			// browserControl's routes depend on the OS (applescript on macOS
 			// only); browser_contract_test.go pins both lists.
 			bcRaw, _ := json.Marshal(&browserControlCapability{Supported: true, Protocol: 1, Routes: browserRoutesFor(runtime.GOOS)})
@@ -83,7 +83,8 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// with the signed-executionId device half, `signedCommandExpiry` with
 			// the signed worktree delivery window, `whatsapp` with the
 			// WhatsApp bridge, and its `protocol` (2) with sticky identities and
-			// the re-link carry-over; `cliSessionDiscovery` with finding and
+			// the re-link carry-over, and its `sendText` with the confirmed
+			// send (whatsapp_send.go); `cliSessionDiscovery` with finding and
 			// adopting coding-agent sessions AI Expedite did not start, and its
 			// `protocol` (2) with startedVia / lastVia, the partial scan kept at
 			// the deadline and the outside-writer frame naming the agent;
