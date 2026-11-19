@@ -462,7 +462,11 @@ func (d *cdpDiscovery) target(t cdpTarget, at time.Time, mem *browserFocusMemory
 	switch {
 	case t.Type == "page":
 		d.pages[t.TargetID] = t
-		d.resolvePendingLocked(mem)
+		// Only a page that could be the pending tab's is worth a new match:
+		// title and load updates of every other page stay O(1).
+		if d.pendingTab != "" && (t.ParentID == d.pendingTab || t.URL == d.tabURL[d.pendingTab]) {
+			d.resolvePendingLocked(mem)
+		}
 		d.continuityLocked(at, mem)
 	case isWindowTab(t):
 		active, ok := embedderTabActive(t.EmbedderData)
