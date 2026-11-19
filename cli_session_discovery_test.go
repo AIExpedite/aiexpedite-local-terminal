@@ -8,9 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
+
+	"cloud.google.com/go/pubsub/v2"
 )
 
 const (
@@ -250,17 +254,20 @@ func TestDiscoverAndProbeAreInternalDemandCommands(t *testing.T) {
 }
 
 // Protocol 2 (startedVia / lastVia, the partial scan, the outside-writer
-// frame's agentId) is additive: terminal-service accepts any protocol at or
-// above its own CLI_SESSION_DISCOVERY_PROTOCOL (1), so older servers keep
-// discovering through a newer agent.
+// frame's agentId) and 3 (every engine with a reader, `engine` on every row)
+// are additive: terminal-service accepts any protocol at or above its own
+// CLI_SESSION_DISCOVERY_PROTOCOL (1), so older servers keep discovering
+// Claude Code through a newer agent. With no other agent installed the
+// capability is Claude Code's alone.
 func TestCapabilityAdvertisesClaudeDiscovery(t *testing.T) {
+	pinCliSessionEnginesInstalled(t)
 	caps := newMachineCapabilities()
-	if caps.CliSessionDiscovery == nil || caps.CliSessionDiscovery.Protocol != 2 ||
+	if caps.CliSessionDiscovery == nil || caps.CliSessionDiscovery.Protocol != 3 ||
 		len(caps.CliSessionDiscovery.Engines) != 1 || caps.CliSessionDiscovery.Engines[0] != "claudeCode" {
 		t.Fatalf("capability = %+v", caps.CliSessionDiscovery)
 	}
 	b, _ := json.Marshal(caps)
-	if !strings.Contains(string(b), `"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2}`) {
+	if !strings.Contains(string(b), `"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":3}`) {
 		t.Fatalf("wire shape: %s", b)
 	}
 }
@@ -765,5 +772,339 @@ func TestEditorWindowsAreReadNewestFirstBeforeTheCap(t *testing.T) {
 		if tab.SessionID == sidC && now.Sub(time.UnixMilli(tab.SeenAt)) > 2*time.Minute {
 			t.Fatalf("seenAt = %v, want the window's own last write", time.UnixMilli(tab.SeenAt))
 		}
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/* Protocol 3: the engine registry, one budget, per-engine truncation         */
+/* -------------------------------------------------------------------------- */
+
+// pinCliSessionEnginesInstalled reports exactly engines installed (Claude Code
+// is listed regardless) for the rest of the test.
+func pinCliSessionEnginesInstalled(t *testing.T, engines ...string) {
+	t.Helper()
+	cliSessionInstalledMu.Lock()
+	prev := cliSessionInstalled
+	cliSessionInstalled = func(r *cliSessionReader) bool { return r != nil && containsString(engines, r.engine) }
+	cliSessionInstalledMu.Unlock()
+	t.Cleanup(func() {
+		cliSessionInstalledMu.Lock()
+		cliSessionInstalled = prev
+		cliSessionInstalledMu.Unlock()
+	})
+}
+
+// standInReader replaces engine's reader (or adds one) for the rest of the test.
+func standInReader(t *testing.T, r *cliSessionReader) {
+	t.Helper()
+	prev := cliSessionReaders
+	next := []*cliSessionReader{}
+	replaced := false
+	for _, existing := range prev {
+		if existing.engine == r.engine {
+			next, replaced = append(next, r), true
+			continue
+		}
+		next = append(next, existing)
+	}
+	if !replaced {
+		next = append(next, r)
+	}
+	cliSessionReaders = next
+	t.Cleanup(func() { cliSessionReaders = prev })
+}
+
+// capturePublished records every result a handler publishes.
+func capturePublished(t *testing.T) func() []resultMsg {
+	t.Helper()
+	var mu sync.Mutex
+	var got []resultMsg
+	prev := publishMsg
+	publishMsg = func(_ context.Context, _ *pubsub.Publisher, res resultMsg) error {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, res)
+		return nil
+	}
+	t.Cleanup(func() { publishMsg = prev })
+	return func() []resultMsg {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]resultMsg(nil), got...)
+	}
+}
+
+// The wire values are shared-constants CLI_SESSION_ENGINES / CLI_SESSION_SOURCES
+// (cliSessionDiscovery.js): a contract pin, so a rename fails here.
+func TestCliSessionEnginesAndSourcesMatchSharedConstants(t *testing.T) {
+	want := []string{"claudeCode", "codex", "grok", "opencode", "antigravity", "museCode"}
+	got := []string{}
+	for _, r := range cliSessionReaders {
+		got = append(got, r.engine)
+		if r.discover == nil || r.probe == nil || len(r.sources) == 0 || r.command == "" {
+			t.Errorf("%s: reader incomplete: %+v", r.engine, r)
+		}
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("registry engines = %v, want %v (Claude Code first)", got, want)
+	}
+	sources := map[string]string{
+		cliSessionSourceCodexStore:       "codexStore",
+		cliSessionSourceGrokStore:        "grokStore",
+		cliSessionSourceAntigravityStore: "antigravityStore",
+		cliSessionSourceOpenCodeStore:    "opencodeStore",
+		cliSessionSourceMuseListing:      "museListing",
+	}
+	for got, want := range sources {
+		if got != want {
+			t.Errorf("source %q, want %q", got, want)
+		}
+	}
+	if cliSessionDiscoveryProtocol != 3 {
+		t.Fatalf("protocol = %d, want shared-constants CLI_SESSION_MULTI_ENGINE_PROTOCOL (3)", cliSessionDiscoveryProtocol)
+	}
+	if cliSessionErrProviderUnsupported != "providerUnsupported" || cliSessionErrNotInstalled != "notInstalled" {
+		t.Fatal("error codes must spell shared-constants CLI_SESSION_DISCOVERY_STATUS_REASONS")
+	}
+}
+
+// Claude Code first and always; every other engine only while installed,
+// in the registry's order.
+func TestCapabilityListsInstalledEnginesClaudeFirst(t *testing.T) {
+	pinCliSessionEnginesInstalled(t, cliSessionEngineMuseCode, cliSessionEngineCodex)
+	got := newCliSessionDiscoveryCapability()
+	if strings.Join(got.Engines, ",") != "claudeCode,codex,museCode" || got.Protocol != 3 {
+		t.Fatalf("capability = %+v, want claudeCode,codex,museCode at 3", got)
+	}
+	raw, _ := json.Marshal(got)
+	if string(raw) != `{"engines":["claudeCode","codex","museCode"],"protocol":3}` {
+		t.Fatalf("wire shape: %s", raw)
+	}
+}
+
+func discoverCmd(args ...string) commandMsg {
+	return commandMsg{ID: "c1", WorkspaceID: "ws", UID: "u1", AgentID: "agent-1", RefreshID: "req-123456", Command: cliSessionsDiscoverCommand, Args: args}
+}
+
+// One command asks for one engine, answered by that engine's reader; every
+// row leaves stamped with the engine, and an engine without a reader is
+// refused as before.
+func TestDiscoverCommandDispatchesByEngine(t *testing.T) {
+	published := capturePublished(t)
+	var gotReq cliSessionDiscoverRequest
+	standInReader(t, &cliSessionReader{
+		engine: cliSessionEngineCodex, command: "codex", sources: []string{cliSessionSourceCodexStore},
+		discover: func(_ context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+			gotReq = req
+			res := newCliSessionsResult("", req.now)
+			res.Rows = []cliSessionRow{{SessionID: "t-old", LastActiveAt: 1}, {SessionID: "t-new", LastActiveAt: 2}}
+			res.SourcesChecked = []string{cliSessionSourceCodexStore}
+			return res
+		},
+		probe: func(context.Context, cliSessionProbeRequest) cliSessionProbeResult { return cliSessionProbeResult{} },
+	})
+	if err := handleCliSessionsDiscoverCommand(context.Background(), nil, discoverCmd("codex", "7", "999"), &Config{AgentID: "agent-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if gotReq.lookBack != 7*24*time.Hour || gotReq.maxRows != cliSessionDefaultMaxRows {
+		t.Fatalf("request = %+v, want 7 days and the row ceiling clamped", gotReq)
+	}
+	frames := published()
+	if len(frames) != 1 || frames[0].CliSessions == nil || frames[0].Type != cliSessionsDiscoverResultType || frames[0].RefreshID != "req-123456" {
+		t.Fatalf("published %+v, want one correlated discover result", frames)
+	}
+	res := frames[0].CliSessions
+	if res.Engine != "codex" || len(res.Rows) != 2 || res.Rows[0].SessionID != "t-new" || res.Error != "" {
+		t.Fatalf("result = %+v, want codex's rows newest first", res)
+	}
+	for _, r := range res.Rows {
+		if r.Engine != "codex" || r.Editors == nil {
+			t.Fatalf("row = %+v, want engine codex and an editors list", r)
+		}
+	}
+	raw, _ := json.Marshal(res.Rows[0])
+	if !strings.HasPrefix(string(raw), `{"engine":"codex","sessionId":"t-new"`) {
+		t.Fatalf("row wire shape: %s", raw)
+	}
+
+	if err := handleCliSessionsDiscoverCommand(context.Background(), nil, discoverCmd("someNewAgent"), nil); err != nil {
+		t.Fatal(err)
+	}
+	frames = published()
+	last := frames[len(frames)-1]
+	if last.Status != "error" || last.CliSessions.Error != cliSessionErrEngineNotSupported || last.CliSessions.Engine != "someNewAgent" {
+		t.Fatalf("unknown engine = %+v / %+v, want engineNotSupported", last, last.CliSessions)
+	}
+}
+
+// Claude Code's rows carry `engine` too; nothing else about them changes.
+func TestClaudeRowsCarryTheirEngine(t *testing.T) {
+	configDir := t.TempDir()
+	writeTranscript(t, configDir, "-w", sidA, time.Now(), userRecord("/w", "fix the build"))
+	reader := &cliSessionReader{
+		engine: cliSessionEngineClaudeCode, selfBudgeted: true, sources: claudeSessionReader.sources,
+		discover: func(ctx context.Context, _ cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+			return discoverClaudeSessions(ctx, testDiscoveryEnv(configDir, nil))
+		},
+	}
+	res := runCliSessionDiscover(context.Background(), reader, newCliSessionDiscoverRequest(30, 500))
+	a := rowByID(res.Rows, sidA)
+	if res.Engine != "claudeCode" || a == nil || a.Engine != "claudeCode" || a.Title != "fix the build" {
+		t.Fatalf("result = %+v, want the Claude row stamped claudeCode", res)
+	}
+}
+
+// A reader that never answers (a hung disk) does not hold the answer past the
+// budget: the engine is reported truncated, its sources timed out.
+func TestRunDiscoverReportsAReaderThatNeverAnswers(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	reader := &cliSessionReader{
+		engine: cliSessionEngineGrok, sources: []string{cliSessionSourceGrokStore},
+		discover: func(context.Context, cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+			<-release // ignores its context
+			return cliSessionsDiscoverResult{}
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	res := runCliSessionDiscover(ctx, reader, newCliSessionDiscoverRequest(30, 500))
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("the answer waited %v for a reader that never answers", waited)
+	}
+	if !res.Truncated || skipReason(res, cliSessionSourceGrokStore) != cliSessionSkipTimeout || res.Engine != "grok" {
+		t.Fatalf("result = %+v, want grok truncated with its store timed out", res)
+	}
+}
+
+// A reader the budget cuts short keeps what it read: it stops on its own
+// context, which ends before the collector stops waiting.
+func TestRunDiscoverKeepsAPartialAnswerAtTheDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	budgetEnds, _ := ctx.Deadline()
+	reader := &cliSessionReader{
+		engine: cliSessionEngineAntigravity, sources: []string{cliSessionSourceAntigravityStore},
+		discover: func(rctx context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+			<-rctx.Done()
+			if !time.Now().Before(budgetEnds) {
+				t.Error("the reader's context did not end before the budget")
+			}
+			res := newCliSessionsResult("", req.now)
+			res.Rows = []cliSessionRow{{SessionID: "11111111-2222-4333-8444-555555555555", LastActiveAt: 5}}
+			res.Truncated = true
+			res.skip(cliSessionSourceAntigravityStore, cliSessionSkipTimeout)
+			return res
+		},
+	}
+	res := runCliSessionDiscover(ctx, reader, newCliSessionDiscoverRequest(30, 500))
+	if len(res.Rows) != 1 || !res.Truncated || res.Rows[0].Engine != "antigravity" {
+		t.Fatalf("result = %+v, want the partial row kept and truncated", res)
+	}
+}
+
+// The row budget is shared: past maxRows the oldest rows go and the answer
+// says so; a reader's panic is a skipped source, not a crashed agent.
+func TestRunDiscoverCapsRowsAndRecoversAPanic(t *testing.T) {
+	reader := &cliSessionReader{
+		engine: cliSessionEngineOpenCode, sources: []string{cliSessionSourceOpenCodeStore},
+		discover: func(_ context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+			res := newCliSessionsResult("", req.now)
+			for i := 0; i < 5; i++ {
+				res.Rows = append(res.Rows, cliSessionRow{SessionID: fmt.Sprintf("ses_%08d", i), LastActiveAt: int64(i)})
+			}
+			return res
+		},
+	}
+	res := runCliSessionDiscover(context.Background(), reader, newCliSessionDiscoverRequest(30, 3))
+	if len(res.Rows) != 3 || !res.Truncated || res.Rows[0].SessionID != "ses_00000004" {
+		t.Fatalf("result = %+v, want the 3 newest rows, truncated", res.Rows)
+	}
+	reader.discover = func(context.Context, cliSessionDiscoverRequest) cliSessionsDiscoverResult { panic("boom") }
+	res = runCliSessionDiscover(context.Background(), reader, newCliSessionDiscoverRequest(30, 3))
+	if skipReason(res, cliSessionSourceOpenCodeStore) != cliSessionSkipUnreadable || !res.Truncated {
+		t.Fatalf("panicking reader = %+v, want its source unreadable", res)
+	}
+}
+
+func probeCmd(args ...string) commandMsg {
+	return commandMsg{ID: "p1", WorkspaceID: "ws", UID: "u1", AgentID: "agent-1", RefreshID: "req-654321", Command: cliSessionProbeCommand, Args: args}
+}
+
+// The probe is dispatched by engine too; one that cannot answer in time says
+// so instead of "no such session".
+func TestProbeCommandDispatchesByEngine(t *testing.T) {
+	published := capturePublished(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	standInReader(t, &cliSessionReader{
+		engine: cliSessionEngineMuseCode, command: "muse", sources: []string{cliSessionSourceMuseListing},
+		discover: func(context.Context, cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+			return cliSessionsDiscoverResult{}
+		},
+		probe: func(_ context.Context, req cliSessionProbeRequest) cliSessionProbeResult {
+			if req.sessionID == "slow" {
+				<-release
+			}
+			return cliSessionProbeResult{SessionID: req.sessionID, Exists: true, Resumable: true, Title: "Listed", TitleSource: cliSessionTitleSavedTitle}
+		},
+	})
+	if err := handleCliSessionProbeCommand(context.Background(), nil, probeCmd("museCode", "s-1", "/w", "0"), nil); err != nil {
+		t.Fatal(err)
+	}
+	frames := published()
+	if len(frames) != 1 || frames[0].Probe == nil || !frames[0].Probe.Resumable || frames[0].Probe.Writers == nil || frames[0].Probe.OpenInEditors == nil {
+		t.Fatalf("probe = %+v, want the reader's answer with empty lists", frames)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	res := runCliSessionProbe(ctx, cliSessionReaderFor(cliSessionEngineMuseCode), cliSessionProbeRequest{sessionID: "slow"})
+	if res.Error != cliSessionErrTimeout || res.Exists || res.Resumable {
+		t.Fatalf("slow probe = %+v, want a timeout, never gone or resumable", res)
+	}
+	if err := handleCliSessionProbeCommand(context.Background(), nil, probeCmd("someNewAgent", "x"), nil); err != nil {
+		t.Fatal(err)
+	}
+	frames = published()
+	if p := frames[len(frames)-1].Probe; p == nil || p.Error != cliSessionErrEngineNotSupported {
+		t.Fatalf("unknown engine probe = %+v", p)
+	}
+}
+
+func TestCliSessionTitleOfTellsATitleFromAPrompt(t *testing.T) {
+	for _, tc := range []struct {
+		saved, last, first, wantTitle, wantSource string
+	}{
+		{"Fix the login flow", "", "please fix login", "Fix the login flow", cliSessionTitleSavedTitle},
+		// A title that is only the first prompt's start reads as that prompt.
+		{"please fix the lo…", "", "please fix the login flow", "please fix the login flow", cliSessionTitleFirstPrompt},
+		{"", "the last ask", "the first ask", "the last ask", cliSessionTitleLastPrompt},
+		{"", "", "", "", cliSessionTitleNone},
+		{"Kept", "", "", "Kept", cliSessionTitleSavedTitle},
+	} {
+		title, source, _ := cliSessionTitleOf(tc.saved, 1, tc.last, tc.first)
+		if title != tc.wantTitle || source != tc.wantSource {
+			t.Errorf("cliSessionTitleOf(%q, %q, %q) = %q/%q, want %q/%q", tc.saved, tc.last, tc.first, title, source, tc.wantTitle, tc.wantSource)
+		}
+	}
+	long := strings.Repeat("word ", 40) + "api_key=SECRETSECRETSECRETSECRET"
+	if title, _, _ := cliSessionTitleOf("", 0, "", long); utf8.RuneCountInString(title) > cliSessionFallbackLabelMaxChars {
+		t.Fatalf("prompt label %q is longer than %d", title, cliSessionFallbackLabelMaxChars)
+	}
+	if title, _, _ := cliSessionTitleOf("", 0, "", "use api_key=SECRETSECRETSECRETSECRET now"); strings.Contains(title, "SECRETSECRET") {
+		t.Fatalf("prompt label %q was not masked", title)
+	}
+}
+
+func TestParseCliSessionTimeSpellings(t *testing.T) {
+	want := time.Date(2026, 11, 19, 10, 0, 0, 123000000, time.UTC).UnixMilli()
+	for _, s := range []string{"2026-11-19T10:00:00.123Z", "2026-11-19T11:00:00.123+01:00", "2026-11-19 11:00:00.123+01:00", "2026-11-19 10:00:00.123000+00:00"} {
+		if got := parseCliSessionTime(s); got != want {
+			t.Errorf("parseCliSessionTime(%q) = %d, want %d", s, got, want)
+		}
+	}
+	if parseCliSessionTime("yesterday") != 0 || cliSessionEpochMs(1795103283) != 1795103283000 || cliSessionEpochMs(1795103283242) != 1795103283242 {
+		t.Fatal("unknown spellings read as 0, seconds and milliseconds both as ms")
 	}
 }

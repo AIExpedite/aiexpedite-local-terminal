@@ -189,7 +189,11 @@ type capabilitiesInfo struct {
 	ReadOnlySessions bool `json:"readOnlySessions"`
 	// CliSessionDiscovery (shared-constants CLI_SESSION_DISCOVERY_CAPABILITY):
 	// this build answers __cli_sessions_discover__ / __cli_session_probe__ for
-	// the listed engines (claude_session_*.go). Absent on an older agent, which
+	// the listed engines (cli_session_discovery.go): Claude Code first, then
+	// each other engine whose reader this build has and whose CLI is
+	// installed here (newCliSessionDiscoveryCapability). terminal-service asks
+	// for an engine other than Claude Code only at `protocol` 3 or newer
+	// (CLI_SESSION_MULTI_ENGINE_PROTOCOL). Absent on an older agent, which
 	// terminal-service refuses with DISCOVERY_AGENT_TOO_OLD before publishing.
 	CliSessionDiscovery *cliSessionDiscoveryCapability `json:"cliSessionDiscovery,omitempty"`
 	// WorktreeBuiltIns (shared-constants DEVICE_WORKTREE_CAPABILITIES.BUILT_INS):
@@ -418,17 +422,14 @@ func newMachineCapabilities() *capabilitiesInfo {
 		NativeLaunchArgs:         true,
 		OpenCodeAuthRefusalFrame: true,
 		ReadOnlySessions:         true,
-		CliSessionDiscovery: &cliSessionDiscoveryCapability{
-			Engines:  []string{cliSessionEngineClaudeCode},
-			Protocol: cliSessionDiscoveryProtocol,
-		},
-		WorktreeBuiltIns:    true,
-		SignedExecutionID:   true,
-		SignedCommandExpiry: true,
-		WhatsApp:            currentWhatsAppCapability(),
-		BrowserControl:      currentBrowserControlCapability(),
-		ACPDrivers:          newACPDriversCapability(),
-		MSPDrivers:          newMSPDriversCapability(),
+		CliSessionDiscovery:      newCliSessionDiscoveryCapability(),
+		WorktreeBuiltIns:         true,
+		SignedExecutionID:        true,
+		SignedCommandExpiry:      true,
+		WhatsApp:                 currentWhatsAppCapability(),
+		BrowserControl:           currentBrowserControlCapability(),
+		ACPDrivers:               newACPDriversCapability(),
+		MSPDrivers:               newMSPDriversCapability(),
 	}
 }
 

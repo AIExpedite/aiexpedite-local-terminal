@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,7 +110,14 @@ func linkGrokDirectory(link, target, description string) error {
 			return fmt.Errorf("clear stale %s directory: %w", description, err)
 		}
 	}
+	return makeGrokDirectoryLink(link, target, description)
+}
 
+// makeGrokDirectoryLink creates link pointing at target — a junction on
+// Windows, else a symlink — and never removes anything: an entry already at
+// link is an error. linkAdoptedGrokSession uses it alone, so linking one
+// adopted session can never clear what is there.
+func makeGrokDirectoryLink(link, target, description string) error {
 	if runtime.GOOS == "windows" {
 		// Directory junctions need no special privilege, unlike symlinks,
 		// which require SeCreateSymbolicLinkPrivilege (admin or Developer
@@ -285,10 +293,21 @@ func pruneGrokSessionStoreAt(store string, maxAge time.Duration, now time.Time) 
 		}
 		liveSessions := 0
 		for _, sessionDir := range sessionDirs {
+			sessionPath := filepath.Join(cwdPath, sessionDir.Name())
+			// A link is one adopted session of the person's own Grok store
+			// (linkAdoptedGrokSession): expired, only the link goes; the
+			// folder it points at is never this store's to delete.
+			if sessionDir.Type()&(fs.ModeSymlink|fs.ModeIrregular) != 0 {
+				if newestModTime(sessionPath).After(cutoff) {
+					liveSessions++
+				} else if unlinkGrokDirectory(sessionPath) != nil {
+					liveSessions++
+				}
+				continue
+			}
 			if !sessionDir.IsDir() {
 				continue
 			}
-			sessionPath := filepath.Join(cwdPath, sessionDir.Name())
 			if newestModTime(sessionPath).After(cutoff) {
 				liveSessions++
 				continue

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -320,4 +321,115 @@ func removeIsolatedGrokHomeSiblings(home string) error {
 		}
 	}
 	return errors.Join(cleanupErrs...)
+}
+
+// errGrokAdoptedLink is linkAdoptedGrokSession's failure: fixed text, so a log
+// line never carries the person's folder names.
+var errGrokAdoptedLink = errors.New("the adopted session's folder could not be linked into the conversation store")
+
+// linkAdoptedGrokSession lets AI Expedite's isolated Grok homes see ONE
+// session of the person's own Grok store, so a `session/load` of a session
+// they adopted (one Grok Build started outside AI Expedite) finds it: every
+// isolated home's `sessions` entry is the per-device store
+// (grok_session_store.go), and Grok resolves a load by reading
+// `<store>/<url-encoded cwd>/<session id>/`. That one folder is linked there
+// IN PLACE — the turns AI Expedite drives are written to the person's own
+// transcript, which their Grok Build keeps showing — and nothing is copied;
+// the person's store as a whole is never linked, so no other conversation of
+// theirs becomes visible to a session AI Expedite runs.
+//
+// It links only a folder of the person's store kept under the load's own cwd
+// (the same folder once symlinks are resolved): Grok answers a load of a
+// session recorded for another folder as it always did. A session already
+// in the store (AI Expedite's own, or linked before) is left alone, and so is
+// any entry already at the link's place. Reports whether it linked.
+func linkAdoptedGrokSession(sessionID, cwd string) (bool, error) {
+	return linkAdoptedGrokSessionIn(grokSessionStoreDir(), grokPersistentHome(), sessionID, cwd)
+}
+
+func linkAdoptedGrokSessionIn(store, realHome, sessionID, cwd string) (bool, error) {
+	if store == "" || realHome == "" || !isCliSessionUUID(sessionID) || !filepath.IsAbs(cwd) {
+		return false, nil
+	}
+	realRoot := filepath.Join(realHome, grokSessionsDirName)
+	if sameGrokFolder(realRoot, store) {
+		return false, nil // GROK_HOME's own sessions are the store already
+	}
+	cwdDir := grokSessionCwdDirName(cwd)
+	link := filepath.Join(store, cwdDir, sessionID)
+	if _, err := os.Lstat(link); err == nil || !os.IsNotExist(err) {
+		return false, nil
+	}
+	target := findGrokRealSessionFolder(realRoot, sessionID, cwd)
+	if target == "" {
+		return false, nil
+	}
+	if err := os.MkdirAll(filepath.Join(store, cwdDir), 0o700); err != nil {
+		return false, errGrokAdoptedLink
+	}
+	if err := makeGrokDirectoryLink(link, target, "adopted session"); err != nil {
+		return false, errGrokAdoptedLink
+	}
+	return true, nil
+}
+
+// findGrokRealSessionFolder is the folder of sessionID in the person's Grok
+// store (realRoot) kept under cwd, or "": the folder Grok itself wrote — a
+// real directory, never a link — under cwd's own encoding, else under
+// another spelling of the same folder (a symlinked path).
+func findGrokRealSessionFolder(realRoot, sessionID, cwd string) string {
+	isFolder := func(p string) bool {
+		fi, err := os.Lstat(p)
+		return err == nil && fi.IsDir() && fi.Mode()&(os.ModeSymlink|os.ModeIrregular) == 0
+	}
+	if p := filepath.Join(realRoot, grokSessionCwdDirName(cwd), sessionID); isFolder(p) {
+		return p
+	}
+	want, err := resolveCwdForContainment(cwd)
+	if err != nil {
+		return ""
+	}
+	matches, _ := filepath.Glob(filepath.Join(realRoot, "*", sessionID))
+	for _, m := range matches {
+		recorded, err := url.PathUnescape(filepath.Base(filepath.Dir(m)))
+		if err != nil || !filepath.IsAbs(recorded) || !isFolder(m) {
+			continue
+		}
+		if got, err := resolveCwdForContainment(recorded); err == nil && sameGrokFolder(got, want) {
+			return m
+		}
+	}
+	return ""
+}
+
+// grokSessionCwdDirName is the name Grok gives a cwd's folder in its store:
+// the path percent-encoded, every byte but A–Z a–z 0–9 - _ . ~ escaped
+// ("/Users/me/repo" → "%2FUsers%2Fme%2Frepo", "C:\aiexpedite" →
+// "C%3A%5Caiexpedite"; checked against Grok Build's own store and
+// GROK_CONVERSATION_STORE_AND_RESUME.md).
+func grokSessionCwdDirName(cwd string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	for i := 0; i < len(cwd); i++ {
+		c := cwd[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_', c == '.', c == '~':
+			b.WriteByte(c)
+		default:
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0x0f])
+		}
+	}
+	return b.String()
+}
+
+// sameGrokFolder compares two folders the way the platform does (Windows
+// paths case-insensitively).
+func sameGrokFolder(a, b string) bool {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }

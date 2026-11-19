@@ -364,7 +364,7 @@ func (m *ClaudeNativeManager) StartForAgent(commandAgentID, id, cwd string, extr
 
 	// Discovery flags sessions this agent drives, and never counts its own
 	// child as another writer; a session resumed in place is watched for one
-	// (claude_session_probe.go). A --fork-session start is a copy under a NEW
+	// (cli_session_outside_writer.go). A --fork-session start is a copy under a NEW
 	// id (recorded from its init frame in readStream): the original stays the
 	// other program's, so it is neither claimed nor watched, and a send into
 	// the copy is never held for what the original's editor does.

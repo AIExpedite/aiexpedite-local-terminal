@@ -147,6 +147,11 @@ func TestMain(m *testing.M) {
 	startMuseCodeMSPFn = func(context.Context, string, func(string, json.RawMessage)) (*museCodeMSPClient, error) {
 		return nil, fmt.Errorf("muse serve is disabled in tests")
 	}
+	// …and so does session discovery's listing host
+	// (musecode_session_sources.go); its tests hand in a pipe-backed fake.
+	startMuseCodeListingHostFn = func(context.Context, string) (*museCodeMSPClient, error) {
+		return nil, fmt.Errorf("muse serve is disabled in tests")
+	}
 	// Same rule for OpenCode: a turn whose stream reported no usage owes an
 	// `opencode export`, which would start the developer's real install.
 	// Default to an export that could not be read; the tests that exercise

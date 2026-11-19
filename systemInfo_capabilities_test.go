@@ -47,6 +47,9 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 	// pin reads them as absent; systemInfo_acp_test.go covers the list.
 	pinACPDriverBinaries(t, nil)
 	pinMSPDriverBinary(t, mspDriverBinary{})
+	// So do the discovery engines past Claude Code (cli_session_discovery_test.go
+	// covers the list).
+	pinCliSessionEnginesInstalled(t)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			caps := newMachineCapabilities()
@@ -85,9 +88,11 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// WhatsApp bridge, and its `protocol` (2) with sticky identities and
 			// the re-link carry-over, and its `sendText` with the confirmed
 			// send (whatsapp_send.go); `cliSessionDiscovery` with finding and
-			// adopting coding-agent sessions AI Expedite did not start, and its
+			// adopting coding-agent sessions AI Expedite did not start, its
 			// `protocol` (2) with startedVia / lastVia, the partial scan kept at
-			// the deadline and the outside-writer frame naming the agent;
+			// the deadline and the outside-writer frame naming the agent, and
+			// (3) with a reader for every coding agent, listed while its CLI
+			// is installed;
 			// `nativeLaunchArgs` with the one-shot managers applying a START's
 			// model and effort to every turn; `openCodeAuthRefusalFrame` with an
 			// OpenCode turn that fails on a missing provider key naming the
@@ -96,7 +101,7 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// Muse Code on `muse serve` (both always present, an empty list when
 			// no installed CLI qualifies); `browserControl` with the AI working
 			// in the person's own Chrome (browser_*.go).
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]},"mspDrivers":{"protocol":2,"agents":[]},"browserControl":`+string(bcRaw)+`}` {
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":3},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]},"mspDrivers":{"protocol":2,"agents":[]},"browserControl":`+string(bcRaw)+`}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})
