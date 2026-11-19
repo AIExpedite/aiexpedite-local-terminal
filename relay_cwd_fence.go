@@ -8,8 +8,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 
 	"cloud.google.com/go/pubsub/v2"
 )
@@ -19,12 +22,56 @@ import (
 // REJECTION_REASONS.CWD_OUTSIDE_GRANT_FOLDER).
 const cwdOutsideGrantFolderRejectionCode = "CWD_OUTSIDE_GRANT_FOLDER"
 
+// maxFenceLinkHops bounds how many links fenceRealPath follows, so a link
+// cycle refuses instead of looping.
+const maxFenceLinkHops = 64
+
+// fenceRealPath is the real folder a path names, following symlinks AND
+// Windows junctions in every component. filepath.EvalSymlinks alone is not
+// enough: since Go 1.23 it does not traverse junctions, so a junction inside
+// the granted folder (C:\AIExpedite\link -> D:\other) would read as inside it.
+// Each pass resolves what EvalSymlinks can, then looks for a component that is
+// still a link (os.Readlink reads junctions) and restarts from its target. An
+// unreadable path, a dangling link or a cycle is an error, so the fence fails
+// closed.
+func fenceRealPath(p string) (string, error) {
+	p = filepath.Clean(p)
+	for hop := 0; hop <= maxFenceLinkHops; hop++ {
+		resolved, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			return "", err
+		}
+		vol := filepath.VolumeName(resolved)
+		segments := strings.FieldsFunc(resolved[len(vol):], func(r rune) bool {
+			return os.IsPathSeparator(uint8(r))
+		})
+		cur := vol + string(filepath.Separator)
+		next := ""
+		for i, seg := range segments {
+			candidate := filepath.Join(cur, seg)
+			if target, lerr := os.Readlink(candidate); lerr == nil && target != "" {
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(cur, target)
+				}
+				next = filepath.Join(append([]string{target}, segments[i+1:]...)...)
+				break
+			}
+			cur = candidate
+		}
+		if next == "" {
+			return resolved, nil
+		}
+		p = next
+	}
+	return "", errors.New("too many links")
+}
+
 // refuseCwdOutsideFence checks whether a session start admitted through an
 // ancestor grant stays inside that granted boundary on disk.
 // If cmd carries CwdFence, both the fence and the working directory are
-// evaluated through symlinks. If either cannot be resolved or the real working
-// directory leaves the real fence, the command is refused with
-// CWD_OUTSIDE_GRANT_FOLDER.
+// resolved through symlinks and junctions (fenceRealPath). If either cannot be
+// resolved or the real working directory leaves the real fence, the command is
+// refused with CWD_OUTSIDE_GRANT_FOLDER. A grant never widens through a link.
 // Returns true when the command was handled (refused) and settled.
 func refuseCwdOutsideFence(ctx context.Context, topic *pubsub.Publisher, m *pubsub.Message, cmd commandMsg, cfg *Config) bool {
 	if cmd.CwdFence == "" {
@@ -54,8 +101,8 @@ func refuseCwdOutsideFence(ctx context.Context, topic *pubsub.Publisher, m *pubs
 		return true
 	}
 
-	realFence, errFence := filepath.EvalSymlinks(cmd.CwdFence)
-	realCwd, errCwd := filepath.EvalSymlinks(cmd.Cwd)
+	realFence, errFence := fenceRealPath(cmd.CwdFence)
+	realCwd, errCwd := fenceRealPath(cmd.Cwd)
 
 	if errFence != nil || errCwd != nil || !isPathWithin(realFence, realCwd) {
 		msg := fmt.Sprintf("working directory %q escapes granted folder %q", cmd.Cwd, cmd.CwdFence)

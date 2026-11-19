@@ -298,3 +298,87 @@ func TestRefuseCwdOutsideFence(t *testing.T) {
 		t.Logf("skipping symlink escape test: %v", err)
 	}
 }
+
+// fenceRefusal runs the fence for one start and returns the rejection it
+// published, or nil when the start was admitted.
+func fenceRefusal(t *testing.T, fence, cwd string) *resultMsg {
+	t.Helper()
+	publishes := captureCwdFencePublishes(t)
+	cmd := commandMsg{ID: "cmd-link", Type: "session_start", SessionID: "sess-link", CwdFence: fence, Cwd: cwd}
+	refused := refuseCwdOutsideFence(context.Background(), nil, nil, cmd, &Config{AgentID: "agent-link"})
+	msgs := publishes()
+	if !refused {
+		if len(msgs) != 0 {
+			t.Fatalf("an admitted start published %d results", len(msgs))
+		}
+		return nil
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("a refused start published %d results, want 1", len(msgs))
+	}
+	return &msgs[0]
+}
+
+// A grant never widens through a link: a symlink inside the granted folder that
+// leads out of it is refused CWD_OUTSIDE_GRANT_FOLDER, and so is a folder
+// reached THROUGH such a link. A link that stays inside is admitted.
+func TestRefuseCwdOutsideFence_SymlinkEscapes(t *testing.T) {
+	base := resolvedTempDir(t)
+	fence := filepath.Join(base, "AIExpedite")
+	inside := filepath.Join(fence, "frontend")
+	outside := filepath.Join(base, "other")
+	for _, d := range []string{inside, filepath.Join(outside, "sub")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	escape := filepath.Join(fence, "link")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Skipf("cannot create a symlink on this host: %v", err)
+	}
+	stay := filepath.Join(fence, "stay")
+	if err := os.Symlink(inside, stay); err != nil {
+		t.Skipf("cannot create a symlink on this host: %v", err)
+	}
+
+	for name, cwd := range map[string]string{
+		"the link itself":          escape,
+		"a folder under the link":  filepath.Join(escape, "sub"),
+		"a traversal out of fence": filepath.Join(inside, "..", "..", "other"),
+	} {
+		res := fenceRefusal(t, fence, cwd)
+		if res == nil {
+			t.Errorf("%s (%s) leaves the granted folder and must be refused", name, cwd)
+			continue
+		}
+		if res.Status != "denied" || res.RejectionReason != cwdOutsideGrantFolderRejectionCode {
+			t.Errorf("%s: unexpected refusal %+v", name, *res)
+		}
+	}
+	if res := fenceRefusal(t, fence, stay); res != nil {
+		t.Errorf("a link that stays inside the granted folder must be admitted: %+v", *res)
+	}
+	// The fence itself reached through a link is still the same real folder.
+	fenceLink := filepath.Join(base, "fence-link")
+	if err := os.Symlink(fence, fenceLink); err == nil {
+		if res := fenceRefusal(t, fenceLink, inside); res != nil {
+			t.Errorf("a fence spelled through a link must admit its own sub-folder: %+v", *res)
+		}
+	}
+}
+
+// A link cycle refuses rather than looping.
+func TestFenceRealPath_CycleFailsClosed(t *testing.T) {
+	base := resolvedTempDir(t)
+	a := filepath.Join(base, "a")
+	b := filepath.Join(base, "b")
+	if err := os.Symlink(b, a); err != nil {
+		t.Skipf("cannot create a symlink on this host: %v", err)
+	}
+	if err := os.Symlink(a, b); err != nil {
+		t.Skipf("cannot create a symlink on this host: %v", err)
+	}
+	if _, err := fenceRealPath(a); err == nil {
+		t.Fatalf("a link cycle must not resolve")
+	}
+}
