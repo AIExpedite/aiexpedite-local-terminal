@@ -127,67 +127,59 @@ func fenceRealPath(p string) (string, error) {
 	}
 }
 
-// refuseCwdOutsideFence checks whether a session start admitted through an
-// ancestor grant stays inside that granted boundary on disk.
-// If cmd carries CwdFence, both the fence and the working directory are
-// resolved through symlinks and junctions (fenceRealPath); a path naming ".."
-// is refused unread. If either cannot be
-// resolved or the real working directory leaves the real fence, the command is
-// refused with CWD_OUTSIDE_GRANT_FOLDER. A grant never widens through a link.
-// Returns true when the command was handled (refused) and settled.
+// cwdFenceRefusalReason is why a start carrying a fence is refused, or "" when
+// its working directory stays inside the granted folder on disk. Both paths
+// must be absolute and name no ".." (refused unread); both are then resolved
+// through symlinks and junctions (fenceRealPath), and a path that cannot be
+// resolved refuses too. A grant never widens through a link.
+func cwdFenceRefusalReason(cwd, fence string) string {
+	switch {
+	case cwd == "":
+		return fmt.Sprintf("working directory is empty; must be inside granted folder %q", fence)
+	case !filepath.IsAbs(cwd) || !filepath.IsAbs(fence):
+		return fmt.Sprintf("working directory and fence must be absolute paths; got cwd %q, fence %q", cwd, fence)
+	case hasParentSegment(cwd) || hasParentSegment(fence):
+		return fmt.Sprintf("working directory %q or granted folder %q names \"..\"; a fenced start never does", cwd, fence)
+	}
+	realFence, err := fenceRealPath(fence)
+	if err != nil {
+		return fmt.Sprintf("granted folder %q cannot be resolved: %v", fence, err)
+	}
+	realCwd, err := fenceRealPath(cwd)
+	if err != nil {
+		return fmt.Sprintf("working directory %q cannot be resolved: %v", cwd, err)
+	}
+	if !isPathWithin(realFence, realCwd) {
+		return fmt.Sprintf("working directory %q escapes granted folder %q", cwd, fence)
+	}
+	return ""
+}
+
+// refuseCwdOutsideFence refuses, with CWD_OUTSIDE_GRANT_FOLDER, a session start
+// admitted through an ancestor grant (it carries CwdFence) whose working
+// directory leaves that granted folder (cwdFenceRefusalReason). Returns true
+// when the command was handled (refused) and settled.
 func refuseCwdOutsideFence(ctx context.Context, topic *pubsub.Publisher, m *pubsub.Message, cmd commandMsg, cfg *Config) bool {
 	if cmd.CwdFence == "" {
 		return false
 	}
-
+	msg := cwdFenceRefusalReason(cmd.Cwd, cmd.CwdFence)
+	if msg == "" {
+		return false
+	}
 	agentID := ""
 	if cfg != nil {
 		agentID = cfg.AgentID
 	}
-
-	if cmd.Cwd == "" || !filepath.IsAbs(cmd.Cwd) || !filepath.IsAbs(cmd.CwdFence) ||
-		hasParentSegment(cmd.Cwd) || hasParentSegment(cmd.CwdFence) {
-		msg := fmt.Sprintf("working directory and fence must be absolute paths; got cwd %q, fence %q", cmd.Cwd, cmd.CwdFence)
-		if cmd.Cwd == "" {
-			msg = fmt.Sprintf("working directory is empty; must be inside granted folder %q", cmd.CwdFence)
-		} else if hasParentSegment(cmd.Cwd) || hasParentSegment(cmd.CwdFence) {
-			msg = fmt.Sprintf("working directory %q or granted folder %q names \"..\"; a fenced start never does", cmd.Cwd, cmd.CwdFence)
+	fmt.Printf("%s[fence] Refused %s: %s%s\n", colorYellow, cmd.Type, msg, colorReset)
+	res := makeRejectionResult(cmd, agentID, "denied", cwdOutsideGrantFolderRejectionCode, msg)
+	err := publishMsg(ctx, topic, res)
+	if m != nil {
+		if err != nil {
+			m.Nack()
+		} else {
+			m.Ack()
 		}
-		fmt.Printf("%s[fence] Refused %s: %s%s\n", colorYellow, cmd.Type, msg, colorReset)
-		res := makeRejectionResult(cmd, agentID, "denied", cwdOutsideGrantFolderRejectionCode, msg)
-		err := publishMsg(ctx, topic, res)
-		if m != nil {
-			if err != nil {
-				m.Nack()
-			} else {
-				m.Ack()
-			}
-		}
-		return true
 	}
-
-	realFence, errFence := fenceRealPath(cmd.CwdFence)
-	realCwd, errCwd := fenceRealPath(cmd.Cwd)
-
-	if errFence != nil || errCwd != nil || !isPathWithin(realFence, realCwd) {
-		msg := fmt.Sprintf("working directory %q escapes granted folder %q", cmd.Cwd, cmd.CwdFence)
-		if errCwd != nil {
-			msg = fmt.Sprintf("working directory %q cannot be resolved: %v", cmd.Cwd, errCwd)
-		} else if errFence != nil {
-			msg = fmt.Sprintf("granted folder %q cannot be resolved: %v", cmd.CwdFence, errFence)
-		}
-		fmt.Printf("%s[fence] Refused %s: %s%s\n", colorYellow, cmd.Type, msg, colorReset)
-		res := makeRejectionResult(cmd, agentID, "denied", cwdOutsideGrantFolderRejectionCode, msg)
-		err := publishMsg(ctx, topic, res)
-		if m != nil {
-			if err != nil {
-				m.Nack()
-			} else {
-				m.Ack()
-			}
-		}
-		return true
-	}
-
-	return false
+	return true
 }
