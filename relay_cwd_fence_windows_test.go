@@ -128,3 +128,21 @@ func TestFenceRealPath_WindowsJunctionCycleFailsClosed(t *testing.T) {
 		t.Fatalf("a start in a junction cycle must be refused")
 	}
 }
+
+// On Windows a root-relative link target names the link's own DRIVE root, not
+// a folder under the link: C:\AIExpedite\link -> \Windows is C:\Windows. Joined
+// under the link it would read as C:\AIExpedite\Windows, inside the fence. A
+// drive-relative target depends on that drive's current folder and refuses.
+func TestLinkTargetPath_WindowsRootAndDriveRelative(t *testing.T) {
+	got, err := linkTargetPath(`C:\AIExpedite`, `\Windows`)
+	if err != nil || got != `C:\Windows` {
+		t.Fatalf("root-relative target = %q, %v; want the drive root's Windows folder", got, err)
+	}
+	got, err = linkTargetPath(`\\srv\share\AIExpedite`, `\other`)
+	if err != nil || got != `\\srv\share\other` {
+		t.Fatalf("root-relative target on a share = %q, %v", got, err)
+	}
+	if got, err := linkTargetPath(`C:\AIExpedite`, `D:foo`); err == nil {
+		t.Fatalf("a drive-relative target must refuse, got %q", got)
+	}
+}

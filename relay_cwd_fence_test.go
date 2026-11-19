@@ -383,3 +383,21 @@ func TestRefuseCwdOutsideFence_ParentSegmentRefused(t *testing.T) {
 		t.Fatalf("a plain sub-folder must be admitted: %+v", *res)
 	}
 }
+
+// Where a link points is joined, never cleaned: an absolute target as is, a
+// relative one under the link's own (real) folder, ".." kept for the walk.
+func TestLinkTargetPath(t *testing.T) {
+	dir := resolvedTempDir(t)
+	sep := string(filepath.Separator)
+	abs := filepath.Join(dir, "elsewhere")
+	for _, tc := range []struct{ target, want string }{
+		{abs, abs},
+		{"other", dir + sep + "other"},
+		{".." + sep + "other", dir + sep + ".." + sep + "other"},
+	} {
+		got, err := linkTargetPath(dir, tc.target)
+		if err != nil || got != tc.want {
+			t.Errorf("linkTargetPath(%q, %q) = %q, %v; want %q", dir, tc.target, got, err, tc.want)
+		}
+	}
+}

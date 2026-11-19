@@ -52,6 +52,24 @@ func hasParentSegment(p string) bool {
 	return false
 }
 
+// linkTargetPath is where a link in folder `dir` (a real folder, no link in
+// it) points, without cleaning: an absolute target as is; on Windows a
+// root-relative target ("\Windows") on dir's own volume, never under dir; a
+// plain relative target under dir. A drive-relative target ("C:foo") depends
+// on that drive's current directory, so it is refused.
+func linkTargetPath(dir, target string) (string, error) {
+	switch {
+	case filepath.IsAbs(target):
+		return target, nil
+	case filepath.VolumeName(target) != "":
+		return "", fmt.Errorf("drive-relative target %q", target)
+	case target != "" && os.IsPathSeparator(target[0]):
+		return filepath.VolumeName(dir) + target, nil
+	default:
+		return dir + string(filepath.Separator) + target, nil
+	}
+}
+
 // fenceRealPath is the real folder an absolute path names, following symlinks
 // AND Windows junctions in every component. filepath.EvalSymlinks alone is not
 // enough: since Go 1.23 it does not traverse junctions, so a junction inside
@@ -92,8 +110,9 @@ func fenceRealPath(p string) (string, error) {
 			if hops++; hops > maxFenceLinkHops {
 				return "", errors.New("too many links")
 			}
-			if !filepath.IsAbs(target) {
-				target = cur + sep + target
+			target, err = linkTargetPath(cur, target)
+			if err != nil {
+				return "", fmt.Errorf("link %q: %w", candidate, err)
 			}
 			next = target
 			if rest := segments[i+1:]; len(rest) > 0 {
