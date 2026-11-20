@@ -1574,3 +1574,42 @@ func TestCodexPostUpdate_GreenSmokeThenUnarmedRunBothLand(t *testing.T) {
 		t.Fatalf("session = %+v, want the later run's 77%%", s)
 	}
 }
+
+// The ~50 s path, end to end through the real held-evidence read: the first
+// poll's nudge declines a rollout still young enough to be appended to, but
+// records it; with nothing on disk changing, the poll re-checks the held
+// evidence after its period, re-runs the reconcile-and-nudge, books the debt,
+// and the ladder's live read pays it.
+func TestCodexPostUpdate_UnarmedRunDeclinedAsTooYoungIsRetriedFromHeldEvidence(t *testing.T) {
+	now := time.Now()
+	h := codexDirectFixture(t, now)
+	h.endToEnd()
+	codexForcedReconcileMinInterval = 300 * time.Millisecond
+	cliUsageClaudeFallbackPeriod = 100 * time.Millisecond
+	observed := now.Add(-time.Hour)
+	h.f.seedPreRunReading(t, observed, now)
+	calls := stubCodexFallbackRead(t, capturingFallbackRead)
+	rollout := time.Now().Truncate(time.Millisecond)
+	writeCodexRunRollout(t, h.f.home, "maintenance-shell-young", rollout.Add(-time.Second), time.Time{}, rollout, false, nil)
+
+	codexDirectRunScanIfChanged()
+	waitCodexUsageRefreshIdle(t)
+	snap := h.f.snapshot(t)
+	if snap.RefreshOwedAtMs != 0 || snap.PendingRolloutMtimeMs != rollout.UnixMilli() {
+		t.Fatalf("a too-young rollout must be held, not owed: %+v", snap)
+	}
+
+	time.Sleep(2 * codexForcedReconcileMinInterval)
+	codexDirectRunScanIfChanged()
+	drainCodexRunDebtLadder(t)
+
+	if *calls == 0 {
+		t.Fatal("the held evidence was never acted on: no live read ran")
+	}
+	if got := codexObservedAt(t, h.f); !got.After(observed) {
+		t.Fatalf("observedAt %s did not advance past the pre-run reading %s", got, observed)
+	}
+	if snap := h.f.snapshot(t); snap.RefreshOwedAtMs != 0 || snap.PendingRolloutMtimeMs != 0 {
+		t.Fatalf("the debt must be paid and the evidence released: %+v", snap)
+	}
+}

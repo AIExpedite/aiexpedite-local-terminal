@@ -30,6 +30,8 @@ type codexDirectHarness struct {
 	heldReads int
 	// reconcile, when set, runs in place of the counted no-op.
 	reconcile func(ctx context.Context, base, fp string, now time.Time)
+	// realHeld is the production held-evidence read (a cache view).
+	realHeld func(fp string) bool
 }
 
 // codexDirectFixture enables the detector against a temporary home, with the
@@ -46,6 +48,7 @@ func codexDirectFixtureOver(t *testing.T, f codexFreshnessFixture, start time.Ti
 	h := &codexDirectHarness{f: f, now: start}
 	prevEnabled, prevDetected := codexDirectScanEnabled, codexDirectDetected
 	prevReconcile, prevHeld := codexDirectReconcile, codexDirectHeldEvidence
+	h.realHeld = prevHeld
 	prevNow, prevInterval, prevBudget := codexUsageFreshnessNow, codexForcedReconcileMinInterval, codexDirectReconcileBudget
 	prevPeriod := cliUsageClaudeFallbackPeriod
 	codexDirectScanEnabled = true
@@ -79,11 +82,13 @@ func codexDirectFixtureOver(t *testing.T, f codexFreshnessFixture, start time.Ti
 	return h
 }
 
-// endToEnd runs the real reconcile-and-nudge on wall time, with the
-// freshness fixture's test-sized interval, for rows that drive the debt ladder.
+// endToEnd runs the real reconcile-and-nudge and the real held-evidence read
+// on wall time, with the freshness fixture's test-sized interval, for rows that
+// drive the debt ladder.
 func (h *codexDirectHarness) endToEnd() {
 	codexUsageFreshnessNow = time.Now
 	codexForcedReconcileMinInterval = 20 * time.Millisecond
+	codexDirectHeldEvidence = h.realHeld
 	h.mu.Lock()
 	h.reconcile = func(ctx context.Context, base, fp string, now time.Time) {
 		codexReconcileAndNudge(ctx, base, fp, now, false)
@@ -421,8 +426,9 @@ func TestCodexDirectScan_TracksOnlyTheNewestFour(t *testing.T) {
 	h.wantReconciles(t, 2, "an append to a tracked rollout")
 }
 
-// A poll across local midnight starts watching the new day at once, and the
-// files tracked from the old day stay tracked.
+// A poll across local midnight starts watching the new day at once, and a
+// rollout tracked from a day that is no longer watched stays tracked until
+// newer ones displace it.
 func TestCodexDirectScan_MidnightRolloverWatchesTheNewDay(t *testing.T) {
 	start := time.Date(2026, 11, 20, 23, 59, 30, 0, codexDirectTestZone)
 	h := codexDirectFixture(t, start)
@@ -439,9 +445,19 @@ func TestCodexDirectScan_MidnightRolloverWatchesTheNewDay(t *testing.T) {
 	h.poll()
 	h.wantReconciles(t, before+1, "a rollout in the new day's directory")
 
+	// Two days on, the 20th is neither local-today, local-yesterday nor
+	// UTC-today; only its tracked rollout's own stat can see a `codex resume`.
+	h.advance(48 * time.Hour)
+	codexDirectRunScanIfChanged()
+	before = h.reconciles()
+	for _, dir := range codexRolloutWatchDirs(h.f.home, h.clock()) {
+		if dir == filepath.Dir(old) {
+			t.Fatalf("the 20th must no longer be watched: %v", dir)
+		}
+	}
 	h.writeRollout(t, filepath.Dir(old), "late", "{}\n", h.clock())
 	h.poll()
-	h.wantReconciles(t, before+2, "an append to yesterday's tracked rollout")
+	h.wantReconciles(t, before+1, "an append to a tracked rollout outside the watched days")
 }
 
 // A moved CODEX_HOME resets the watch: the reconcile runs against the new home
