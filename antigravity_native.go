@@ -691,37 +691,6 @@ func killAntigravityProcessTree(cmd *exec.Cmd) {
 	_ = killProcessGroup(pid)
 }
 
-// containedCwd resolves symlinks on cwd and, when workspaceRoot is set,
-// verifies the resolved cwd stays inside the resolved root, returning the real
-// (symlink-free) cwd to use as the process working directory. Called from a
-// one-shot-per-turn manager's Start with an empty root (resolve-only — the
-// result BECOMES the session's root) and again per turn (in the Send path,
-// just before launch) against that captured root, so a cwd component that is
-// swapped for a symlink between <kind>_native_start and <kind>_native_send
-// resolves elsewhere and cannot run an auto-approving CLI outside the
-// directory the session was started in.
-//
-// Shared by AntigravityNativeManager and OpenCodeNativeManager: both launch no
-// process until a turn arrives, which is exactly what leaves the TOCTOU window
-// this closes.
-func containedCwd(cwd, workspaceRoot string) (string, error) {
-	resolvedCwd, err := filepath.EvalSymlinks(cwd)
-	if err != nil {
-		return "", fmt.Errorf("cwd %q symlink resolution failed: %w", cwd, err)
-	}
-	if workspaceRoot == "" {
-		return resolvedCwd, nil
-	}
-	resolvedRoot, err := filepath.EvalSymlinks(workspaceRoot)
-	if err != nil {
-		return "", fmt.Errorf("workspace root %q symlink resolution failed: %w", workspaceRoot, err)
-	}
-	if !pathInsideRoot(resolvedCwd, resolvedRoot) {
-		return "", fmt.Errorf("cwd %q is outside the session's workspace root %q (the directory the session was started in)", resolvedCwd, resolvedRoot)
-	}
-	return resolvedCwd, nil
-}
-
 // antigravityTurnRun is what one `agy` run left: its stdout events, stderr,
 // exit, the driver's own stop (if any) and the failure lines in its own log.
 type antigravityTurnRun struct {

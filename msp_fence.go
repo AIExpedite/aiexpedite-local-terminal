@@ -522,7 +522,7 @@ func checkMSPWorkspaceRoot(what, path, root string) error {
 	if err != nil {
 		return fmt.Errorf("%s %q could not be safely resolved: %w", what, path, err)
 	}
-	if !pathInsideRoot(resolved, root) {
+	if !resolvedPathWithin(root, resolved) {
 		return fmt.Errorf("%s %q is outside the session's folder %q (the directory the session was started in)", what, resolved, root)
 	}
 	return nil

@@ -248,7 +248,7 @@ func checkACPSetupCwd(method, cwd, root string) error {
 	if err != nil {
 		return fmt.Errorf("%s params.cwd %q could not be safely resolved: %w", method, cwd, err)
 	}
-	if !pathInsideRoot(resolved, root) {
+	if !resolvedPathWithin(root, resolved) {
 		return fmt.Errorf("%s params.cwd %q is outside the session's workspace root %q (the directory the session was started in)", method, resolved, root)
 	}
 	return nil

@@ -405,33 +405,6 @@ func TestGrokACPManager_StartRootsContainmentAtSessionCwd(t *testing.T) {
 	})
 }
 
-// TestPathInsideRoot pins the helper's edge cases — the place where a
-// strings.HasPrefix shortcut would silently regress (`/root` vs `/rootkit`).
-func TestPathInsideRoot(t *testing.T) {
-	cases := []struct {
-		name      string
-		candidate string
-		root      string
-		want      bool
-	}{
-		{"exact_match", "/a/b", "/a/b", true},
-		{"child_dir", "/a/b/c", "/a/b", true},
-		{"nested_child", "/a/b/c/d/e", "/a/b", true},
-		{"sibling_with_shared_prefix", "/a/bb", "/a/b", false},
-		{"parent_dir", "/a", "/a/b", false},
-		{"different_branch", "/x/y", "/a/b", false},
-		{"empty_candidate", "", "/a", false},
-		{"empty_root", "/a", "", false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := pathInsideRoot(c.candidate, c.root); got != c.want {
-				t.Errorf("pathInsideRoot(%q, %q) = %v, want %v", c.candidate, c.root, got, c.want)
-			}
-		})
-	}
-}
-
 // TestGrokACPManager_StartClampsTimeoutAtMaxLifetime pins finding #2:
 // requested timeouts above the stale-GC ceiling are clamped, so a runaway
 // orchestrator can't request a deadline longer than our GC tolerates.
