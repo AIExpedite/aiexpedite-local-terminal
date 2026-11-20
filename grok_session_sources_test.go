@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -241,6 +242,21 @@ func TestGrokSessionCwdDirNameMatchesGrok(t *testing.T) {
 	}
 }
 
+// shortGrokCwd is a working directory SHORT enough that the store path built
+// from it — the encoded cwd segment triples every separator — stays inside
+// MAX_PATH. t.TempDir() does not: its encoded form pushed the link past 260
+// characters, where neither cmd nor PowerShell can see the path, so these
+// tests only ever passed through os.Symlink on an elevated runner and never
+// exercised the junction an ordinary machine uses (grok_session_store.go).
+// The cwd itself need not exist; only its name is used.
+func shortGrokCwd(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return `C:\gk`
+	}
+	return "/gk"
+}
+
 func isDirLink(t *testing.T, path string) bool {
 	t.Helper()
 	fi, err := os.Lstat(path)
@@ -253,7 +269,7 @@ func isDirLink(t *testing.T, path string) bool {
 func TestLinkAdoptedGrokSessionLinksOneFolderInPlace(t *testing.T) {
 	realHome := t.TempDir()
 	store := withTempGrokSessionStore(t)
-	cwd := t.TempDir()
+	cwd := shortGrokCwd(t)
 	writeGrokSession(t, realHome, cwd, gkS1, time.Now(), "Adopted", grokUserChunk("adopt me"))
 	writeGrokSession(t, realHome, cwd, gkS2, time.Now(), "Not adopted", grokUserChunk("leave me"))
 	writeGrokSession(t, realHome, "/elsewhere", gkS3, time.Now(), "Other folder", grokUserChunk("other"))
@@ -311,7 +327,7 @@ func TestPrepareACPResumeFrameLinksBeforeAGrokLoad(t *testing.T) {
 	realHome := t.TempDir()
 	t.Setenv("GROK_HOME", realHome)
 	store := withTempGrokSessionStore(t)
-	cwd := t.TempDir()
+	cwd := shortGrokCwd(t)
 	writeGrokSession(t, realHome, cwd, gkS1, time.Now(), "Adopted", grokUserChunk("adopt me"))
 	raw, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 5, "method": "session/load",
 		"params": map[string]any{"sessionId": gkS1, "cwd": cwd, "mcpServers": []any{}}})
@@ -332,7 +348,7 @@ func TestPrepareACPResumeFrameLinksBeforeAGrokLoad(t *testing.T) {
 func TestPruneUnlinksAnExpiredAdoptedLinkAndKeepsItsFolder(t *testing.T) {
 	realHome := t.TempDir()
 	store := withTempGrokSessionStore(t)
-	cwd := t.TempDir()
+	cwd := shortGrokCwd(t)
 	old := time.Now().Add(-30 * 24 * time.Hour)
 	folder := writeGrokSession(t, realHome, cwd, gkS1, old, "Old adopted", grokUserChunk("adopt me"))
 	fresh := writeGrokSession(t, realHome, cwd, gkS2, time.Now(), "Fresh adopted", grokUserChunk("adopt me too"))
