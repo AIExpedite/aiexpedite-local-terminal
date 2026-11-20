@@ -1440,3 +1440,137 @@ func TestCodexFencedRollout_AnUnfencedDebtKeepsTheOrdinaryLadder(t *testing.T) {
 		t.Fatalf("calls=%d kind=%v, want no early read", *calls, kind)
 	}
 }
+
+/* --------------------------------------------------------------------------
+   Unarmed runs after an upgrade — the Windows nightly: a green smoke, a Codex
+   update, and then a rollout from a `codex` nothing armed (the maintenance
+   controller's own shell). The cache stayed at its pre-update reading until a
+   gather happened to run; the propagator poll's direct-run scan
+   (cliagent_usage_codex_direct.go) now lands it with no gather at all.
+   ------------------------------------------------------------------------ */
+
+// pendingCodexHint is the Codex generation the propagator is holding for a
+// hint, or nil.
+func pendingCodexHint() *cliUsageGeneration {
+	p := cliUsagePropagator
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if h := p.pending[codexUsageProvider]; h != nil {
+		g := h.generation
+		return &g
+	}
+	return nil
+}
+
+// The nightly, reproduced: the reading is at T0, Codex is upgraded (a new
+// capture version, so the old cursor is reset), and an unarmed run writes a
+// token_count frame at T0+8m. No gather runs; two polls land it and leave a
+// Codex hint pending.
+func TestCodexPostUpdate_UnarmedRunAfterUpgradeAdvancesWithoutAGather(t *testing.T) {
+	withCodexGenerationEpoch(t, 8801)
+	now := time.Now()
+	t0 := now.Add(-9 * time.Minute)
+	h := codexDirectFixture(t, now)
+	h.endToEnd()
+	h.f.seedPreRunReading(t, t0, now)
+	codexRotateGenerationEpoch(now)
+	// The pre-update cursor already sits past the run's rollout; only the
+	// version change resets it.
+	h.f.advanceCursorPast(t, now, now)
+	setCodexCaptureVersion(t, "codex-cli 0.150.0")
+	baseline := pendingCodexHint()
+
+	run := t0.Add(8 * time.Minute)
+	writeCodexRunRollout(t, h.f.home, "maintenance-shell", now.Add(-5*time.Second), run, run, true,
+		[]map[string]any{codexRateLimitFrameWithLimitID("codex", 57, 63, now)})
+
+	codexDirectRunScanIfChanged()
+	h.pollWall()
+	waitCodexUsageRefreshIdle(t)
+
+	if got := codexObservedAt(t, h.f); got.UnixMilli() < run.UnixMilli() {
+		t.Fatalf("observedAt %s still predates the unarmed run %s", got, run)
+	}
+	if s := codexSessionMetric(t, codexMetricsFromCache(time.Now(), h.f.fp)); s.Consumed == nil || *s.Consumed != 57 {
+		t.Fatalf("session = %+v, want the unarmed run's 57%%", s)
+	}
+	pending := pendingCodexHint()
+	if pending == nil || (baseline != nil && baseline.covers(*pending)) {
+		t.Fatalf("no new Codex hint is pending (baseline %+v, pending %+v)", baseline, pending)
+	}
+}
+
+// The unarmed run's rollout carries no telemetry — the post-upgrade shape the
+// scan cannot mine. The poll's nudge books a debt floored at the rollout's
+// mtime, and the ladder's live read pays it.
+func TestCodexPostUpdate_UnarmedRunWithoutTelemetryFallsToTheLadder(t *testing.T) {
+	now := time.Now()
+	h := codexDirectFixture(t, now)
+	h.endToEnd()
+	observed := now.Add(-time.Hour)
+	h.f.seedPreRunReading(t, observed, now)
+	calls := stubCodexFallbackRead(t, capturingFallbackRead)
+	rollout := now.Add(-time.Second).Truncate(time.Millisecond)
+	writeCodexRunRollout(t, h.f.home, "maintenance-shell-silent", now.Add(-5*time.Second), time.Time{}, rollout, false, nil)
+
+	var floor int64
+	prevWorker := codexDirectReconcile
+	codexDirectReconcile = func(ctx context.Context, base, fp string, at time.Time) {
+		prevWorker(ctx, base, fp, at)
+		if snap, ok := loadCodexRateLimitSnapshot(h.f.cache); ok && snap.RefreshOwedAtMs != 0 {
+			floor = snap.RunFloorMs
+		}
+	}
+	codexDirectRunScanIfChanged()
+	drainCodexRunDebtLadder(t)
+
+	if floor != rollout.UnixMilli() {
+		t.Fatalf("the debt's floor = %d, want the rollout mtime %d", floor, rollout.UnixMilli())
+	}
+	if *calls == 0 {
+		t.Fatal("the debt's live read never ran, so the card would stay stale in silence")
+	}
+	if got := codexObservedAt(t, h.f); got.Before(rollout.Truncate(time.Second)) {
+		t.Fatalf("observedAt %s still predates the unarmed run %s", got, rollout)
+	}
+	if snap := h.f.snapshot(t); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("the live read must clear the debt: %+v", snap)
+	}
+}
+
+// A green smoke settles, then a later shell run writes a newer rollout. Both
+// land: the final reading is the later run's.
+func TestCodexPostUpdate_GreenSmokeThenUnarmedRunBothLand(t *testing.T) {
+	f, path := codexSmokeFreshnessFixture(t)
+	f.seedPreRunReading(t, time.Now().Add(-time.Hour), time.Now())
+	stubCodexSmokeExec(t, func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+		return codexPreUpdateFrames(codexMarkerFromLaunch(t, launch)), nil, nil
+	})
+	stubCodexFallbackRead(t, capturingFallbackRead)
+	h := codexDirectFixtureOver(t, f, time.Now())
+	h.endToEnd()
+
+	if result := runCodexSmoke(context.Background(), path, codexSmokeTestVersion); result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	drainCodexRunDebtLadder(t)
+	afterSmoke := codexObservedAt(t, f)
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs != 0 || afterSmoke.UnixMilli() < snap.RunFloorMs {
+		t.Fatalf("the smoke's debt must be paid first: %+v (observedAt %s)", snap, afterSmoke)
+	}
+	codexDirectScanAtStartup() // the baseline: the tree as the smoke left it
+
+	run := time.Now().Add(time.Second)
+	time.Sleep(time.Until(run))
+	writeCodexRunRollout(t, f.home, "shell-after-smoke", run.Add(-time.Second), run, run, true,
+		[]map[string]any{codexRateLimitFrameWithLimitID("codex", 77, 78, run)})
+	h.pollWall()
+	waitCodexUsageRefreshIdle(t)
+
+	if got := codexObservedAt(t, f); got.UnixMilli() < run.UnixMilli() || !got.After(afterSmoke) {
+		t.Fatalf("observedAt %s did not advance past the smoke's %s to the later run %s", got, afterSmoke, run)
+	}
+	if s := codexSessionMetric(t, codexMetricsFromCache(time.Now(), f.fp)); s.Consumed == nil || *s.Consumed != 77 {
+		t.Fatalf("session = %+v, want the later run's 77%%", s)
+	}
+}

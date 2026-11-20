@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -22,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -132,7 +134,7 @@ func codexRolloutWrittenAfter(ctx context.Context, root string, after time.Time)
 		if err != nil || entry.IsDir() {
 			return nil
 		}
-		if matched, _ := filepath.Match("rollout-*.jsonl", entry.Name()); !matched {
+		if !codexIsRolloutFileName(entry.Name()) {
 			return nil
 		}
 		if info, err := entry.Info(); err == nil && info.ModTime().After(after) {
@@ -141,6 +143,115 @@ func codexRolloutWrittenAfter(ctx context.Context, root string, after time.Time)
 		return nil
 	})
 	return errors.Is(err, errCodexRolloutFound)
+}
+
+// codexIsRolloutFileName reports whether name is a Codex rollout log
+// (`rollout-*.jsonl`).
+func codexIsRolloutFileName(name string) bool {
+	matched, err := filepath.Match("rollout-*.jsonl", name)
+	return err == nil && matched
+}
+
+// codexRolloutWatchDirs returns the date directories a run happening around
+// `now` writes its rollout into: today and yesterday in now's own location
+// (the caller passes local time; yesterday covers a run that started before
+// midnight), and today in UTC, so a host whose local and UTC dates differ — the
+// Windows nightly — is covered whichever clock the Codex build files by.
+// De-duplicated, newest local date first.
+func codexRolloutWatchDirs(base string, now time.Time) []string {
+	if base == "" {
+		return nil
+	}
+	root := filepath.Join(base, "sessions")
+	dirs := make([]string, 0, 3)
+	for _, day := range []time.Time{now, now.AddDate(0, 0, -1), now.UTC()} {
+		dir := filepath.Join(root, day.Format("2006"), day.Format("01"), day.Format("02"))
+		if !slices.Contains(dirs, dir) {
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
+}
+
+// codexRolloutFileStat is one rollout's (path, mtime, size) — metadata only,
+// never content.
+type codexRolloutFileStat struct {
+	path    string
+	mtimeNs int64
+	size    int64
+}
+
+// codexNewestRolloutFiles lists one date directory and returns its newest n
+// `rollout-*.jsonl` files by mtime (newest first; path breaks a tie). complete
+// is false when ctx ended or a read failed part-way, so the caller must not
+// treat the listing as the directory's state; a missing directory is an empty,
+// complete listing.
+//
+// The listing is chunked and checks ctx between chunks and stats, like
+// codexReadDirContext, but it deliberately does NOT go through that helper's
+// resume state: that state is the reconcile discovery's own cursor (an
+// interrupted stream, its replay queue, its traversal position), and a second
+// reader consuming it would steal entries discovery has yet to process.
+func codexNewestRolloutFiles(ctx context.Context, dir string, n int) ([]codexRolloutFileStat, bool) {
+	if n <= 0 {
+		return nil, true
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, os.IsNotExist(err)
+	}
+	defer f.Close()
+	var newest []codexRolloutFileStat
+	for {
+		if ctx.Err() != nil {
+			return newest, false
+		}
+		batch, readErr := f.ReadDir(codexRolloutReadDirChunkSize)
+		for _, entry := range batch {
+			if ctx.Err() != nil {
+				return newest, false
+			}
+			if entry.IsDir() || !codexIsRolloutFileName(entry.Name()) {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			info, err := os.Stat(path)
+			if err != nil {
+				// Removed or rotated since the listing: not a rollout to track.
+				continue
+			}
+			newest = codexInsertNewestRolloutFile(newest, codexRolloutFileStat{
+				path: path, mtimeNs: info.ModTime().UnixNano(), size: info.Size(),
+			}, n)
+		}
+		if readErr == io.EOF {
+			return newest, true
+		}
+		if readErr != nil {
+			return newest, false
+		}
+	}
+}
+
+// codexInsertNewestRolloutFile adds file to newest (sorted newest first) and
+// keeps at most n, replacing any entry for the same path.
+func codexInsertNewestRolloutFile(newest []codexRolloutFileStat, file codexRolloutFileStat, n int) []codexRolloutFileStat {
+	newest = slices.DeleteFunc(newest, func(f codexRolloutFileStat) bool { return f.path == file.path })
+	i, _ := slices.BinarySearchFunc(newest, file, codexRolloutFileNewestFirst)
+	newest = slices.Insert(newest, i, file)
+	if len(newest) > n {
+		newest = newest[:n]
+	}
+	return newest
+}
+
+// codexRolloutFileNewestFirst orders rollout stats newest mtime first, path
+// breaking a tie.
+func codexRolloutFileNewestFirst(a, b codexRolloutFileStat) int {
+	if c := cmp.Compare(b.mtimeNs, a.mtimeNs); c != 0 {
+		return c
+	}
+	return strings.Compare(a.path, b.path)
 }
 
 // codexRolloutCursorBelowFloor restarts a forced scan just below the run
@@ -1011,8 +1122,7 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 			if entry.IsDir() {
 				continue
 			}
-			matched, err := filepath.Match("rollout-*.jsonl", entry.Name())
-			if err != nil || !matched {
+			if !codexIsRolloutFileName(entry.Name()) {
 				continue
 			}
 			info, err := os.Stat(path)
