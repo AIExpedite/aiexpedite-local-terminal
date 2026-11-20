@@ -390,6 +390,10 @@ type ACPSession struct {
 	// observe is the launch's frame observer (acpLaunch.observe), nil for
 	// most agents. Set once at Start.
 	observe func(line string)
+	// ownIO is when this child last read or wrote a frame: the outside-writer
+	// watcher of a session it resumed never counts the child's own store
+	// writes as another writer's (cli_session_outside_writer.go).
+	ownIO cliSessionOwnIO
 
 	mu            sync.Mutex
 	status        string // "running" | "ended"
@@ -872,6 +876,12 @@ func (m *ACPManager) sendAccepting(id string, payload string, accept func() erro
 			return err
 		}
 	}
+	// A frame the checks admitted that loads a session AI Expedite's isolated
+	// Grok home cannot see links that one session's folder in first
+	// (cli_session_outside_writer.go, grok_isolated_home.go).
+	if !deviceBuilt {
+		prepareACPResumeFrame(p, trimmed)
+	}
 
 	session.stdinMu.Lock()
 	defer session.stdinMu.Unlock()
@@ -931,7 +941,13 @@ func (m *ACPManager) sendAccepting(id string, payload string, accept func() erro
 		return fmt.Errorf("timeout writing to %s session %s stdin — session terminated to prevent frame interleave", p.noun, id)
 	}
 	wrote = true
+	session.ownIO.note()
 	m.armFirstFrameWatchdog(session, trimmed)
+	// A session this frame resumes in place is watched for another writer
+	// for as long as the child runs (cli_session_outside_writer.go).
+	if !deviceBuilt {
+		m.noteACPResumeWritten(session, trimmed)
+	}
 
 	fmt.Printf("%s%s → %s (%d bytes)%s\n",
 		colorBlue, p.logTag, id, len(trimmed), colorReset)
@@ -1369,6 +1385,7 @@ func (m *ACPManager) readStream(session *ACPSession, publishFn PublishFunc) {
 			// reports an error frame and keeps scanning, so the watchdog must
 			// stay armed until we see a real frame.
 			session.signalFirstFrame()
+			session.ownIO.note()
 
 			if lineCount <= 3 {
 				fmt.Printf("%s%s stdout[%d] %s: %s%s\n",

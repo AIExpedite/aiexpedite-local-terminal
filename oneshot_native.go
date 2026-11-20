@@ -345,6 +345,11 @@ type oneShotNativeSession struct {
 	turnMu        sync.Mutex
 	// endDrainUnconfirmed marks a retained tombstone (see end_confirm.go).
 	endDrainUnconfirmed bool
+	// ownIO is when this session's last turn ended (its child had exited):
+	// the outside-writer watcher of the conversation it continues reads it
+	// (TurnState), so that turn's own store writes are never another
+	// program's.
+	ownIO cliSessionOwnIO
 }
 
 func (s *oneShotNativeSession) Status() string {
@@ -604,6 +609,9 @@ func (m *oneShotNativeManager) SendTurn(id, text string, publishFn PublishFunc, 
 		return fmt.Errorf("%s native session %s has ended", name, id)
 	}
 	defer func() {
+		// Noted before the session reads idle: a watcher that sees the turn
+		// over always sees when it ended.
+		session.ownIO.note()
 		if session.Status() != "ended" {
 			session.setStatus("idle")
 		}

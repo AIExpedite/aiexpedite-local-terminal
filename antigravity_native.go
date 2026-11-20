@@ -141,6 +141,11 @@ type AntigravityNativeSession struct {
 	// while its tree may still be exiting; the next turn's spawn waits for it
 	// (awaitLingeringTurn). Guarded by mu.
 	lingering *antigravityLingeringTurn
+	// ownIO is when this session's last turn ended (its child had exited):
+	// the outside-writer watcher of the conversation it continues reads it
+	// (TurnState), so that turn's own store writes are never another
+	// program's.
+	ownIO cliSessionOwnIO
 }
 
 type antigravityTurn struct {
@@ -462,6 +467,9 @@ func (m *AntigravityNativeManager) SendTurn(id, text string, publishFn PublishFu
 		return fmt.Errorf("antigravity native session %s has ended", id)
 	}
 	defer func() {
+		// Noted before the session reads idle: a watcher that sees the turn
+		// over always sees when it ended.
+		session.ownIO.note()
 		if session.Status() != "ended" {
 			session.setStatus("idle")
 		}

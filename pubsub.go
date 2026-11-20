@@ -1380,8 +1380,8 @@ type resultMsg struct {
 	// correlate the response with its pending inspection request.
 	Readiness *ReadinessReport `json:"readiness,omitempty"`
 
-	// Coding-session discovery (claude_session_discovery.go /
-	// claude_session_probe.go, shared-constants cliSessionDiscovery.js):
+	// Coding-session discovery (cli_session_discovery.go,
+	// cli_session_outside_writer.go, shared-constants cliSessionDiscovery.js):
 	// populated only on __cli_sessions_discover_result__,
 	// __cli_session_probe_result__ and claude_native_outside_writer.
 	CliSessions   *cliSessionsDiscoverResult `json:"cliSessions,omitempty"`
@@ -2129,6 +2129,17 @@ func runPubSubConnection(cfg *Config) error {
 
 	topic := client.Publisher(topicName)
 
+	// Every outside-writer watcher publishes through this connection from now
+	// on, one a resume starts later with its session's older publisher
+	// included, and every running watcher repeats its last state on it: a
+	// frame published while the link was down (an `idle` that releases a held
+	// message) is never lost for good (cli_session_outside_writer.go). The
+	// publisher is set here, before any command is received; only the repeat
+	// runs in the background.
+	outsideWriterPublish := newSessionPublishFn(topic, "[outside-writer]")
+	setCliOutsideWriterPublisher(outsideWriterPublish)
+	go resendCliSessionOutsideWriterStates(outsideWriterPublish)
+
 	fmt.Printf("[pubsub] connected to subscription: %s\n", cfg.CommandsSubscription)
 	if IsSystrayReady() {
 		systray.SetTooltip(EnvDisplayName + " – Connected")
@@ -2667,7 +2678,7 @@ func runPubSubConnection(cfg *Config) error {
 		}
 
 		if cmd.Command == cliSessionsDiscoverCommand || cmd.Command == cliSessionProbeCommand {
-			// Read-only coding-session discovery / probe (claude_session_*.go).
+			// Read-only coding-session discovery / probe (cli_session_discovery.go).
 			// Always publishes one correlated result; nack on a publish
 			// failure so Pub/Sub redelivers.
 			handler := handleCliSessionsDiscoverCommand
@@ -8048,6 +8059,11 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 			publishFn,
 			onStarted,
 		)
+		if err == nil {
+			// A start that continues an existing conversation in place is
+			// watched for another writer of it (cli_session_outside_writer.go).
+			watchOneShotResumedSession(cliSessionEngineAntigravity, cmd, globalAntigravityNativeManager, publishFn)
+		}
 		if err != nil {
 			// Only emit antigravity_native_ended when no local session exists.
 			// A residual "already exists" path (or any Start error after a live
@@ -8499,6 +8515,10 @@ func dispatchOneShotNativeCommandAccepting(cmd commandMsg, mgr oneShotNativeComm
 			if !mgr.HasSession(cmd.SessionID) {
 				publishFn(ended(redactAgentSecrets(fmt.Sprintf("start failed: %v", err)), "error", -1))
 			}
+		} else if ts, ok := mgr.(oneShotTurnState); ok {
+			// A start that continues an existing conversation in place is
+			// watched for another writer of it (cli_session_outside_writer.go).
+			watchOneShotResumedSession(oneShotEngineFor(spec.FramePrefix), cmd, ts, publishFn)
 		}
 
 	case sendType:

@@ -1,23 +1,35 @@
-// claude_session_discovery.go — answers terminal-service's
-// __cli_sessions_discover__ command: the Claude Code sessions this computer
-// knows that AI Expedite may NOT have started (a tab in VS Code / Insiders /
-// Cursor, a session started in a terminal), by title, so the owner can adopt
-// one into the web chat without knowing its session id.
+// cli_session_discovery.go — answers terminal-service's
+// __cli_sessions_discover__ command: the coding-agent sessions this computer
+// knows that AI Expedite may NOT have started (a Claude Code tab in VS Code /
+// Insiders / Cursor, a Codex or Grok session started in a terminal), by
+// title, so the owner can adopt one into the web chat without knowing its
+// session id. One request asks for ONE engine (args [engine, lookBackDays,
+// maxRows]); the engine-keyed reader registry (cliSessionReaders) answers it:
+// Claude Code's reader is in this file (its sources in
+// claude_session_sources_*.go), every other engine's in
+// <engine>_session_sources.go.
 //
 // Contract: shared-constants src/constants/cliSessionDiscovery.js
-// (CLI_SESSION_DEVICE_COMMANDS / CLI_SESSION_DEVICE_RESULT_TYPES, sources,
-// title sources, skip reasons). terminal-service matches titles; this file
-// only reports what each local source says.
+// (CLI_SESSION_DEVICE_COMMANDS / CLI_SESSION_DEVICE_RESULT_TYPES, engines,
+// sources, title sources, skip reasons). terminal-service matches titles;
+// this file only reports what each local source says.
 //
 // READ-ONLY by construction: every source is opened read-only (SQLite
-// `mode=ro&immutable=1`, plain os.Open on files) and nothing is ever written,
-// locked or renamed. The editors' storage is not a documented interface, so
-// every reader parses through an allowlist and reports a source it cannot
-// read as skipped (`unreadable` / `unrecognised` / `timeout`) rather than
-// guessing; one bad source never fails the request.
+// `mode=ro`, and `immutable` unless its owner's write-ahead log is live,
+// cliSessionSQLiteDSN; plain os.Open on files) and nothing is ever written,
+// created, renamed or locked against its owner. No agent documents its
+// session storage, so every reader parses through an allowlist and reports a
+// source it cannot read as skipped (`unreadable` / `unrecognised` /
+// `timeout`) rather than guessing; one bad source never fails the request.
+// Every reader shares the one budget (cliSessionDiscoverBudget,
+// cliSessionMaxRows): a scan the budget cuts short answers what it read,
+// marked `truncated`, and a reader that does not answer at all is reported
+// timed out instead of holding the answer.
 //
 // Privacy: a row carries a title or a short, masked prompt-based fallback
-// label — never conversation content, tool output or file contents.
+// label — never conversation content, tool output or file contents. Only the
+// session ids and folders terminal-service needs to adopt a session leave
+// the computer, and transcripts never do.
 package main
 
 import (
@@ -45,19 +57,37 @@ const (
 	claudeOutsideWriterResultType = "claude_native_outside_writer"
 )
 
-// The one engine this build discovers (shared-constants CLI_SESSION_ENGINES).
-const cliSessionEngineClaudeCode = "claudeCode"
+// Engines (shared-constants CLI_SESSION_ENGINES): each is the coding agent's
+// CLI_AGENT_IDS value, so they are derived from those, never re-listed.
+const (
+	cliSessionEngineClaudeCode  = claudeCodeCliAgentID
+	cliSessionEngineCodex       = codexCliAgentID
+	cliSessionEngineGrok        = grokCliAgentID
+	cliSessionEngineOpenCode    = opencodeCliAgentID
+	cliSessionEngineAntigravity = antigravityCliAgentID
+	cliSessionEngineMuseCode    = museCodeCliAgentID
+)
 
 // cliSessionDiscoveryProtocol is advertised in capabilitiesInfo
 // (shared-constants CLI_SESSION_DISCOVERY_PROTOCOL; a reader accepts any value
-// at or above its own). 2 adds, all additive:
+// at or above its own). 2 added, all additive:
 //   - rows (and the probe) carry `startedVia` / `lastVia`, the raw entrypoint
 //     Claude Code recorded when the session started and when it was last driven;
 //   - a scan cut short by the time budget keeps what it read and says
 //     `truncated: true`;
 //   - the claude_native_outside_writer frame names the agent (`agentId`,
 //     `bootId`), and a --fork-session copy never watches the original.
-const cliSessionDiscoveryProtocol = 2
+//
+// 3 is shared-constants CLI_SESSION_MULTI_ENGINE_PROTOCOL, the first at which
+// the cloud asks for an engine other than Claude Code:
+//   - every engine the capability lists has a reader (cliSessionReaders), and
+//     each request's `truncated` / `sourcesSkipped` are that engine's own;
+//   - every row carries `engine`;
+//   - the outside-writer frame is published for every engine a session of
+//     which AI Expedite continues in place (cli_session_outside_writer.go),
+//     and a watcher's current state is published again on every Pub/Sub
+//     reconnect, so a missed `idle` never holds a message for good.
+const cliSessionDiscoveryProtocol = 3
 
 // Sources (shared-constants CLI_SESSION_SOURCES).
 const (
@@ -66,6 +96,12 @@ const (
 	cliSessionSourceCursor         = "cursor"
 	cliSessionSourceClaudeRegistry = "claudeRegistry"
 	cliSessionSourceClaudeStore    = "claudeStore"
+	// One source per other engine: its own session store or listing.
+	cliSessionSourceCodexStore       = "codexStore"
+	cliSessionSourceGrokStore        = "grokStore"
+	cliSessionSourceAntigravityStore = "antigravityStore"
+	cliSessionSourceOpenCodeStore    = "opencodeStore"
+	cliSessionSourceMuseListing      = "museListing"
 )
 
 // Title sources (shared-constants CLI_SESSION_TITLE_SOURCES). "none" is not in
@@ -91,6 +127,15 @@ const (
 	cliSessionErrEngineNotSupported = "engineNotSupported"
 	cliSessionErrBadRequest         = "badRequest"
 	cliSessionErrInternal           = "internal"
+	// The provider itself offers no list this build can read (a Muse Code host
+	// without MSP `session/list`), and the agent's CLI is not on this computer:
+	// the spellings of shared-constants CLI_SESSION_DISCOVERY_STATUS_REASONS
+	// PROVIDER_UNSUPPORTED / NOT_INSTALLED, so terminal-service reports the
+	// engine `unsupported` for the right reason instead of "no sessions".
+	cliSessionErrProviderUnsupported = "providerUnsupported"
+	cliSessionErrNotInstalled        = "notInstalled"
+	// A probe that could not answer inside the budget: never read as "gone".
+	cliSessionErrTimeout = "timeout"
 )
 
 const (
@@ -147,6 +192,10 @@ type cliSessionEditorRef struct {
 }
 
 type cliSessionRow struct {
+	// Engine is the reader's (shared-constants CLI_SESSION_ENGINES), stamped on
+	// every row by runCliSessionDiscover: one conversation two sources list is
+	// one candidate, keyed (engine, sessionId). Protocol 3.
+	Engine              string                `json:"engine"`
 	SessionID           string                `json:"sessionId"`
 	Cwd                 string                `json:"cwd,omitempty"`
 	Title               string                `json:"title"`
@@ -367,22 +416,18 @@ type claudeDiscoveryEnv struct {
 }
 
 func defaultClaudeDiscoveryEnv(lookBackDays, maxRows int) claudeDiscoveryEnv {
-	if lookBackDays <= 0 {
-		lookBackDays = cliSessionDefaultLookBackDays
-	}
-	if lookBackDays > cliSessionMaxLookBackDays {
-		lookBackDays = cliSessionMaxLookBackDays
-	}
-	if maxRows <= 0 || maxRows > cliSessionMaxRows {
-		maxRows = cliSessionDefaultMaxRows
-	}
+	return claudeDiscoveryEnvFor(newCliSessionDiscoverRequest(lookBackDays, maxRows))
+}
+
+// claudeDiscoveryEnvFor is the real computer's Claude sources for one request.
+func claudeDiscoveryEnvFor(req cliSessionDiscoverRequest) claudeDiscoveryEnv {
 	home := userHomeDir()
 	return claudeDiscoveryEnv{
 		configDir:    claudeConfigDir(home),
 		editorRoots:  defaultEditorUserDataRoots(home),
-		now:          time.Now(),
-		lookBack:     time.Duration(lookBackDays) * 24 * time.Hour,
-		maxRows:      maxRows,
+		now:          req.now,
+		lookBack:     req.lookBack,
+		maxRows:      req.maxRows,
 		isOwnSession: isClaudeOwnSessionID,
 		isOwnPID:     isClaudeOwnPID,
 	}
@@ -693,6 +738,255 @@ func claudeSessionTitle(info *claudeTranscriptInfo, tabs []claudeEditorTab, runn
 }
 
 /* -------------------------------------------------------------------------- */
+/* Reader registry                                                            */
+/* -------------------------------------------------------------------------- */
+
+// cliSessionDiscoverRequest is one discovery's bounds, already clamped.
+type cliSessionDiscoverRequest struct {
+	now      time.Time
+	lookBack time.Duration
+	maxRows  int
+}
+
+// since is the oldest last activity the request asks for.
+func (r cliSessionDiscoverRequest) since() time.Time { return r.now.Add(-r.lookBack) }
+
+// newCliSessionDiscoverRequest clamps the server's bounds to this build's
+// defaults and ceilings (shared-constants CLI_SESSION_DISCOVERY_LIMITS).
+func newCliSessionDiscoverRequest(lookBackDays, maxRows int) cliSessionDiscoverRequest {
+	if lookBackDays <= 0 {
+		lookBackDays = cliSessionDefaultLookBackDays
+	}
+	if lookBackDays > cliSessionMaxLookBackDays {
+		lookBackDays = cliSessionMaxLookBackDays
+	}
+	if maxRows <= 0 || maxRows > cliSessionMaxRows {
+		maxRows = cliSessionDefaultMaxRows
+	}
+	return cliSessionDiscoverRequest{
+		now:      time.Now(),
+		lookBack: time.Duration(lookBackDays) * 24 * time.Hour,
+		maxRows:  maxRows,
+	}
+}
+
+// cliSessionProbeRequest is one probe's arguments.
+type cliSessionProbeRequest struct {
+	now            time.Time
+	sessionID      string
+	cwd            string
+	includeHistory bool
+}
+
+// cliSessionReader is one engine's discovery: what lists its sessions and
+// what answers a probe of one of them. Every reader is read-only, stops when
+// its ctx ends (cliSessionSourceDeadlineGrace before the collector stops
+// waiting) with what it read marked truncated, keeps to req.maxRows, and
+// reports a source it could not read as skipped rather than guessing.
+type cliSessionReader struct {
+	engine string
+	// sources are the sources discover reads, reported timed out when it
+	// never answers.
+	sources  []string
+	discover func(ctx context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult
+	probe    func(ctx context.Context, req cliSessionProbeRequest) cliSessionProbeResult
+	// selfBudgeted: discover and probe keep the budget themselves (Claude
+	// Code's collector, unchanged since protocol 2), so they are called
+	// directly rather than through the runner's own wait.
+	selfBudgeted bool
+}
+
+// claudeSessionReader is Claude Code's reader: the sources above, as protocol
+// 2 read them.
+var claudeSessionReader = &cliSessionReader{
+	engine: cliSessionEngineClaudeCode,
+	sources: []string{
+		cliSessionSourceVSCode, cliSessionSourceVSCodeInsiders, cliSessionSourceCursor,
+		cliSessionSourceClaudeRegistry, cliSessionSourceClaudeStore,
+	},
+	selfBudgeted: true,
+	discover: func(ctx context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+		return discoverClaudeSessions(ctx, claudeDiscoveryEnvFor(req))
+	},
+	probe: func(ctx context.Context, req cliSessionProbeRequest) cliSessionProbeResult {
+		return probeClaudeSession(ctx, defaultClaudeDiscoveryEnv(0, 0), req.sessionID, req.includeHistory)
+	},
+}
+
+// cliSessionReaders is every engine this build discovers, Claude Code first
+// (the capability lists them in this order), then shared-constants
+// CLI_SESSION_ENGINES' order. A var so tests can stand a reader in.
+var cliSessionReaders = []*cliSessionReader{
+	claudeSessionReader,
+	codexSessionReader,
+	grokSessionReader,
+	openCodeSessionReader,
+	antigravitySessionReader,
+	museCodeSessionReader,
+}
+
+// cliSessionReaderFor is the engine's reader, nil for one this build has none for.
+func cliSessionReaderFor(engine string) *cliSessionReader {
+	for _, r := range cliSessionReaders {
+		if r.engine == engine {
+			return r
+		}
+	}
+	return nil
+}
+
+// newCliSessionDiscoveryCapability is capabilitiesInfo.CliSessionDiscovery:
+// every engine this build has a reader for, Claude Code first, at this
+// build's protocol, whether or not the agent's CLI is installed here (the
+// shared contract's six). terminal-service answers "not installed"
+// (CLAUDE_NOT_INSTALLED / AGENT_NOT_INSTALLED) from the CLI Agents report,
+// which its demand-driven refresh keeps current, but only for an engine
+// listed here: one missing from this list at protocol 3 reads as an agent
+// whose sessions this app cannot read at all (providerUnsupported), and this
+// list is gathered again only every machineInfoRefreshInterval, so a CLI
+// installed in between would read that way for hours. A reader whose agent is
+// missing still says so itself (Muse Code's `notInstalled`).
+func newCliSessionDiscoveryCapability() *cliSessionDiscoveryCapability {
+	engines := make([]string, 0, len(cliSessionReaders))
+	for _, r := range cliSessionReaders {
+		engines = append(engines, r.engine)
+	}
+	return &cliSessionDiscoveryCapability{Engines: engines, Protocol: cliSessionDiscoveryProtocol}
+}
+
+// newCliSessionsResult is an empty answer for engine, scanned at now.
+func newCliSessionsResult(engine string, now time.Time) cliSessionsDiscoverResult {
+	return cliSessionsDiscoverResult{
+		Engine:         engine,
+		Rows:           []cliSessionRow{},
+		SourcesChecked: []string{},
+		SourcesSkipped: []cliSessionSkip{},
+		ScannedAt:      now.UnixMilli(),
+	}
+}
+
+// skip records that source was not read (reason: a cliSessionSkip* value).
+func (res *cliSessionsDiscoverResult) skip(source, reason string) {
+	res.SourcesSkipped = append(res.SourcesSkipped, cliSessionSkip{Source: source, Reason: reason})
+}
+
+// failedResult is the answer for a reader that did not answer inside the
+// budget (reason timeout) or panicked (unreadable): nothing read, so it may
+// be missing every session.
+func (r *cliSessionReader) failedResult(now time.Time, reason string) cliSessionsDiscoverResult {
+	res := newCliSessionsResult(r.engine, now)
+	res.Truncated = true
+	for _, s := range r.sources {
+		res.skip(s, reason)
+	}
+	return res
+}
+
+// finishCliSessionRows sorts rows newest first (by session id within one
+// instant, so the answer is stable) and keeps at most maxRows, marking the
+// answer truncated when it drops one.
+func finishCliSessionRows(res *cliSessionsDiscoverResult, maxRows int) {
+	sort.SliceStable(res.Rows, func(i, j int) bool {
+		if res.Rows[i].LastActiveAt != res.Rows[j].LastActiveAt {
+			return res.Rows[i].LastActiveAt > res.Rows[j].LastActiveAt
+		}
+		return res.Rows[i].SessionID < res.Rows[j].SessionID
+	})
+	if maxRows > 0 && len(res.Rows) > maxRows {
+		res.Rows = res.Rows[:maxRows]
+		res.Truncated = true
+	}
+}
+
+// runCliSessionDiscover answers one request through reader under ctx (the
+// request's budget). A reader that keeps no budget of its own reads under a
+// context that ends cliSessionSourceDeadlineGrace earlier (claudeSourceContext),
+// so its partial answer still lands; one that has not answered when ctx ends
+// is reported timed out, and its goroutine's late answer is dropped. Every
+// row leaves stamped with the reader's engine.
+func runCliSessionDiscover(ctx context.Context, reader *cliSessionReader, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+	var res cliSessionsDiscoverResult
+	if reader.selfBudgeted {
+		res = reader.discover(ctx, req)
+	} else {
+		srcCtx, cancel := claudeSourceContext(ctx)
+		defer cancel()
+		answer := make(chan cliSessionsDiscoverResult, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("%s[cli-sessions] %s reader panicked: %v%s\n", colorRed, reader.engine, r, colorReset)
+					answer <- reader.failedResult(req.now, cliSessionSkipUnreadable)
+				}
+			}()
+			answer <- reader.discover(srcCtx, req)
+		}()
+		select {
+		case res = <-answer:
+		case <-ctx.Done():
+			res = reader.failedResult(req.now, cliSessionSkipTimeout)
+		}
+		finishCliSessionRows(&res, req.maxRows)
+	}
+	res.Engine = reader.engine
+	if res.Rows == nil {
+		res.Rows = []cliSessionRow{}
+	}
+	if res.SourcesChecked == nil {
+		res.SourcesChecked = []string{}
+	}
+	if res.SourcesSkipped == nil {
+		res.SourcesSkipped = []cliSessionSkip{}
+	}
+	if res.ScannedAt == 0 {
+		res.ScannedAt = req.now.UnixMilli()
+	}
+	for i := range res.Rows {
+		res.Rows[i].Engine = reader.engine
+		if res.Rows[i].Editors == nil {
+			res.Rows[i].Editors = []cliSessionEditorRef{}
+		}
+	}
+	return res
+}
+
+// runCliSessionProbe answers one probe through reader under ctx, the same
+// way: a probe that does not answer in time says so (cliSessionErrTimeout)
+// rather than "no such session".
+func runCliSessionProbe(ctx context.Context, reader *cliSessionReader, req cliSessionProbeRequest) cliSessionProbeResult {
+	var res cliSessionProbeResult
+	if reader.selfBudgeted {
+		res = reader.probe(ctx, req)
+	} else {
+		answer := make(chan cliSessionProbeResult, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("%s[cli-sessions] %s probe panicked: %v%s\n", colorRed, reader.engine, r, colorReset)
+					answer <- cliSessionProbeResult{SessionID: req.sessionID, Error: cliSessionErrInternal}
+				}
+			}()
+			answer <- reader.probe(ctx, req)
+		}()
+		select {
+		case res = <-answer:
+		case <-ctx.Done():
+			res = cliSessionProbeResult{SessionID: req.sessionID, Error: cliSessionErrTimeout}
+		}
+	}
+	if res.SessionID == "" {
+		res.SessionID = req.sessionID
+	}
+	if res.Writers == nil {
+		res.Writers = []cliSessionWriter{}
+	}
+	if res.OpenInEditors == nil {
+		res.OpenInEditors = []string{}
+	}
+	return res
+}
+
+/* -------------------------------------------------------------------------- */
 /* Command handlers                                                           */
 /* -------------------------------------------------------------------------- */
 
@@ -755,31 +1049,88 @@ func handleCliSessionsDiscoverCommand(ctx context.Context, topic *pubsub.Publish
 		res.CliSessions = &payload
 		return publishMsg(ctx, topic, res)
 	}
+	engine, lookBackDays, maxRows := parseDiscoverArgs(cmd.Args)
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("%s[pubsub] panic in cli session discovery: %v%s\n", colorRed, r, colorReset)
-			publishErr = publish(cliSessionsDiscoverResult{
-				Engine: cliSessionEngineClaudeCode, Rows: []cliSessionRow{},
-				SourcesChecked: []string{}, SourcesSkipped: []cliSessionSkip{},
-				ScannedAt: time.Now().UnixMilli(), Error: cliSessionErrInternal,
-			}, "error")
+			failed := newCliSessionsResult(engine, time.Now())
+			failed.Error = cliSessionErrInternal
+			publishErr = publish(failed, "error")
 		}
 	}()
 
-	engine, lookBackDays, maxRows := parseDiscoverArgs(cmd.Args)
-	if engine != cliSessionEngineClaudeCode {
-		return publish(cliSessionsDiscoverResult{
-			Engine: engine, Rows: []cliSessionRow{},
-			SourcesChecked: []string{}, SourcesSkipped: []cliSessionSkip{},
-			ScannedAt: time.Now().UnixMilli(), Error: cliSessionErrEngineNotSupported,
-		}, "error")
+	reader := cliSessionReaderFor(engine)
+	if reader == nil {
+		unsupported := newCliSessionsResult(engine, time.Now())
+		unsupported.Error = cliSessionErrEngineNotSupported
+		return publish(unsupported, "error")
 	}
 	runCtx, cancel := context.WithTimeout(ctx, cliSessionDiscoverBudget)
 	defer cancel()
-	res := discoverClaudeSessions(runCtx, defaultClaudeDiscoveryEnv(lookBackDays, maxRows))
+	res := runCliSessionDiscover(runCtx, reader, newCliSessionDiscoverRequest(lookBackDays, maxRows))
 	fitDiscoverResult(&res)
 	if err := publish(res, "success"); err != nil {
 		fmt.Printf("%s[pubsub] Failed to publish cli session discovery: %v%s\n", colorRed, err, colorReset)
+		return err
+	}
+	return nil
+}
+
+// parseProbeArgs reads [engine, sessionId, cwd, includeHistory].
+func parseProbeArgs(args []string) (engine, sessionID, cwd string, includeHistory bool) {
+	engine = cliSessionEngineClaudeCode
+	if len(args) > 0 && args[0] != "" {
+		engine = args[0]
+	}
+	if len(args) > 1 {
+		sessionID = args[1]
+	}
+	if len(args) > 2 {
+		cwd = args[2]
+	}
+	if len(args) > 3 {
+		includeHistory = args[3] == "1"
+	}
+	return
+}
+
+// handleCliSessionProbeCommand ALWAYS publishes one correlated result, even
+// after a panic, so terminal-service's pending probe never sticks.
+func handleCliSessionProbeCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) (publishErr error) {
+	engine, sessionID, cwd, includeHistory := parseProbeArgs(cmd.Args)
+	publish := func(payload cliSessionProbeResult, status string) error {
+		res := cliSessionResultBase(cmd, cfg, cliSessionProbeResultType)
+		res.Status = status
+		res.Probe = &payload
+		return publishMsg(ctx, topic, res)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("%s[pubsub] panic in cli session probe: %v%s\n", colorRed, r, colorReset)
+			publishErr = publish(cliSessionProbeResult{
+				SessionID: sessionID, Writers: []cliSessionWriter{}, OpenInEditors: []string{},
+				Error: cliSessionErrInternal,
+			}, "error")
+		}
+	}()
+	reader := cliSessionReaderFor(engine)
+	if reader == nil || reader.probe == nil {
+		return publish(cliSessionProbeResult{
+			SessionID: sessionID, Writers: []cliSessionWriter{}, OpenInEditors: []string{},
+			Error: cliSessionErrEngineNotSupported,
+		}, "error")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, cliSessionDiscoverBudget)
+	defer cancel()
+	res := runCliSessionProbe(probeCtx, reader, cliSessionProbeRequest{
+		now: time.Now(), sessionID: sessionID, cwd: cwd, includeHistory: includeHistory,
+	})
+	status := "success"
+	if res.Error != "" {
+		status = "error"
+	}
+	if err := publish(res, status); err != nil {
+		fmt.Printf("%s[pubsub] Failed to publish cli session probe: %v%s\n", colorRed, err, colorReset)
 		return err
 	}
 	return nil

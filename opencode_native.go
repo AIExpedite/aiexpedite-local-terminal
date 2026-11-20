@@ -157,6 +157,11 @@ type OpenCodeNativeSession struct {
 	// as a tombstone (see end_confirm.go): only a verified-absent turn process
 	// may convert it into the "not found" absence answer.
 	endDrainUnconfirmed bool
+	// ownIO is when this session's last turn ended (its child had exited):
+	// the outside-writer watcher of the conversation it continues reads it
+	// (TurnState), so that turn's own store writes are never another
+	// program's.
+	ownIO cliSessionOwnIO
 }
 
 type openCodeTurn struct {
@@ -427,6 +432,9 @@ func (m *OpenCodeNativeManager) SendTurn(id, text string, publishFn PublishFunc,
 		return fmt.Errorf("opencode native session %s has ended", id)
 	}
 	defer func() {
+		// Noted before the session reads idle: a watcher that sees the turn
+		// over always sees when it ended.
+		session.ownIO.note()
 		if session.Status() != "ended" {
 			session.setStatus("idle")
 		}

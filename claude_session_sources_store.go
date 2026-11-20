@@ -1,5 +1,5 @@
 // claude_session_sources_store.go — Claude Code's own session sources, for
-// session discovery (claude_session_discovery.go) and the adoption probe
+// session discovery (cli_session_discovery.go) and the adoption probe
 // (claude_session_probe.go).
 //
 //   - Running registry: <configDir>/sessions/<pid>.json, one per live Claude

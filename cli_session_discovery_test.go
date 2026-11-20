@@ -8,9 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
+
+	"cloud.google.com/go/pubsub/v2"
 )
 
 const (
@@ -250,17 +254,20 @@ func TestDiscoverAndProbeAreInternalDemandCommands(t *testing.T) {
 }
 
 // Protocol 2 (startedVia / lastVia, the partial scan, the outside-writer
-// frame's agentId) is additive: terminal-service accepts any protocol at or
-// above its own CLI_SESSION_DISCOVERY_PROTOCOL (1), so older servers keep
-// discovering through a newer agent.
+// frame's agentId) and 3 (every engine with a reader, `engine` on every row)
+// are additive: terminal-service accepts any protocol at or above its own
+// CLI_SESSION_DISCOVERY_PROTOCOL (1), so older servers keep discovering
+// Claude Code through a newer agent: Claude Code stays the first engine
+// listed, and one that reads protocol 1-2 only takes that one
+// (cliSessionDiscoveryEnginesOf).
 func TestCapabilityAdvertisesClaudeDiscovery(t *testing.T) {
 	caps := newMachineCapabilities()
-	if caps.CliSessionDiscovery == nil || caps.CliSessionDiscovery.Protocol != 2 ||
-		len(caps.CliSessionDiscovery.Engines) != 1 || caps.CliSessionDiscovery.Engines[0] != "claudeCode" {
+	if caps.CliSessionDiscovery == nil || caps.CliSessionDiscovery.Protocol != 3 ||
+		len(caps.CliSessionDiscovery.Engines) == 0 || caps.CliSessionDiscovery.Engines[0] != "claudeCode" {
 		t.Fatalf("capability = %+v", caps.CliSessionDiscovery)
 	}
 	b, _ := json.Marshal(caps)
-	if !strings.Contains(string(b), `"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":2}`) {
+	if !strings.Contains(string(b), `"cliSessionDiscovery":{"engines":["claudeCode",`) || !strings.Contains(string(b), `],"protocol":3}`) {
 		t.Fatalf("wire shape: %s", b)
 	}
 }
@@ -765,5 +772,516 @@ func TestEditorWindowsAreReadNewestFirstBeforeTheCap(t *testing.T) {
 		if tab.SessionID == sidC && now.Sub(time.UnixMilli(tab.SeenAt)) > 2*time.Minute {
 			t.Fatalf("seenAt = %v, want the window's own last write", time.UnixMilli(tab.SeenAt))
 		}
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/* Protocol 3: the engine registry, one budget, per-engine truncation         */
+/* -------------------------------------------------------------------------- */
+
+// standInReader replaces engine's reader (or adds one) for the rest of the test.
+func standInReader(t *testing.T, r *cliSessionReader) {
+	t.Helper()
+	prev := cliSessionReaders
+	next := []*cliSessionReader{}
+	replaced := false
+	for _, existing := range prev {
+		if existing.engine == r.engine {
+			next, replaced = append(next, r), true
+			continue
+		}
+		next = append(next, existing)
+	}
+	if !replaced {
+		next = append(next, r)
+	}
+	cliSessionReaders = next
+	t.Cleanup(func() { cliSessionReaders = prev })
+}
+
+// capturePublished records every result a handler publishes.
+func capturePublished(t *testing.T) func() []resultMsg {
+	t.Helper()
+	var mu sync.Mutex
+	var got []resultMsg
+	prev := publishMsg
+	publishMsg = func(_ context.Context, _ *pubsub.Publisher, res resultMsg) error {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, res)
+		return nil
+	}
+	t.Cleanup(func() { publishMsg = prev })
+	return func() []resultMsg {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]resultMsg(nil), got...)
+	}
+}
+
+// The wire values are shared-constants CLI_SESSION_ENGINES / CLI_SESSION_SOURCES
+// (cliSessionDiscovery.js): a contract pin, so a rename fails here.
+func TestCliSessionEnginesAndSourcesMatchSharedConstants(t *testing.T) {
+	want := []string{"claudeCode", "codex", "grok", "opencode", "antigravity", "museCode"}
+	got := []string{}
+	for _, r := range cliSessionReaders {
+		got = append(got, r.engine)
+		if r.discover == nil || r.probe == nil || len(r.sources) == 0 {
+			t.Errorf("%s: reader incomplete: %+v", r.engine, r)
+		}
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("registry engines = %v, want %v (Claude Code first)", got, want)
+	}
+	sources := map[string]string{
+		cliSessionSourceCodexStore:       "codexStore",
+		cliSessionSourceGrokStore:        "grokStore",
+		cliSessionSourceAntigravityStore: "antigravityStore",
+		cliSessionSourceOpenCodeStore:    "opencodeStore",
+		cliSessionSourceMuseListing:      "museListing",
+	}
+	for got, want := range sources {
+		if got != want {
+			t.Errorf("source %q, want %q", got, want)
+		}
+	}
+	if cliSessionDiscoveryProtocol != 3 {
+		t.Fatalf("protocol = %d, want shared-constants CLI_SESSION_MULTI_ENGINE_PROTOCOL (3)", cliSessionDiscoveryProtocol)
+	}
+	if cliSessionErrProviderUnsupported != "providerUnsupported" || cliSessionErrNotInstalled != "notInstalled" {
+		t.Fatal("error codes must spell shared-constants CLI_SESSION_DISCOVERY_STATUS_REASONS")
+	}
+}
+
+// Every engine this build has a reader for, Claude Code first, whether or not
+// its CLI is installed here (CONTRACT: `engines: [...six]`): terminal-service
+// answers "not installed" only for a listed engine, and reads one missing at
+// protocol 3 as an agent whose sessions this app cannot read at all. The PATH
+// here holds no agent's CLI, which must not shorten the list.
+func TestCapabilityListsEveryEngineClaudeFirst(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	got := newCliSessionDiscoveryCapability()
+	want := `{"engines":["claudeCode","codex","grok","opencode","antigravity","museCode"],"protocol":3}`
+	if raw, _ := json.Marshal(got); string(raw) != want {
+		t.Fatalf("capability = %s, want %s", raw, want)
+	}
+	standInReader(t, &cliSessionReader{engine: "someNewAgent", sources: []string{"someStore"}})
+	if got := newCliSessionDiscoveryCapability(); got.Engines[len(got.Engines)-1] != "someNewAgent" || got.Engines[0] != cliSessionEngineClaudeCode {
+		t.Fatalf("capability = %+v, want every reader listed, Claude Code first", got)
+	}
+}
+
+func discoverCmd(args ...string) commandMsg {
+	return commandMsg{ID: "c1", WorkspaceID: "ws", UID: "u1", AgentID: "agent-1", RefreshID: "req-123456", Command: cliSessionsDiscoverCommand, Args: args}
+}
+
+// One command asks for one engine, answered by that engine's reader; every
+// row leaves stamped with the engine, and an engine without a reader is
+// refused as before.
+func TestDiscoverCommandDispatchesByEngine(t *testing.T) {
+	published := capturePublished(t)
+	var gotReq cliSessionDiscoverRequest
+	standInReader(t, &cliSessionReader{
+		engine: cliSessionEngineCodex, sources: []string{cliSessionSourceCodexStore},
+		discover: func(_ context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+			gotReq = req
+			res := newCliSessionsResult("", req.now)
+			res.Rows = []cliSessionRow{{SessionID: "t-old", LastActiveAt: 1}, {SessionID: "t-new", LastActiveAt: 2}}
+			res.SourcesChecked = []string{cliSessionSourceCodexStore}
+			return res
+		},
+		probe: func(context.Context, cliSessionProbeRequest) cliSessionProbeResult { return cliSessionProbeResult{} },
+	})
+	if err := handleCliSessionsDiscoverCommand(context.Background(), nil, discoverCmd("codex", "7", "999"), &Config{AgentID: "agent-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if gotReq.lookBack != 7*24*time.Hour || gotReq.maxRows != cliSessionDefaultMaxRows {
+		t.Fatalf("request = %+v, want 7 days and the row ceiling clamped", gotReq)
+	}
+	frames := published()
+	if len(frames) != 1 || frames[0].CliSessions == nil || frames[0].Type != cliSessionsDiscoverResultType || frames[0].RefreshID != "req-123456" {
+		t.Fatalf("published %+v, want one correlated discover result", frames)
+	}
+	res := frames[0].CliSessions
+	if res.Engine != "codex" || len(res.Rows) != 2 || res.Rows[0].SessionID != "t-new" || res.Error != "" {
+		t.Fatalf("result = %+v, want codex's rows newest first", res)
+	}
+	for _, r := range res.Rows {
+		if r.Engine != "codex" || r.Editors == nil {
+			t.Fatalf("row = %+v, want engine codex and an editors list", r)
+		}
+	}
+	raw, _ := json.Marshal(res.Rows[0])
+	if !strings.HasPrefix(string(raw), `{"engine":"codex","sessionId":"t-new"`) {
+		t.Fatalf("row wire shape: %s", raw)
+	}
+
+	if err := handleCliSessionsDiscoverCommand(context.Background(), nil, discoverCmd("someNewAgent"), nil); err != nil {
+		t.Fatal(err)
+	}
+	frames = published()
+	last := frames[len(frames)-1]
+	if last.Status != "error" || last.CliSessions.Error != cliSessionErrEngineNotSupported || last.CliSessions.Engine != "someNewAgent" {
+		t.Fatalf("unknown engine = %+v / %+v, want engineNotSupported", last, last.CliSessions)
+	}
+}
+
+// Claude Code's rows carry `engine` too; nothing else about them changes.
+func TestClaudeRowsCarryTheirEngine(t *testing.T) {
+	configDir := t.TempDir()
+	writeTranscript(t, configDir, "-w", sidA, time.Now(), userRecord("/w", "fix the build"))
+	reader := &cliSessionReader{
+		engine: cliSessionEngineClaudeCode, selfBudgeted: true, sources: claudeSessionReader.sources,
+		discover: func(ctx context.Context, _ cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+			return discoverClaudeSessions(ctx, testDiscoveryEnv(configDir, nil))
+		},
+	}
+	res := runCliSessionDiscover(context.Background(), reader, newCliSessionDiscoverRequest(30, 500))
+	a := rowByID(res.Rows, sidA)
+	if res.Engine != "claudeCode" || a == nil || a.Engine != "claudeCode" || a.Title != "fix the build" {
+		t.Fatalf("result = %+v, want the Claude row stamped claudeCode", res)
+	}
+}
+
+// A reader that never answers (a hung disk) does not hold the answer past the
+// budget: the engine is reported truncated, its sources timed out.
+func TestRunDiscoverReportsAReaderThatNeverAnswers(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	reader := &cliSessionReader{
+		engine: cliSessionEngineGrok, sources: []string{cliSessionSourceGrokStore},
+		discover: func(context.Context, cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+			<-release // ignores its context
+			return cliSessionsDiscoverResult{}
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	res := runCliSessionDiscover(ctx, reader, newCliSessionDiscoverRequest(30, 500))
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("the answer waited %v for a reader that never answers", waited)
+	}
+	if !res.Truncated || skipReason(res, cliSessionSourceGrokStore) != cliSessionSkipTimeout || res.Engine != "grok" {
+		t.Fatalf("result = %+v, want grok truncated with its store timed out", res)
+	}
+}
+
+// A reader the budget cuts short keeps what it read: it stops on its own
+// context, which ends before the collector stops waiting.
+func TestRunDiscoverKeepsAPartialAnswerAtTheDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	budgetEnds, _ := ctx.Deadline()
+	reader := &cliSessionReader{
+		engine: cliSessionEngineAntigravity, sources: []string{cliSessionSourceAntigravityStore},
+		discover: func(rctx context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+			<-rctx.Done()
+			if !time.Now().Before(budgetEnds) {
+				t.Error("the reader's context did not end before the budget")
+			}
+			res := newCliSessionsResult("", req.now)
+			res.Rows = []cliSessionRow{{SessionID: "11111111-2222-4333-8444-555555555555", LastActiveAt: 5}}
+			res.Truncated = true
+			res.skip(cliSessionSourceAntigravityStore, cliSessionSkipTimeout)
+			return res
+		},
+	}
+	res := runCliSessionDiscover(ctx, reader, newCliSessionDiscoverRequest(30, 500))
+	if len(res.Rows) != 1 || !res.Truncated || res.Rows[0].Engine != "antigravity" {
+		t.Fatalf("result = %+v, want the partial row kept and truncated", res)
+	}
+}
+
+// The row budget is shared: past maxRows the oldest rows go and the answer
+// says so; a reader's panic is a skipped source, not a crashed agent.
+func TestRunDiscoverCapsRowsAndRecoversAPanic(t *testing.T) {
+	reader := &cliSessionReader{
+		engine: cliSessionEngineOpenCode, sources: []string{cliSessionSourceOpenCodeStore},
+		discover: func(_ context.Context, req cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+			res := newCliSessionsResult("", req.now)
+			for i := 0; i < 5; i++ {
+				res.Rows = append(res.Rows, cliSessionRow{SessionID: fmt.Sprintf("ses_%08d", i), LastActiveAt: int64(i)})
+			}
+			return res
+		},
+	}
+	res := runCliSessionDiscover(context.Background(), reader, newCliSessionDiscoverRequest(30, 3))
+	if len(res.Rows) != 3 || !res.Truncated || res.Rows[0].SessionID != "ses_00000004" {
+		t.Fatalf("result = %+v, want the 3 newest rows, truncated", res.Rows)
+	}
+	reader.discover = func(context.Context, cliSessionDiscoverRequest) cliSessionsDiscoverResult { panic("boom") }
+	res = runCliSessionDiscover(context.Background(), reader, newCliSessionDiscoverRequest(30, 3))
+	if skipReason(res, cliSessionSourceOpenCodeStore) != cliSessionSkipUnreadable || !res.Truncated {
+		t.Fatalf("panicking reader = %+v, want its source unreadable", res)
+	}
+}
+
+func probeCmd(args ...string) commandMsg {
+	return commandMsg{ID: "p1", WorkspaceID: "ws", UID: "u1", AgentID: "agent-1", RefreshID: "req-654321", Command: cliSessionProbeCommand, Args: args}
+}
+
+// The probe is dispatched by engine too; one that cannot answer in time says
+// so instead of "no such session".
+func TestProbeCommandDispatchesByEngine(t *testing.T) {
+	published := capturePublished(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	standInReader(t, &cliSessionReader{
+		engine: cliSessionEngineMuseCode, sources: []string{cliSessionSourceMuseListing},
+		discover: func(context.Context, cliSessionDiscoverRequest) cliSessionsDiscoverResult {
+			return cliSessionsDiscoverResult{}
+		},
+		probe: func(_ context.Context, req cliSessionProbeRequest) cliSessionProbeResult {
+			if req.sessionID == "slow" {
+				<-release
+			}
+			return cliSessionProbeResult{SessionID: req.sessionID, Exists: true, Resumable: true, Title: "Listed", TitleSource: cliSessionTitleSavedTitle}
+		},
+	})
+	if err := handleCliSessionProbeCommand(context.Background(), nil, probeCmd("museCode", "s-1", "/w", "0"), nil); err != nil {
+		t.Fatal(err)
+	}
+	frames := published()
+	if len(frames) != 1 || frames[0].Probe == nil || !frames[0].Probe.Resumable || frames[0].Probe.Writers == nil || frames[0].Probe.OpenInEditors == nil {
+		t.Fatalf("probe = %+v, want the reader's answer with empty lists", frames)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	res := runCliSessionProbe(ctx, cliSessionReaderFor(cliSessionEngineMuseCode), cliSessionProbeRequest{sessionID: "slow"})
+	if res.Error != cliSessionErrTimeout || res.Exists || res.Resumable {
+		t.Fatalf("slow probe = %+v, want a timeout, never gone or resumable", res)
+	}
+	if err := handleCliSessionProbeCommand(context.Background(), nil, probeCmd("someNewAgent", "x"), nil); err != nil {
+		t.Fatal(err)
+	}
+	frames = published()
+	if p := frames[len(frames)-1].Probe; p == nil || p.Error != cliSessionErrEngineNotSupported {
+		t.Fatalf("unknown engine probe = %+v", p)
+	}
+}
+
+func TestCliSessionTitleOfTellsATitleFromAPrompt(t *testing.T) {
+	for _, tc := range []struct {
+		saved, last, first, wantTitle, wantSource string
+	}{
+		{"Fix the login flow", "", "please fix login", "Fix the login flow", cliSessionTitleSavedTitle},
+		// A title that is only the first prompt's start reads as that prompt.
+		{"please fix the lo…", "", "please fix the login flow", "please fix the login flow", cliSessionTitleFirstPrompt},
+		{"", "the last ask", "the first ask", "the last ask", cliSessionTitleLastPrompt},
+		{"", "", "", "", cliSessionTitleNone},
+		{"Kept", "", "", "Kept", cliSessionTitleSavedTitle},
+	} {
+		title, source, _ := cliSessionTitleOf(tc.saved, 1, tc.last, tc.first)
+		if title != tc.wantTitle || source != tc.wantSource {
+			t.Errorf("cliSessionTitleOf(%q, %q, %q) = %q/%q, want %q/%q", tc.saved, tc.last, tc.first, title, source, tc.wantTitle, tc.wantSource)
+		}
+	}
+	long := strings.Repeat("word ", 40) + "api_key=SECRETSECRETSECRETSECRET"
+	if title, _, _ := cliSessionTitleOf("", 0, "", long); utf8.RuneCountInString(title) > cliSessionFallbackLabelMaxChars {
+		t.Fatalf("prompt label %q is longer than %d", title, cliSessionFallbackLabelMaxChars)
+	}
+	if title, _, _ := cliSessionTitleOf("", 0, "", "use api_key=SECRETSECRETSECRETSECRET now"); strings.Contains(title, "SECRETSECRET") {
+		t.Fatalf("prompt label %q was not masked", title)
+	}
+}
+
+func TestParseCliSessionTimeSpellings(t *testing.T) {
+	want := time.Date(2026, 11, 19, 10, 0, 0, 123000000, time.UTC).UnixMilli()
+	for _, s := range []string{"2026-11-19T10:00:00.123Z", "2026-11-19T11:00:00.123+01:00", "2026-11-19 11:00:00.123+01:00", "2026-11-19 10:00:00.123000+00:00"} {
+		if got := parseCliSessionTime(s); got != want {
+			t.Errorf("parseCliSessionTime(%q) = %d, want %d", s, got, want)
+		}
+	}
+	if parseCliSessionTime("yesterday") != 0 || cliSessionEpochMs(1795103283) != 1795103283000 || cliSessionEpochMs(1795103283242) != 1795103283242 {
+		t.Fatal("unknown spellings read as 0, seconds and milliseconds both as ms")
+	}
+}
+
+// sqliteSideFiles lists what lies beside a store in its folder.
+func sqliteSideFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{}
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// Another program's SQLite store is read without leaving anything behind in
+// its folder: a WAL store whose owner is not running is read `immutable` (a
+// plain read-only open creates its -wal and -shm and leaves them there), and
+// one whose owner runs is read through the owner's live log, so the writes it
+// has not checkpointed yet are seen and its next write still goes through.
+func TestCliSessionSQLiteReadCreatesNothingBesideTheStore(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+	owner, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.SetMaxOpenConns(1)
+	for _, stmt := range []string{`PRAGMA journal_mode=WAL`, `CREATE TABLE t (v TEXT)`, `INSERT INTO t VALUES ('checkpointed')`} {
+		if _, err := owner.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The owner's last connection closes: SQLite checkpoints and removes the log.
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	count := func() int {
+		t.Helper()
+		db, err := openCliSessionSQLite(context.Background(), path)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer db.Close()
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM t`).Scan(&n); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return n
+	}
+	if got := sqliteSideFiles(t, dir); len(got) != 1 {
+		t.Fatalf("before the read the folder holds %v, want the store alone", got)
+	}
+	if n := count(); n != 1 {
+		t.Fatalf("read %d rows, want the checkpointed one", n)
+	}
+	if got := sqliteSideFiles(t, dir); len(got) != 1 || got[0] != "store.db" {
+		t.Fatalf("the read left %v in the owner's folder, want the store alone", got)
+	}
+
+	// The owner runs again and writes past its last checkpoint.
+	owner, err = sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.SetMaxOpenConns(1)
+	defer owner.Close()
+	for _, stmt := range []string{`PRAGMA wal_autocheckpoint=0`, `INSERT INTO t VALUES ('in the log')`} {
+		if _, err := owner.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !cliSessionSQLiteWALLive(path) {
+		t.Fatalf("the running owner's log is not live: %v", sqliteSideFiles(t, dir))
+	}
+	if n := count(); n != 2 {
+		t.Fatalf("read %d rows, want the row still only in the owner's log too", n)
+	}
+	if _, err := owner.Exec(`INSERT INTO t VALUES ('after the read')`); err != nil {
+		t.Fatalf("the owner's write after the read failed: %v", err)
+	}
+}
+
+// Only a live log is read through: a -wal with no -shm beside it (an owner in
+// exclusive locking mode, or a log a crash left behind) is read immutable, as
+// of the store file. Reading through it would CREATE the -shm SQLite needs to
+// read a log, in the owner's folder.
+func TestCliSessionSQLiteReadOfALoneLogCreatesNoSharedMemory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+	owner, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.SetMaxOpenConns(1)
+	for _, stmt := range []string{`PRAGMA journal_mode=WAL`, `CREATE TABLE t (v TEXT)`, `INSERT INTO t VALUES ('checkpointed')`} {
+		if _, err := owner.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+"-wal", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cliSessionSQLiteWALLive(path) {
+		t.Fatal("a -wal with no -shm reads as a live log")
+	}
+	db, err := openCliSessionSQLite(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	var n int
+	err = db.QueryRow(`SELECT count(*) FROM t`).Scan(&n)
+	_ = db.Close()
+	if err != nil || n != 1 {
+		t.Fatalf("read %d rows (%v), want the checkpointed one", n, err)
+	}
+	if got := sqliteSideFiles(t, dir); len(got) != 2 || got[0] != "store.db" || got[1] != "store.db-wal" {
+		t.Fatalf("the read left %v in the owner's folder, want the store and its lone log only", got)
+	}
+}
+
+// cutAfterContext is a listing budget that runs out after its first `left`
+// checks, whatever the clock says: a listing the budget cuts short, at a
+// place the test chooses.
+type cutAfterContext struct {
+	context.Context
+	left atomic.Int32
+}
+
+func (c *cutAfterContext) Err() error {
+	if c.left.Add(-1) < 0 {
+		return context.DeadlineExceeded
+	}
+	return c.Context.Err()
+}
+
+// pinCliSessionListing makes every store listing in the test run out after
+// `checks` budget checks; the reader's own budget is untouched.
+func pinCliSessionListing(t *testing.T, checks int32) {
+	t.Helper()
+	cliSessionListingContextMu.Lock()
+	prev := cliSessionListingContextOf
+	cliSessionListingContextOf = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		c := &cutAfterContext{Context: ctx}
+		c.left.Store(checks)
+		return c, func() {}
+	}
+	cliSessionListingContextMu.Unlock()
+	t.Cleanup(func() {
+		cliSessionListingContextMu.Lock()
+		cliSessionListingContextOf = prev
+		cliSessionListingContextMu.Unlock()
+	})
+}
+
+// A store's listing may use half of what is left of the reader's budget, so
+// a listing cut short still leaves time to read what it found; a reader with
+// no deadline lists under its own cancellation.
+func TestCliSessionListingContextEndsHalfwayThroughTheBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	listCtx, cancelList := cliSessionListingContext(ctx)
+	defer cancelList()
+	outer, _ := ctx.Deadline()
+	inner, ok := listCtx.Deadline()
+	if !ok {
+		t.Fatal("the listing has no deadline")
+	}
+	if left := time.Until(inner); left > 2100*time.Millisecond || left < 1500*time.Millisecond {
+		t.Fatalf("the listing ends in %v, want about half of the 4s budget", left)
+	}
+	if !inner.Before(outer) {
+		t.Fatalf("the listing ends at %v, not before the budget's %v", inner, outer)
+	}
+	bare, cancelBare := context.WithCancel(context.Background())
+	listBare, cancelListBare := cliSessionListingContext(bare)
+	defer cancelListBare()
+	if _, ok := listBare.Deadline(); ok {
+		t.Fatal("a listing under no deadline got one")
+	}
+	cancelBare()
+	if listBare.Err() == nil {
+		t.Fatal("the listing outlived its reader's cancellation")
 	}
 }

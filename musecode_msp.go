@@ -73,6 +73,9 @@ type museCodeMSPClient struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	tmpDir string
+	// clientName is the `clientInfo.name` the handshake sends ("" is the
+	// usage probe's).
+	clientName string
 
 	writeMu sync.Mutex
 	mu      sync.Mutex
@@ -93,13 +96,24 @@ var startMuseCodeMSPFn = startMuseCodeMSP
 // completes the initialize handshake. onNotify (may be nil) sees every server
 // notification. The caller must Close the client.
 func startMuseCodeMSP(ctx context.Context, launcher string, onNotify func(string, json.RawMessage)) (*museCodeMSPClient, error) {
+	return startMuseCodeMSPWith(ctx, launcher, museCodeServeArgs, museCodeUsageProbeClientName, onNotify)
+}
+
+// museCodeUsageProbeClientName is the usage probe host's `clientInfo.name`.
+const museCodeUsageProbeClientName = "aiexpedite_usage_probe"
+
+// startMuseCodeMSPWith is startMuseCodeMSP with the host's argv and the name
+// the client gives itself: the session listing (musecode_session_sources.go)
+// runs a host of its own, on the same boundaries but able to read the
+// person's saved sessions.
+func startMuseCodeMSPWith(ctx context.Context, launcher string, serveArgs []string, clientName string, onNotify func(string, json.RawMessage)) (*museCodeMSPClient, error) {
 	tmpDir, err := os.MkdirTemp("", "aix-muse-probe-")
 	if err != nil {
 		return nil, err
 	}
 	executable := museCodeServeBinary(launcher)
 	env := stripEnvPrefixes(os.Environ(), museCodeUnrelatedStripped)
-	cmd := newOneShotCommand(context.Background(), executable, museCodeServeArgs, env, tmpDir)
+	cmd := newOneShotCommand(context.Background(), executable, serveArgs, env, tmpDir)
 	cmd.Stderr = io.Discard
 	hideWindow(cmd)
 	// Unix: own process group, so Close reaches every child.
@@ -121,6 +135,7 @@ func startMuseCodeMSP(ctx context.Context, launcher string, onNotify func(string
 	c := newMuseCodeMSPClient(stdin, stdout, onNotify)
 	c.cmd = cmd
 	c.tmpDir = tmpDir
+	c.clientName = clientName
 	if err := c.handshake(ctx); err != nil {
 		c.Close()
 		return nil, err
@@ -141,8 +156,12 @@ func newMuseCodeMSPClient(stdin io.WriteCloser, stdout io.Reader, onNotify func(
 }
 
 func (c *museCodeMSPClient) handshake(ctx context.Context) error {
+	name := c.clientName
+	if name == "" {
+		name = museCodeUsageProbeClientName
+	}
 	if _, err := c.Call(ctx, "initialize", map[string]any{
-		"clientInfo": map[string]any{"name": "aiexpedite_usage_probe", "version": Version},
+		"clientInfo": map[string]any{"name": name, "version": Version},
 	}); err != nil {
 		return err
 	}

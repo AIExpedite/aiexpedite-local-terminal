@@ -1,6 +1,6 @@
 // claude_session_sources_editor.go — the Claude Code tabs VS Code, VS Code
 // Insiders and Cursor remember, for session discovery
-// (claude_session_discovery.go).
+// (cli_session_discovery.go).
 //
 // Each editor keeps one SQLite database per window workspace at
 // <userData>/User/workspaceStorage/<hash>/state.vscdb. The Claude Code

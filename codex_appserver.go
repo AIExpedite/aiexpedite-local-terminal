@@ -164,6 +164,14 @@ type CodexAppServerSession struct {
 	// liveFollowUps is the live follow-up tracker (relay_follow_up_jsonrpc.go),
 	// nil unless launchedVersion is certified. Set once at Start.
 	liveFollowUps *liveFollowUpTracker
+	// publish is the publishFn the session was started with, and ownIO when
+	// the child last read or wrote a frame: the outside-writer watcher of a
+	// thread it resumes never counts the child's own rollout writes as
+	// another writer, and publishes through the newest Pub/Sub connection
+	// rather than publish's, which a reconnect may have closed since
+	// (cli_session_outside_writer.go).
+	publish PublishFunc
+	ownIO   cliSessionOwnIO
 
 	mu            sync.Mutex
 	status        string // "running" | "ended"
@@ -641,6 +649,7 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 		codexCaptureVersion: codexCaptureVersionPin.confirmed(),
 		launchedVersion:     launchedVersion,
 		liveFollowUps:       newLiveFollowUpTracker(codexCliAgentID, launchedVersion),
+		publish:             publishFn,
 		processExited:       make(chan struct{}),
 		streamDone:          make(chan struct{}),
 	}
@@ -789,6 +798,12 @@ func (m *CodexAppServerManager) SendAccepting(id string, payload string, accept 
 		return fmt.Errorf("timeout writing to codex app-server session %s stdin — session terminated to prevent frame interleave", id)
 	}
 	wrote = true
+	session.ownIO.note()
+	// A thread this frame resumes is watched for another writer for as long
+	// as the app-server runs (cli_session_outside_writer.go). Reading the
+	// request's method and thread id is this file's one other look inside a
+	// frame, beside the live follow-up tracker's.
+	m.noteCodexResumeWritten(session, trimmed)
 
 	fmt.Printf("%s[codex-appserver] → %s (%d bytes)%s\n",
 		colorBlue, id, len(trimmed), colorReset)
@@ -1161,6 +1176,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			if trimmed == "" {
 				continue
 			}
+			session.ownIO.note()
 
 			// Pre-publish size check (Finding #4 in the secondary review):
 			// Pub/Sub messages have a 10 MB ceiling. A frame larger than

@@ -1,5 +1,5 @@
 {
-  "description": "The claude_native_outside_writer frame the desktop agent publishes for one outside-writer state change of an adopted Claude Code session (claude_session_probe.go claudeOutsideWriterFrame; pinned by claude_session_probe_test.go). terminal-service records it only when agentId and uid name that session's own computer and owner (adoptedSessionClaims.service.js recordOutsideWriter), so a reader test should feed it this frame rather than a hand-built one. version and bootId are examples: every build and agent process sends its own.",
+  "description": "The claude_native_outside_writer frame the desktop agent publishes for one outside-writer state change of an adopted Claude Code session (cli_session_outside_writer.go cliSessionOutsideWriterFrame, the same frame for every engine; pinned by claude_session_probe_test.go). terminal-service records it only when agentId and uid name that session's own computer and owner (adoptedSessionClaims.service.js recordOutsideWriter), so a reader test should feed it this frame rather than a hand-built one. version and bootId are examples: every build and agent process sends its own.",
   "frame": {
     "id": "ts1",
     "workspaceID": "ws1",
