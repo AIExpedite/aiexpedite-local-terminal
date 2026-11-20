@@ -703,3 +703,40 @@ func TestCodexReconcileFromRollout_TransientReadFailureIsNotSettled(t *testing.T
 		t.Fatalf("once the read recovers the unchanged tree must settle: %+v", evidence)
 	}
 }
+
+// A future auth.json mtime makes the rollout source unavailable for the pass.
+// That must not settle the direct scan: correcting only the auth timestamp
+// leaves the watched rollout signature unchanged, so the retry has to come
+// from the scan staying unsettled.
+func TestCodexReconcileFromRollout_FutureAuthWatermarkIsNotSettled(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	writeCodexRunRollout(t, f.home, "steady", now.Add(-6*time.Minute), now.Add(-2*time.Minute), now.Add(-2*time.Minute), true,
+		[]map[string]any{codexRateLimitFrame(11, 12, now.Add(-2*time.Minute))})
+	authPath := filepath.Join(f.home, "auth.json")
+	info, err := os.Stat(authPath)
+	if err != nil {
+		t.Fatalf("fixture has no auth.json: %v", err)
+	}
+	future := now.Add(time.Hour)
+	if err := os.Chtimes(authPath, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), codexRolloutScanBudget)
+	_, _, _, evidence := codexReconcileFromRollout(ctx, f.home, f.fp, now)
+	cancel()
+	if !evidence.incomplete || evidence.settled() {
+		t.Fatalf("a pass skipped by a future auth watermark must stay unsettled: %+v", evidence)
+	}
+
+	if err := os.Chtimes(authPath, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), codexRolloutScanBudget)
+	_, _, _, evidence = codexReconcileFromRollout(ctx, f.home, f.fp, now)
+	cancel()
+	if !evidence.settled() {
+		t.Fatalf("once the auth timestamp is corrected the unchanged tree must settle: %+v", evidence)
+	}
+}

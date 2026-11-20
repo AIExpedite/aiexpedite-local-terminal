@@ -2023,9 +2023,12 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	// earlier sessions. Treat the optional rollout source as unavailable for
 	// this pass instead of rejecting current evidence and then advancing past
 	// it; once the clock or file timestamp is corrected, the unchanged rollout
-	// remains eligible for a retry.
+	// remains eligible for a retry. The pass saw none of the tree, so it reports
+	// incomplete: a caller that stores progress of its own (codexDirectScan)
+	// must keep retrying, because correcting only auth.json's timestamp does not
+	// move the rollout signature it watches.
 	if authMod.After(now) {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{}
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{incomplete: true}
 	}
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
 	discoveryCtx, cancelDiscovery := codexRolloutDiscoveryContext(ctx)
@@ -2493,8 +2496,9 @@ type codexRolloutNudgeEvidence struct {
 	// debt's own rollout has not flushed yet.
 	fencedSinceFloor bool
 	// incomplete is set when the pass did not see the whole tree it was asked
-	// to: discovery or selection ran out of its reserved sub-budget, or the
-	// account switched under it. The parent context can still be live, so a
+	// to: discovery or selection ran out of its reserved sub-budget, the
+	// account switched under it, or a future auth.json mtime made the login
+	// watermark unusable so discovery was skipped. The parent context can still be live, so a
 	// caller that stores progress of its own (codexDirectScan) reads this
 	// rather than ctx.Err() to decide whether the pass may be treated as done.
 	incomplete bool
