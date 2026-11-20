@@ -39,6 +39,18 @@ type fakeWAClient struct {
 	// closeGate, when set, holds Close until it is closed (a session store
 	// close that does not finish).
 	closeGate chan struct{}
+	// send answers SendText (nil: WhatsApp accepts it at waTS); sends lists
+	// every call, and ids counts the message ids handed out.
+	send  func(ctx context.Context, to types.JID, text string, id types.MessageID) (time.Time, error)
+	sends []fakeWASend
+	ids   int
+}
+
+// fakeWASend is one SendText call.
+type fakeWASend struct {
+	To   types.JID
+	Text string
+	ID   types.MessageID
 }
 
 func (c *fakeWAClient) AddEventHandler(h func(any)) {
@@ -88,6 +100,37 @@ func (c *fakeWAClient) PairPhone(context.Context, string) (string, error) { retu
 func (c *fakeWAClient) ParseWebMessage(chat types.JID, web *waWeb.WebMessageInfo) (*events.Message, error) {
 	return liveMsg(chat, waPeer, false, web.GetKey().GetID(), web.GetMessage()), nil
 }
+func (c *fakeWAClient) IsLoggedIn() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.connected }
+func (c *fakeWAClient) GenerateMessageID() types.MessageID {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ids++
+	return types.MessageID("3EB0FAKE" + strconv.Itoa(c.ids))
+}
+func (c *fakeWAClient) SendText(ctx context.Context, to types.JID, text string, id types.MessageID) (time.Time, error) {
+	c.mu.Lock()
+	c.sends = append(c.sends, fakeWASend{To: to, Text: text, ID: id})
+	send := c.send
+	c.mu.Unlock()
+	if send != nil {
+		return send(ctx, to, text, id)
+	}
+	return waTS, nil
+}
+
+// sent lists the SendText calls so far.
+func (c *fakeWAClient) sent() []fakeWASend {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]fakeWASend(nil), c.sends...)
+}
+
+// answerSends sets how SendText answers from now on.
+func (c *fakeWAClient) answerSends(send func(ctx context.Context, to types.JID, text string, id types.MessageID) (time.Time, error)) {
+	c.mu.Lock()
+	c.send = send
+	c.mu.Unlock()
+}
 func (c *fakeWAClient) Close() error {
 	c.mu.Lock()
 	gate := c.closeGate
@@ -128,6 +171,11 @@ func (f *fakeWATransport) Post(_ context.Context, payload any) whatsAppSyncResul
 	if respond != nil {
 		return respond(m)
 	}
+	return acceptWASync(m)
+}
+
+// acceptWASync is the cloud's healthy answer: accepted, a batch acked to its end.
+func acceptWASync(m map[string]any) whatsAppSyncResult {
 	res := whatsAppSyncResult{Status: 200, Body: whatsAppSyncResponse{OK: true}}
 	if m["kind"] == waSyncKindBatch {
 		to := int64(m["seqTo"].(float64))
@@ -1873,5 +1921,28 @@ func TestWhatsAppSupervisorShutdownHonoursTheCallerDeadline(t *testing.T) {
 	}
 	if local, err := loadWhatsAppLocalLinks(); err != nil || len(local) != 1 {
 		t.Fatalf("shutdown must still record the link: %+v %v", local, err)
+	}
+}
+
+// capabilities.whatsapp says this build sends confirmed texts: terminal-service
+// publishes a send only to a computer reporting `sendText: true`
+// (shared-constants isWhatsAppSendCapable), so a build that dropped it would
+// never be sent one, and one that reported it without the handler would read
+// the command as a shell command.
+func TestWhatsAppCapabilityReportsSendText(t *testing.T) {
+	withWhatsAppTestEnv(t) // the memory keystore answers the secureStorage probe
+	c := currentWhatsAppCapability()
+	if !c.Supported || !c.SecureStorage || c.Protocol != whatsAppAgentProtocol || !c.SendText {
+		t.Fatalf("capability = %+v, want supported, secureStorage, protocol %d and sendText", *c, whatsAppAgentProtocol)
+	}
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"sendText":true`) {
+		t.Fatalf("capabilities.whatsapp = %s, want sendText true", raw)
+	}
+	if !isWhatsAppCommand(whatsAppSendTextCommand) {
+		t.Fatal("the build reports sendText but does not admit the send command")
 	}
 }

@@ -247,7 +247,8 @@ type capabilitiesInfo struct {
 	// (whatsapp_supervisor.go). `secureStorage` is whether the OS credential
 	// store works here; a Linux computer without Secret Service reports false
 	// and terminal-service refuses to link it. An agent without the block is
-	// too old, and is never sent a WhatsApp command.
+	// too old, and is never sent a WhatsApp command. `sendText` says it sends
+	// confirmed texts (whatsapp_send.go); one without it is never sent one.
 	WhatsApp *whatsAppCapability `json:"whatsapp,omitempty"`
 	// RelayFollowUps (DEVICE_RELAY_CAPABILITIES.FOLLOW_UPS): the durable
 	// follow-up attempt ledger (relay_follow_up_ledger.go) — attempts expire,

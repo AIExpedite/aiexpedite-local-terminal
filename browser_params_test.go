@@ -21,6 +21,8 @@ func TestParseBrowserCommandAcceptsEveryOp(t *testing.T) {
 	digest := strings.Repeat("a", 64)
 	cases := []map[string]any{
 		{"op": "tabs"},
+		{"op": "current"},
+		{"op": "current", "appOrigin": "https://app.aiexpedite.com"},
 		{"op": "stop"},
 		{"op": "open", "url": "https://example.com/a?b=1"},
 		{"op": "read", "tabId": "d:ABC123", "includeText": false},
@@ -166,5 +168,38 @@ func TestBrowserStopIsAlwaysAdmitted(t *testing.T) {
 	}
 	if isInternalDemandCommand(browserDeviceCommand) {
 		t.Fatal("__browser__ is model-driven: it must face the staleness and rate checks")
+	}
+}
+
+// current needs no tab; a malformed appOrigin is cleared, never refused.
+func TestParseBrowserCurrentAppOrigin(t *testing.T) {
+	now := time.Now()
+	cases := map[any]string{
+		"https://App.AIExpedite.com":  "https://app.aiexpedite.com",
+		"https://app.aiexpedite.com/": "https://app.aiexpedite.com",
+		"http://localhost:3000":       "http://localhost:3000",
+		"https://app.test/chat":       "",
+		"https://app.test/?x=1":       "",
+		"https://app.test#x":          "",
+		"https://u:p@app.test":        "",
+		"chrome://newtab":             "",
+		"javascript:alert(1)":         "",
+		"not a url":                   "",
+		"https://" + strings.Repeat("a", browserMaxAppOriginChars): "",
+		"": "",
+	}
+	for in, want := range cases {
+		p, id, berr := parseBrowserCommand(browserCmd(t, map[string]any{"v": 1, "commandId": "c", "op": "current", "appOrigin": in}), now)
+		if berr != nil || id != "c" {
+			t.Errorf("%v: refused %v", in, berr)
+			continue
+		}
+		if p.AppOrigin != want {
+			t.Errorf("%v: appOrigin %q, want %q", in, p.AppOrigin, want)
+		}
+	}
+	// A non-string appOrigin is a wrong type (the whole command's shape).
+	if _, _, berr := parseBrowserCommand(browserCmd(t, map[string]any{"v": 1, "commandId": "c", "op": "current", "appOrigin": 7}), now); berr == nil {
+		t.Error("a numeric appOrigin must be refused as the wrong type")
 	}
 }

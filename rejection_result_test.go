@@ -292,3 +292,35 @@ func TestMakeRejectionResult_NonGrokArgsUseGenericRedaction(t *testing.T) {
 		t.Errorf("Args leaked bearer token: %v", res.Args)
 	}
 }
+
+// A WhatsApp command's one argument is the person's own data: a confirmed
+// message and the chat it goes to, the phone number a pairing code is for,
+// the browser's pairing key. A refusal that echoes args (a signature that
+// does not verify) would put them in the rejected-command record
+// terminal-service keeps for 90 days, so they are never echoed. The command
+// name stays.
+func TestMakeRejectionResult_NeverEchoesWhatsAppParams(t *testing.T) {
+	for _, c := range []struct {
+		command, args string
+		private       []string
+	}{
+		{whatsAppSendTextCommand,
+			`{"linkId":"lnk_1","generation":2,"proposalId":"AbCdEfGhIjKlMnOpQrSt","attempt":1,"chatJid":"15559876543@s.whatsapp.net","text":"TOP SECRET SEND BODY"}`,
+			[]string{"15559876543", "TOP SECRET SEND BODY"}},
+		{whatsAppLinkStartCommand,
+			`{"linkId":"lnk_1","generation":2,"workspaceID":"ws","method":"phoneCode","browserPub":"BROWSERPUBKEYBASE64","phoneNumber":"+15559876543"}`,
+			[]string{"15559876543", "BROWSERPUBKEYBASE64"}},
+	} {
+		cmd := commandMsg{ID: "cmd-wa", Command: c.command, Args: []string{c.args}, WorkspaceID: "__device__", Ts: 1700000000000}
+		res := makeRejectionResult(cmd, "agent-1", "unauthorized", "UNAUTHORIZED", "Command rejected: invalid signature")
+		joined := strings.Join(res.Args, " ")
+		for _, p := range c.private {
+			if strings.Contains(joined, p) {
+				t.Errorf("%s: Args leaked %q: %v", c.command, p, res.Args)
+			}
+		}
+		if res.Command != c.command {
+			t.Errorf("Command = %q, want %q", res.Command, c.command)
+		}
+	}
+}

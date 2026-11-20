@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -307,5 +308,79 @@ func TestRedactWhatsAppLog(t *testing.T) {
 		if strings.Contains(out, leak) {
 			t.Fatalf("leaked %q in %q", leak, out)
 		}
+	}
+}
+
+// A history-sync group says how many people it lists (memberCount, each entry
+// once), which names it on the assistant's cards ("the group 'Design team'
+// (3 people)"). A direct chat, or a group listing nobody, carries none.
+func TestNormalizeHistoryGroupCarriesMemberCount(t *testing.T) {
+	members := func(jids ...string) []*waHistorySync.GroupParticipant {
+		var out []*waHistorySync.GroupParticipant
+		for _, j := range jids {
+			out = append(out, &waHistorySync.GroupParticipant{UserJID: proto.String(j)})
+		}
+		return out
+	}
+	quiet := types.NewJID("120363000000000002", types.GroupServer)
+	data := &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{
+		{ID: proto.String(waGroup.String()), Name: proto.String("Design team"),
+			Participant: members(waMe.String(), waPeer.String(), "999888777@lid", waPeer.String())},
+		{ID: proto.String(quiet.String()), Name: proto.String("Quiet group")},
+		{ID: proto.String(waPeer.String()), Name: proto.String("Peer"), Participant: members(waPeer.String())},
+	}}
+	recs, _ := normalizeWhatsAppHistory(data, nil, whatsAppNormalizeContext{})
+	if len(recs) != 3 {
+		t.Fatalf("records = %+v", recs)
+	}
+	for i, want := range []int{3, 0, 0} {
+		if recs[i].Kind != waRecordConversation || recs[i].MemberCount != want {
+			t.Fatalf("%s: memberCount = %d, want %d", recs[i].ChatJid, recs[i].MemberCount, want)
+		}
+		raw, _ := json.Marshal(recs[i])
+		if has := strings.Contains(string(raw), `"memberCount"`); has != (want > 0) {
+			t.Fatalf("%s: %s", recs[i].ChatJid, raw)
+		}
+	}
+	if raw, _ := json.Marshal(recs[0]); !strings.Contains(string(raw), `"memberCount":3`) {
+		t.Fatalf("group record = %s", raw)
+	}
+}
+
+// The record of a text this computer sent is the message a live copy of it
+// would normalize to (so the history copy a later sync brings collapses into
+// it): op new, fromMe, source live, the chat and the linked account resolved
+// to the identities first written for them. Never catch-up.
+func TestNormalizeWhatsAppOwnSendIsWhatALiveCopyNormalizesTo(t *testing.T) {
+	peerLID := types.NewJID("999888777", types.HiddenUserServer)
+	alternates := map[types.JID]types.JID{}
+	ir := newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), func(j types.JID) types.JID { return alternates[j] })
+	nc := whatsAppNormalizeContext{OwnJID: waMe, Identity: ir, ReconnectedAt: waTS.Add(time.Minute)}
+	// The peer was first written under their LID, before anything mapped it.
+	if got := ir.Canonical(peerLID, types.EmptyJID); got != peerLID {
+		t.Fatalf("first identity = %s", got)
+	}
+	alternates[waPeer], alternates[peerLID] = peerLID, waPeer
+
+	rec := one(t, normalizeWhatsAppOwnSend(waPeer, "3EB0OWN", waTS, "on my way", nc))
+	if rec.Kind != waRecordMessage || rec.Op != waOpNew || !rec.FromMe || rec.Source != waSourceLive || rec.Type != waTypeText ||
+		rec.Text != "on my way" || rec.WaMessageID != "3EB0OWN" || rec.WaTimestamp != waTS.UnixMilli() || rec.CatchUp {
+		t.Fatalf("own send = %+v", rec)
+	}
+	if rec.ChatJid != peerLID.String() || rec.SenderJid != waMe.String() {
+		t.Fatalf("own send at (%s, %s), want the identities first written (%s, %s)", rec.ChatJid, rec.SenderJid, peerLID, waMe)
+	}
+	// The same message, as it would arrive from another of the account's devices.
+	live := liveMsg(waPeer, types.JID{User: waMe.User, Device: 2, Server: types.DefaultUserServer}, true, "3EB0OWN", textMsg("on my way"))
+	if got := one(t, normalizeWhatsAppMessage(live, waSourceLive, nc)); got.ChatJid != rec.ChatJid || got.SenderJid != rec.SenderJid || got.WaMessageID != rec.WaMessageID {
+		t.Fatalf("a live copy keys as (%s, %s, %s), the own send as (%s, %s, %s)", got.ChatJid, got.SenderJid, got.WaMessageID, rec.ChatJid, rec.SenderJid, rec.WaMessageID)
+	}
+	// A group passes through; the account is still resolved.
+	if g := one(t, normalizeWhatsAppOwnSend(waGroup, "3EB0G", waTS, "hi all", nc)); g.ChatJid != waGroup.String() || g.SenderJid != waMe.String() {
+		t.Fatalf("group own send = %+v", g)
+	}
+	// No linked account, no record.
+	if recs := normalizeWhatsAppOwnSend(waPeer, "3EB0X", waTS, "x", whatsAppNormalizeContext{}); len(recs) != 0 {
+		t.Fatalf("records without a linked account: %+v", recs)
 	}
 }
