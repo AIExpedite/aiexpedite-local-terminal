@@ -309,12 +309,141 @@ func TestOutsideWriterReSendsTheCurrentStateOnReconnect(t *testing.T) {
 type fakeTurnState struct {
 	mu             sync.Mutex
 	alive, running bool
+	lastTurnEnded  time.Time
 }
 
-func (f *fakeTurnState) TurnState(string) (bool, bool) {
+func (f *fakeTurnState) TurnState(string) (bool, bool, time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.alive, f.running
+	return f.alive, f.running, f.lastTurnEnded
+}
+
+// A turn of AI Expedite's own that starts and ends between two watcher polls
+// is still its own: when it ran comes from the session, never from what a
+// poll saw, so the store write it made reads as nobody else's — while a
+// write past that turn and its flush slack is another program's.
+func TestOneShotOwnTurnBetweenPollsIsNeverAnOutsideWriter(t *testing.T) {
+	now := time.Now()
+	ended := now.Add(-2 * time.Second)
+	state := &fakeTurnState{alive: true, lastTurnEnded: ended}
+	own := oneShotOwnActiveAt(state, owTestSession)
+	if cliSessionStoreWrittenByOther(ended.Add(-time.Second).UnixMilli(), now, own) {
+		t.Fatal("the store write of a turn no poll saw running read as another writer's")
+	}
+	later := ended.Add(cliSessionOwnWriteSlack + time.Second)
+	if !cliSessionStoreWrittenByOther(later.UnixMilli(), later.Add(time.Second), own) {
+		t.Fatal("a write after AI Expedite's turn and its flush slack did not read as another writer's")
+	}
+	state.mu.Lock()
+	state.running = true
+	state.mu.Unlock()
+	if cliSessionStoreWrittenByOther(later.UnixMilli(), later.Add(time.Second), own) {
+		t.Fatal("a write while a turn of AI Expedite's own runs read as another writer's")
+	}
+	if !cliSessionStoreWrittenByOther(now.Add(-time.Second).UnixMilli(), now, oneShotOwnActiveAt(&fakeTurnState{alive: true}, owTestSession)) {
+		t.Fatal("before any turn of its own, a fresh store write must be another writer's")
+	}
+}
+
+// The watcher of a resumed one-shot session: the store write of a turn of AI
+// Expedite's own that ran entirely between two polls publishes nothing (no
+// `busy` holding the next message), while a write another program makes once
+// that turn is long over reads busy.
+func TestOneShotWatcherNeverReportsItsOwnUnsampledTurn(t *testing.T) {
+	fastOutsideWriterPolls(t)
+	pinCliSessionProcesses(t, func() []cliSessionProcess { return nil })
+	root := t.TempDir()
+	t.Setenv("OPENCODE_DATA", root)
+	const conversation = "ses_0123456789abcdefABCDEF"
+	writeOpenCodeLegacySession(t, root, conversation, "Resumed", "/w/app", time.Now().Add(-time.Second))
+	state := &fakeTurnState{alive: true, lastTurnEnded: time.Now()}
+	sink := &outsideWriterSink{}
+	cmd := commandMsg{SessionID: owTestSession + "-unsampled", WorkspaceID: "ws1", UID: "u1", AgentID: "agent-1", ConversationID: conversation}
+	if !watchOneShotResumedSession(cliSessionEngineOpenCode, cmd, state, sink.publish) {
+		t.Fatal("watcher not started")
+	}
+	key := cliSessionEngineOpenCode + "|" + cmd.SessionID + "|" + conversation
+	t.Cleanup(func() {
+		state.mu.Lock()
+		state.alive = false
+		state.mu.Unlock()
+		waitForWriterState(t, 3*time.Second, "the watcher to end", func() bool { return !watchRunning(key) })
+	})
+	time.Sleep(10 * 20 * time.Millisecond) // ten polls
+	if got := sink.states(cmd.SessionID); len(got) != 0 {
+		t.Fatalf("states = %v, want nothing: the only write was AI Expedite's own turn's", got)
+	}
+	state.mu.Lock()
+	state.lastTurnEnded = time.Now().Add(-8 * time.Second)
+	state.mu.Unlock()
+	writeOpenCodeLegacySession(t, root, conversation, "Resumed", "/w/app", time.Now())
+	waitForWriterState(t, 3*time.Second, "busy", func() bool {
+		s := sink.states(cmd.SessionID)
+		return len(s) == 1 && s[0] == claudeOutsideWriterBusy
+	})
+}
+
+// Every one-shot manager records a turn's end as the turn itself ends — its
+// child has exited, and before the session reads idle — so after a real turn
+// (a stub CLI) that no watcher poll ever saw running, the session says when
+// it ended, and the last write its child made just before exiting is AI
+// Expedite's own.
+func TestOneShotTurnsRecordWhenTheyEnded(t *testing.T) {
+	check := func(t *testing.T, mgr oneShotTurnState, id, doneMark string, send func() error) {
+		t.Helper()
+		if _, _, ended := mgr.TurnState(id); !ended.IsZero() {
+			t.Fatalf("a session that never ran a turn reports one ended at %v", ended)
+		}
+		before := time.Now()
+		if err := send(); err != nil {
+			t.Fatalf("turn: %v", err)
+		}
+		after := time.Now()
+		alive, running, ended := mgr.TurnState(id)
+		if !alive || running {
+			t.Fatalf("after the turn: alive=%v running=%v, want an idle live session", alive, running)
+		}
+		if ended.Before(before.Truncate(time.Millisecond)) || ended.After(after) {
+			t.Fatalf("turn ended at %v, want between %v and %v", ended, before, after)
+		}
+		fi, err := os.Stat(doneMark)
+		if err != nil {
+			t.Fatalf("the stub's last write: %v", err)
+		}
+		if cliSessionStoreWrittenByOther(fi.ModTime().UnixMilli(), time.Now(), oneShotOwnActiveAt(mgr, id)) {
+			t.Fatal("the last write of AI Expedite's own turn read as another writer's")
+		}
+	}
+	t.Run("opencode", func(t *testing.T) {
+		installOpenCodeStub(t)
+		t.Setenv("OPENCODE_DATA", t.TempDir())
+		done := filepath.Join(t.TempDir(), "done.log")
+		t.Setenv("OPENCODE_STUB_DONE_LOG", done)
+		t.Setenv("OPENCODE_STUB_STDOUT", `{"type":"session.created","sessionID":"ses_turnended"}\n{"type":"text","text":"ok"}\n`)
+		m := NewOpenCodeNativeManager()
+		injectOpenCodeSession(t, m, "sess-turn-ended", t.TempDir())
+		check(t, m, "sess-turn-ended", done, func() error {
+			return m.Send("sess-turn-ended", "hello", func(resultMsg) {}, time.Minute)
+		})
+	})
+	t.Run("musecode", func(t *testing.T) {
+		m := installMuseCodeStub(t)
+		done := filepath.Join(t.TempDir(), "done.log")
+		t.Setenv("OPENCODE_STUB_DONE_LOG", done)
+		t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museFrameUserInput, museFrameDeltaHello, museFrameDeltaWorld, museFrameCompleted))
+		startMuse(t, m, "s-turn-ended", "")
+		check(t, m, "s-turn-ended", done, func() error {
+			return m.Send("s-turn-ended", "say hello", func(resultMsg) {}, time.Minute)
+		})
+	})
+	t.Run("antigravity", func(t *testing.T) {
+		done := filepath.Join(t.TempDir(), "done.log")
+		installFakeAgy(t, initEventScript()+echoLines(successResultEvent)+"touch '"+done+"'\n")
+		m := NewAntigravityNativeManager(nil)
+		s := injectAntigravitySession(t, m, "s-turn-ended", "")
+		var fl agyFrameLog
+		check(t, m, s.ID, done, func() error { return m.Send(s.ID, "hello", fl.publish, 10*time.Second) })
+	})
 }
 
 // One watcher per (engine, AI Expedite session, session): a redelivered

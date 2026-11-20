@@ -880,67 +880,73 @@ func (m *CodexAppServerManager) noteCodexResumeWritten(session *CodexAppServerSe
 }
 
 // oneShotTurnState is a one-shot manager's view of a session: still
-// registered, and whether a turn of it runs now.
+// registered, whether a turn of it runs now, and when its last turn ended
+// (zero before the first) — recorded by the turn itself as its child exits,
+// before the session reads idle.
 type oneShotTurnState interface {
-	TurnState(id string) (alive, running bool)
+	TurnState(id string) (alive, running bool, lastTurnEnded time.Time)
 }
 
-func (m *oneShotNativeManager) TurnState(id string) (alive, running bool) {
+func (m *oneShotNativeManager) TurnState(id string) (alive, running bool, lastTurnEnded time.Time) {
 	s := m.Get(id)
 	if s == nil {
-		return false, false
+		return false, false, time.Time{}
 	}
 	st := s.Status()
-	return st != "ended", st == "running"
+	return st != "ended", st == "running", s.ownIO.lastAt(time.Time{})
 }
 
-func (m *OpenCodeNativeManager) TurnState(id string) (alive, running bool) {
+func (m *OpenCodeNativeManager) TurnState(id string) (alive, running bool, lastTurnEnded time.Time) {
 	s := m.Get(id)
 	if s == nil {
-		return false, false
+		return false, false, time.Time{}
 	}
 	st := s.Status()
-	return st != "ended", st == "running"
+	return st != "ended", st == "running", s.ownIO.lastAt(time.Time{})
 }
 
-func (m *AntigravityNativeManager) TurnState(id string) (alive, running bool) {
+func (m *AntigravityNativeManager) TurnState(id string) (alive, running bool, lastTurnEnded time.Time) {
 	s := m.Get(id)
 	if s == nil {
-		return false, false
+		return false, false, time.Time{}
 	}
 	st := s.Status()
-	return st != "ended", st == "running"
+	return st != "ended", st == "running", s.ownIO.lastAt(time.Time{})
 }
 
 // watchOneShotResumedSession starts the watcher of a one-shot session a START
 // seeded with the conversation it continues (the signed `conversationId`):
 // between turns no process runs, so the session's own manager says when it
-// ended and when a turn of AI Expedite's own runs.
+// ended and when a turn of AI Expedite's own runs or last ran.
 func watchOneShotResumedSession(engine string, cmd commandMsg, mgr oneShotTurnState, publishFn PublishFunc) bool {
 	if mgr == nil || cmd.ConversationID == "" || cmd.SessionID == "" {
 		return false
 	}
-	var lastRunning atomic.Int64
 	return startCliSessionOutsideWriterWatcher(cliOutsideWriterTarget{
 		engine:    engine,
 		sessionID: cmd.ConversationID,
 		owner:     cliOutsideWriterOwner{ID: cmd.SessionID, WorkspaceID: cmd.WorkspaceID, UID: cmd.UID},
 		agentID:   cmd.AgentID,
 		alive: func() bool {
-			alive, _ := mgr.TurnState(cmd.SessionID)
+			alive, _, _ := mgr.TurnState(cmd.SessionID)
 			return alive
 		},
-		ownActiveAt: func(now time.Time) time.Time {
-			if _, running := mgr.TurnState(cmd.SessionID); running {
-				lastRunning.Store(now.UnixMilli())
-				return now
-			}
-			if ms := lastRunning.Load(); ms > 0 {
-				return time.UnixMilli(ms)
-			}
-			return time.Time{}
-		},
+		ownActiveAt: oneShotOwnActiveAt(mgr, cmd.SessionID),
 	}, publishFn)
+}
+
+// oneShotOwnActiveAt is a one-shot session's ownActiveAt: now while a turn of
+// it runs, else when its last turn ended. Both come from the turn itself,
+// never from what a poll happened to see, so a turn that starts and ends
+// between two polls still owns the store writes it made.
+func oneShotOwnActiveAt(mgr oneShotTurnState, sessionID string) func(now time.Time) time.Time {
+	return func(now time.Time) time.Time {
+		_, running, lastTurnEnded := mgr.TurnState(sessionID)
+		if running {
+			return now
+		}
+		return lastTurnEnded
+	}
 }
 
 // oneShotEngineFor is the discovery engine of a one-shot native kind's frame
