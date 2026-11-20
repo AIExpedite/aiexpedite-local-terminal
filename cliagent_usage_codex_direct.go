@@ -62,6 +62,15 @@ import (
 // an append to a file already listed moves no directory mtime.
 const codexDirectTrackedFiles = 4
 
+// codexDirectUnsettledAttempts bounds how many consecutive reconciles over one
+// unchanged signature may report themselves unsettled before the signature is
+// stored anyway. A rollout that can never be read to the end (an ACL or AV hold,
+// or one too large for its share of the file budget) keeps the pass unsettled for
+// ever, and without this bound every eligible poll would spend a full reconcile
+// budget on the same tree for the life of the process. The gather still covers it,
+// and any later change to the tree re-arms the scan.
+const codexDirectUnsettledAttempts = 5
+
 var (
 	// codexDirectScanEnabled gates every trigger. TestMain turns it off, so no
 	// test reads the developer's own ~/.codex/sessions.
@@ -111,6 +120,8 @@ type codexDirectWatch struct {
 	// heldCheckedAt is when an unmoved poll last read the cache for held
 	// evidence (or a reconcile last ran).
 	heldCheckedAt time.Time
+	// unsettled counts consecutive unsettled reconciles over the same signature.
+	unsettled int
 }
 
 var (
@@ -195,14 +206,21 @@ func codexDirectScan(atStartup bool) {
 	complete := codexDirectReconcile(ctx, base, fp, now)
 	finished := complete && ctx.Err() == nil
 	cancel()
+	codexDirectMu.Lock()
+	if w.base == base {
+		if !finished {
+			w.unsettled++
+		}
+		// Stop re-running over a tree that may be unreadable for good; leave it
+		// to the gather. A later change to the tree re-arms the scan.
+		if finished || w.unsettled >= codexDirectUnsettledAttempts {
+			w.stored, w.storedSet, w.unsettled = sig, true, 0
+		}
+	}
+	codexDirectMu.Unlock()
 	if !finished {
 		return
 	}
-	codexDirectMu.Lock()
-	if w.base == base {
-		w.stored, w.storedSet = sig, true
-	}
-	codexDirectMu.Unlock()
 	fmt.Printf("%s[cli-usage] codex direct run: reconciled%s\n", colorCyan, colorReset)
 }
 

@@ -317,6 +317,30 @@ func TestCodexDirectScan_BudgetExpiryLeavesTheSignatureUnstored(t *testing.T) {
 	h.wantReconciles(t, 3, "stores the signature")
 }
 
+// A rollout that can never be read to the end (an ACL or AV hold, or one too
+// large for its share of the file budget) keeps every pass unsettled. Without a
+// bound the scan would spend a full reconcile budget on the same unchanged tree
+// on every eligible poll for the life of the process, silently - the log line
+// sits after the unsettled return. The gather still covers such a tree.
+func TestCodexDirectScan_StopsReconcilingAnUnsettledUnchangedTree(t *testing.T) {
+	h := codexDirectFixture(t, codexDirectTestStart)
+	h.mu.Lock()
+	h.reconcile = func(context.Context, string, string, time.Time) bool { return false }
+	h.mu.Unlock()
+	h.writeRollout(t, h.dayDir(h.clock()), "a", "{}\n", h.clock())
+
+	for range codexDirectUnsettledAttempts + 7 {
+		h.poll()
+	}
+	h.wantReconciles(t, codexDirectUnsettledAttempts,
+		"an always-unsettled tree stops at the attempt bound")
+
+	// The bound is not a permanent stand-down: a change to the tree re-arms it.
+	h.writeRollout(t, h.dayDir(h.clock()), "b", "{}\n", h.clock())
+	h.poll()
+	h.wantReconciles(t, codexDirectUnsettledAttempts+1, "a changed tree re-arms the scan")
+}
+
 // A reconcile that returns inside its budget but reports discovery or
 // selection incomplete stores no signature either: the parent context is still
 // live, yet the pass withheld its evidence, and a finished run that writes
