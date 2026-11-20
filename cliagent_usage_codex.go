@@ -212,6 +212,22 @@ func codexAccountScope(auth codexAuth, claims codexIDTokenClaims) string {
 	)
 }
 
+// codexReconcileAndNudge is the one rollout reconcile every pass that reads
+// Codex's telemetry off disk runs: the gather (ParseContext) and the direct-run
+// poll (codexDirectScan, cliagent_usage_codex_direct.go). It reconciles the
+// rollouts into the cache, then acts on the same evidence: a booked rung that is
+// due, or Codex telemetry written after the cached reading with no debt
+// recorded at all (a `codex` the user started in their own shell), arms the
+// bounded refresh. The nudge is handed the rollout evidence this reconcile
+// already stat-ed — the newest account-eligible mtime still owing telemetry,
+// and the newest one whose telemetry it mined — never a walk of its own
+// (cliagent_usage_codex_refresh_schedule.go). ctx bounds the reconcile only.
+func codexReconcileAndNudge(ctx context.Context, base, fp string, now time.Time, forced bool) codexReconcileResult {
+	reconciled := codexReconcileForGather(ctx, base, fp, now, forced)
+	nudgeCodexUsageRefresh(base, fp, now, reconciled.rollouts, reconciled.latestObservation)
+	return reconciled
+}
+
 func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
 	return p.ParseContext(context.Background(), home, detected, now)
 }
@@ -291,17 +307,9 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 	scanBudget := codexSubBudget(ctx, codexRolloutScanBudget, scanHoldBack)
 	if scanBudget > 0 && ctx.Err() == nil {
 		scanCtx, cancel := context.WithTimeout(ctx, scanBudget)
-		reconciled := codexReconcileForGather(scanCtx, base, usage.AccountFingerprint, now, forced)
+		reconciled := codexReconcileAndNudge(scanCtx, base, usage.AccountFingerprint, now, forced)
 		cancel()
 		usageLimit, latestRolloutObservation = reconciled.limit, reconciled.latestObservation
-		// The same evidence, acted on: a booked rung that is due, or Codex
-		// telemetry written after the cached reading with no debt recorded at all
-		// (a `codex` the user started in their own shell), arms the bounded
-		// refresh. It is handed the rollout evidence this reconcile already
-		// stat-ed — the newest account-eligible mtime still owing telemetry, and
-		// the newest one whose telemetry it mined — never a walk of its own
-		// (cliagent_usage_codex_refresh_schedule.go).
-		nudgeCodexUsageRefresh(base, usage.AccountFingerprint, now, reconciled.rollouts, latestRolloutObservation)
 	}
 	// The published metrics and their capture generation come from ONE final
 	// read, so a receipt can never pair one snapshot's numbers with another's

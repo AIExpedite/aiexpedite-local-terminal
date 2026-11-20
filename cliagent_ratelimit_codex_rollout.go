@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -22,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -94,18 +96,22 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 	// an old-account scan clear or overwrite a live capture already scoped to the
 	// newly active account; the next refresh will reconcile under that account.
 	if codexAccountFingerprintAtBase(base) != currentFingerprint {
-		return codexMetricsFromCache(now, currentFingerprint), codexUsageLimitEvidence{}, time.Time{}, codexRolloutNudgeEvidence{}
+		return codexMetricsFromCache(now, currentFingerprint), codexUsageLimitEvidence{}, time.Time{}, codexRolloutNudgeEvidence{incomplete: true}
 	}
 	if ok || highWater != nil {
 		// The forced path passes ctx so its bounded lock wait is clamped to the
 		// gather deadline it is running inside. The stamp names the installed
 		// build only when every merged rollout says that build wrote it; any
 		// other provenance merges unstamped and leaves the existing stamp alone.
-		mergeCodexRateLimitCacheObserved(
+		committed, _ := mergeCodexRateLimitCacheObserved(
 			ctx, codexRateLimitCachePath(), contribs, nil, false, nil, false,
 			now, currentFingerprint, highWater, base, forced, nil,
 			codexRolloutProducerVersion(producer, currentCodexUsageCaptureVersion()), false,
 		)
+		// A non-forced merge may drop on lock contention. The pass's coverage then
+		// describes telemetry that never reached the cache, and its cursor did not
+		// advance either, so a caller tracking its own progress must retry.
+		rollouts.uncommitted = !committed
 	}
 	return codexMetricsFromCache(now, currentFingerprint), limit, latestObservation, rollouts
 }
@@ -132,7 +138,7 @@ func codexRolloutWrittenAfter(ctx context.Context, root string, after time.Time)
 		if err != nil || entry.IsDir() {
 			return nil
 		}
-		if matched, _ := filepath.Match("rollout-*.jsonl", entry.Name()); !matched {
+		if !codexIsRolloutFileName(entry.Name()) {
 			return nil
 		}
 		if info, err := entry.Info(); err == nil && info.ModTime().After(after) {
@@ -141,6 +147,115 @@ func codexRolloutWrittenAfter(ctx context.Context, root string, after time.Time)
 		return nil
 	})
 	return errors.Is(err, errCodexRolloutFound)
+}
+
+// codexIsRolloutFileName reports whether name is a Codex rollout log
+// (`rollout-*.jsonl`).
+func codexIsRolloutFileName(name string) bool {
+	matched, err := filepath.Match("rollout-*.jsonl", name)
+	return err == nil && matched
+}
+
+// codexRolloutWatchDirs returns the date directories a run happening around
+// `now` writes its rollout into: today and yesterday in now's own location
+// (the caller passes local time; yesterday covers a run that started before
+// midnight), and today in UTC, so a host whose local and UTC dates differ — the
+// Windows nightly — is covered whichever clock the Codex build files by.
+// De-duplicated, newest local date first.
+func codexRolloutWatchDirs(base string, now time.Time) []string {
+	if base == "" {
+		return nil
+	}
+	root := filepath.Join(base, "sessions")
+	dirs := make([]string, 0, 3)
+	for _, day := range []time.Time{now, now.AddDate(0, 0, -1), now.UTC()} {
+		dir := filepath.Join(root, day.Format("2006"), day.Format("01"), day.Format("02"))
+		if !slices.Contains(dirs, dir) {
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
+}
+
+// codexRolloutFileStat is one rollout's (path, mtime, size) — metadata only,
+// never content.
+type codexRolloutFileStat struct {
+	path    string
+	mtimeNs int64
+	size    int64
+}
+
+// codexNewestRolloutFiles lists one date directory and returns its newest n
+// `rollout-*.jsonl` files by mtime (newest first; path breaks a tie). complete
+// is false when ctx ended or a read failed part-way, so the caller must not
+// treat the listing as the directory's state; a missing directory is an empty,
+// complete listing.
+//
+// The listing is chunked and checks ctx between chunks and stats, like
+// codexReadDirContext, but it deliberately does NOT go through that helper's
+// resume state: that state is the reconcile discovery's own cursor (an
+// interrupted stream, its replay queue, its traversal position), and a second
+// reader consuming it would steal entries discovery has yet to process.
+func codexNewestRolloutFiles(ctx context.Context, dir string, n int) ([]codexRolloutFileStat, bool) {
+	if n <= 0 {
+		return nil, true
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, os.IsNotExist(err)
+	}
+	defer f.Close()
+	var newest []codexRolloutFileStat
+	for {
+		if ctx.Err() != nil {
+			return newest, false
+		}
+		batch, readErr := f.ReadDir(codexRolloutReadDirChunkSize)
+		for _, entry := range batch {
+			if ctx.Err() != nil {
+				return newest, false
+			}
+			if entry.IsDir() || !codexIsRolloutFileName(entry.Name()) {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			info, err := os.Stat(path)
+			if err != nil {
+				// Removed or rotated since the listing: not a rollout to track.
+				continue
+			}
+			newest = codexInsertNewestRolloutFile(newest, codexRolloutFileStat{
+				path: path, mtimeNs: info.ModTime().UnixNano(), size: info.Size(),
+			}, n)
+		}
+		if readErr == io.EOF {
+			return newest, true
+		}
+		if readErr != nil {
+			return newest, false
+		}
+	}
+}
+
+// codexInsertNewestRolloutFile adds file to newest (sorted newest first) and
+// keeps at most n, replacing any entry for the same path.
+func codexInsertNewestRolloutFile(newest []codexRolloutFileStat, file codexRolloutFileStat, n int) []codexRolloutFileStat {
+	newest = slices.DeleteFunc(newest, func(f codexRolloutFileStat) bool { return f.path == file.path })
+	i, _ := slices.BinarySearchFunc(newest, file, codexRolloutFileNewestFirst)
+	newest = slices.Insert(newest, i, file)
+	if len(newest) > n {
+		newest = newest[:n]
+	}
+	return newest
+}
+
+// codexRolloutFileNewestFirst orders rollout stats newest mtime first, path
+// breaking a tie.
+func codexRolloutFileNewestFirst(a, b codexRolloutFileStat) int {
+	if c := cmp.Compare(b.mtimeNs, a.mtimeNs); c != 0 {
+		return c
+	}
+	return strings.Compare(a.path, b.path)
 }
 
 // codexRolloutCursorBelowFloor restarts a forced scan just below the run
@@ -1011,8 +1126,7 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 			if entry.IsDir() {
 				continue
 			}
-			matched, err := filepath.Match("rollout-*.jsonl", entry.Name())
-			if err != nil || !matched {
+			if !codexIsRolloutFileName(entry.Name()) {
 				continue
 			}
 			info, err := os.Stat(path)
@@ -1909,16 +2023,19 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	// earlier sessions. Treat the optional rollout source as unavailable for
 	// this pass instead of rejecting current evidence and then advancing past
 	// it; once the clock or file timestamp is corrected, the unchanged rollout
-	// remains eligible for a retry.
+	// remains eligible for a retry. The pass saw none of the tree, so it reports
+	// incomplete: a caller that stores progress of its own (codexDirectScan)
+	// must keep retrying, because correcting only auth.json's timestamp does not
+	// move the rollout signature it watches.
 	if authMod.After(now) {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{}
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{incomplete: true}
 	}
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
 	discoveryCtx, cancelDiscovery := codexRolloutDiscoveryContext(ctx)
 	candidates, discoveryComplete := codexDiscoverRolloutCandidates(discoveryCtx, base, cursor)
 	cancelDiscovery()
 	if len(candidates) == 0 {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{}
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{incomplete: !discoveryComplete}
 	}
 	eligibleCandidates := codexUnconsumedRolloutCandidates(candidates, cursor, now)
 	if len(eligibleCandidates) == 0 {
@@ -1942,7 +2059,7 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 			}
 			return nil, codexUsageLimitEvidence{}, time.Time{}, &progress, false, "", codexRolloutNudgeEvidence{}
 		}
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{}
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{incomplete: true}
 	}
 	// Rank candidates by file mtime descending, NOT by filename (= session
 	// start time). When sessions overlap — e.g. an older still-active session
@@ -2054,6 +2171,11 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	progressComplete := discoveryComplete && selectionComplete
 	attempted := make([]codexRolloutCandidate, 0, len(selected))
 	retryEntries := codexRolloutRetrySet(cursor.retryEntries)
+	// readRetry records that an attempted file was not fully read (a transient
+	// open/read failure or its file budget expired). Its retry entry is
+	// persisted, but a later recovery changes neither its mtime nor its size,
+	// so a stat-signature caller must keep re-running until the read lands.
+	readRetry := false
 	if discoveryComplete {
 		present := make(map[string]struct{}, len(candidates))
 		for _, candidate := range candidates {
@@ -2076,6 +2198,7 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		cancelFile()
 		retryEntry := codexRolloutBacklogEntryDigest(c)
 		retry := !handled
+		readRetry = readRetry || !handled
 		// A fully read file with neither numeric nor refusal evidence has nothing
 		// account-scoped to merge. It is safe to count as handled even when its
 		// first record does not provide a usable session timestamp.
@@ -2275,6 +2398,13 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		highWater = &progress
 	}
 	evidence := codexRolloutNudgeEvidenceFor(newestUncoveredMtime, newestUncoveredEntry, coveredEntries, progressComplete)
+	// The file cap (or a file budget) left unconsumed rollouts for a later pass:
+	// the persisted backlog/boundary cursor walks them, but only if something
+	// runs another pass.
+	evidence.workRemaining = progressComplete && len(attempted) < len(eligibleCandidates)
+	// An unread file stays queued in retryEntries; a refusal hold (limitEntry)
+	// does not set this, so a long-lived notice does not re-run every poll.
+	evidence.readRetry = readRetry
 	// Fenced only when nothing this pass ACCEPTED already covers the floor: an
 	// accepted reading at or after it pays the debt through the normal merge.
 	evidence.fencedSinceFloor = fencedAfterFloor
@@ -2365,6 +2495,25 @@ type codexRolloutNudgeEvidence struct {
 	// useless: the fenced file may be an unrelated overlapping session while the
 	// debt's own rollout has not flushed yet.
 	fencedSinceFloor bool
+	// incomplete is set when the pass did not see the whole tree it was asked
+	// to: discovery or selection ran out of its reserved sub-budget, the
+	// account switched under it, or a future auth.json mtime made the login
+	// watermark unusable so discovery was skipped. The parent context can still be live, so a
+	// caller that stores progress of its own (codexDirectScan) reads this
+	// rather than ctx.Err() to decide whether the pass may be treated as done.
+	incomplete bool
+	// uncommitted is set when the pass had a merge to make and it did not
+	// commit (a non-forced merge dropped on lock contention): neither its
+	// telemetry nor its cursor reached the cache.
+	uncommitted bool
+	// workRemaining is set when a complete pass still left eligible rollouts
+	// unread — more than codexRolloutScanFileCap of them, or a file budget
+	// expired — so its persisted cursor has more batches to walk.
+	workRemaining bool
+	// readRetry is set when an attempted rollout was not fully read — a
+	// transient open/read failure or an expired file budget — so it sits in
+	// the retry set and a re-run over the unchanged tree must read it again.
+	readRetry bool
 }
 
 // covers reports whether this pass mined telemetry covering the rollout
@@ -2496,8 +2645,17 @@ func codexRolloutLineStartsTurn(line string) bool {
 
 // codexRolloutNudgeEvidenceFor pairs the uncovered and covered rollouts,
 // withholding only `newest` on an unfinished pass (codexEligibleMtimeFor).
+// settled reports whether the pass left nothing for a re-run to do: it saw the
+// whole tree, committed what it found and read every eligible rollout to the
+// end. A caller
+// that stores progress of its own (codexDirectScan) retries an unchanged tree
+// until this holds.
+func (e codexRolloutNudgeEvidence) settled() bool {
+	return !e.incomplete && !e.uncommitted && !e.workRemaining && !e.readRetry
+}
+
 func codexRolloutNudgeEvidenceFor(newest time.Time, newestEntry string, covered map[string]time.Time, complete bool) codexRolloutNudgeEvidence {
-	evidence := codexRolloutNudgeEvidence{newest: codexEligibleMtimeFor(newest, complete), covered: covered}
+	evidence := codexRolloutNudgeEvidence{newest: codexEligibleMtimeFor(newest, complete), covered: covered, incomplete: !complete}
 	if !evidence.newest.IsZero() {
 		evidence.newestEntry = newestEntry
 	}

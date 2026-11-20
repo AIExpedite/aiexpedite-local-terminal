@@ -90,6 +90,21 @@
 // numeric live reading owes one read through the bounded Grok run debt, whose
 // commit hints like any other.
 //
+// Last, the Codex direct-run scan (codexDirectRunScanIfChanged,
+// cliagent_usage_codex_direct.go): a `codex` the agent did not arm — the
+// maintenance controller's shell, the user's shell or IDE, a hand-typed run in
+// an agent-hosted PTY — writes its telemetry to a rollout only a read can
+// discover. A poll stats at most three date directories and four tracked
+// rollouts; only when that moved (or the nudge still holds rollout evidence,
+// re-checked once a minute), at most every codexForcedReconcileMinInterval and
+// never while a run of this process is open, it runs the gather's own
+// reconcile-and-nudge, whose commit hints like any other. Unlike the Grok scan
+// it runs offline too: its first step is local I/O, and what follows is
+// offline-gated on its own. From the rollout write to the hint that is about
+// 50 s typically — up to 10 s for the poll, the nudge's 20 s settle, up to 5 s
+// of reconcile and the 15 s debounce — and at worst the 5-minute device spacing
+// plus terminal-service's 4-minute cooldown; no new timer bounds it.
+//
 // Pending state is in memory only. A reading captured just before an update
 // handoff is recovered by the next process: once its Codex epoch rotation
 // commits (codexRotateGenerationEpoch), a Codex cache that still renders a
@@ -125,9 +140,11 @@ var (
 	cliUsageRotationRetryPeriod = 60 * time.Second
 	cliUsageHintHTTPTimeout     = 2 * time.Second
 	// cliUsageClaudeFallbackPoll paces the fallback timer, which also runs the
-	// OpenCode direct-run reader's gated scan and the Grok direct-run scan.
+	// OpenCode direct-run reader's gated scan and the Grok and Codex direct-run
+	// scans.
 	// cliUsageClaudeFallbackPeriod is the Claude half's own spacing: while its
-	// cache stat is unchanged, the cache is still re-read once per period.
+	// cache stat is unchanged, the cache is still re-read once per period. The
+	// Codex direct-run scan re-checks held rollout evidence on the same period.
 	cliUsageClaudeFallbackPeriod  = 60 * time.Second
 	cliUsageClaudeFallbackPoll    = 10 * time.Second
 	cliUsageClaudeFallbackEnabled = true
@@ -276,6 +293,7 @@ func startCLIUsagePropagator(cfg *Config) {
 		// Runs made while the agent was down or mid-update.
 		openCodeDirectScanAtStartup()
 		grokDirectScanAtStartup()
+		codexDirectScanAtStartup()
 	}()
 }
 
@@ -698,9 +716,10 @@ var claudeUsageFallbackDetected = func() bool {
 }
 
 // armFallbackLocked (re)arms the fallback timer: the Claude tick, the OpenCode
-// direct scan and the Grok direct-run scan.
+// direct scan, the Grok direct-run scan and the Codex direct-run scan.
 func (p *cliUsagePropagatorState) armFallbackLocked() {
-	if p.stopped || (!cliUsageClaudeFallbackEnabled && !openCodeDirectScanEnabled && !grokDirectScanEnabled) {
+	if p.stopped || (!cliUsageClaudeFallbackEnabled && !openCodeDirectScanEnabled &&
+		!grokDirectScanEnabled && !codexDirectScanEnabled) {
 		return
 	}
 	if p.fallbackTimer != nil {
@@ -711,8 +730,8 @@ func (p *cliUsagePropagatorState) armFallbackLocked() {
 	p.fallbackTimer = time.AfterFunc(cliUsageClaudeFallbackPoll, func() { p.fallback(gen) })
 }
 
-// fallback is the Claude tick, the OpenCode direct scan and the Grok direct-run
-// scan. It discovers a
+// fallback is the Claude tick, the OpenCode direct scan, the Grok direct-run
+// scan and the Codex direct-run scan. It discovers a
 // Claude generation another process committed (the status-line hook) when no
 // ordinary read has, and adopts a refresh debt the SessionEnd hook recorded —
 // one stat per tick, and one small cache read only when that stat moved or
@@ -720,8 +739,8 @@ func (p *cliUsagePropagatorState) armFallbackLocked() {
 // reconcile, which is latched on that file's own stamp and throttled, so a
 // Claude upgrade that dropped our hooks is repaired without waiting for an
 // agent-run session — a direct run never triggers one. Then it runs the
-// OpenCode direct scan, then the Grok one. Each only while its own gates are
-// open.
+// OpenCode direct scan, then the Grok one, then the Codex one. Each only while
+// its own gates are open.
 func (p *cliUsagePropagatorState) fallback(gen uint64) {
 	// Serialized with resetCLIUsagePropagator exactly as fire is, so a tick in
 	// flight finishes before a test reset restores the vars it reads
@@ -751,6 +770,7 @@ func (p *cliUsagePropagatorState) fallback(gen uint64) {
 	}
 	openCodeDirectScanIfChanged()
 	grokDirectRunScanIfChanged()
+	codexDirectRunScanIfChanged()
 	p.mu.Lock()
 	if gen == p.fallbackGen {
 		p.armFallbackLocked()
@@ -954,5 +974,6 @@ func resetCLIUsagePropagator() {
 	p.rotated, p.rotationRetryAt, p.recoveryDue, p.claudeRecoveryDue = false, time.Time{}, false, false
 	p.claudeTickSeen, p.claudeTickMod, p.claudeTickSize, p.claudeTickWorkedAt = false, 0, 0, time.Time{}
 	resetGrokDirectScan()
+	resetCodexDirectScan()
 	grokGenerationRotated.Store(false)
 }

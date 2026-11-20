@@ -16,6 +16,14 @@
 //
 // Lifecycle (both the direct app-server path and terminal `codex` sessions):
 //
+//   - Discover: a run the agent did not arm (the user's or the maintenance
+//     controller's shell, a hand-typed `codex` in an agent-hosted PTY) reaches
+//     the same debt without a gather: the propagator poll's
+//     codexDirectRunScanIfChanged (cliagent_usage_codex_direct.go) runs the
+//     gather's reconcile-and-nudge once its rollout moves, so the post-run
+//     guarantee below no longer depends on the agent having spawned the run.
+//     It stands down while a run of this process is open
+//     (codexNewestOpenRunFloor) — that run settles itself.
 //   - Arm: a run start persists RunFloorMs (armCodexUsageRunFloor).
 //   - Settle: run completion persists RefreshOwedAtMs, then a bounded worker
 //     spends at most codexRefreshAfterRunMaxAttempts FORCED reconciles on it:

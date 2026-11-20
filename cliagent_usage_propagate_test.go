@@ -93,8 +93,8 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 	if os.Getenv("AIEXPEDITE_MUSECODE_USAGE_LIVE_CACHE") == "" {
 		t.Setenv("AIEXPEDITE_MUSECODE_USAGE_LIVE_CACHE", t.TempDir()+"/musecode_usage_live.json")
 	}
-	prevGrokScan := grokDirectScanEnabled
-	grokDirectScanEnabled = false
+	prevGrokScan, prevCodexScan := grokDirectScanEnabled, codexDirectScanEnabled
+	grokDirectScanEnabled, codexDirectScanEnabled = false, false
 	rec := &cliUsageHintRecorder{}
 	prevSend := sendCLIUsageObservedHint
 	sendCLIUsageObservedHint = func(_ context.Context, url string, hint cliUsageObservedHint) int {
@@ -112,7 +112,7 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 		sendCLIUsageObservedHint = prevSend
 		cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod, cliUsageClaudeFallbackPeriod, cliUsageClaudeFallbackPoll = prev[0], prev[1], prev[2], prev[3], prev[4], prev[5]
 		cliUsageClaudeFallbackEnabled, claudeUsageFallbackDetected = prevFallback, prevDetected
-		grokDirectScanEnabled = prevGrokScan
+		grokDirectScanEnabled, codexDirectScanEnabled = prevGrokScan, prevCodexScan
 	})
 	return rec, &Config{AgentID: "agent-1", CommandSecret: "secret"}
 }
@@ -1715,5 +1715,49 @@ func TestCLIUsageHint_GrokStartupScanNudgesATurnFromBeforeStart(t *testing.T) {
 	h.idle()
 	if h.reads.Load() != 1 {
 		t.Fatalf("reads = %d, want the startup scan to owe the turn its read", h.reads.Load())
+	}
+}
+
+// With only the Codex direct-run scan enabled, the fallback timer still arms,
+// the startup scan takes the baseline, and the poll runs the Codex scan when a
+// rollout lands.
+func TestCLIUsageHint_CodexPollRunsTheDirectScanAlone(t *testing.T) {
+	h := codexDirectFixture(t, time.Now())
+	codexUsageFreshnessNow = time.Now
+	codexForcedReconcileMinInterval = 10 * time.Millisecond
+	_, cfg := propagatorFixture(t)
+	cliUsageClaudeFallbackPoll = 10 * time.Millisecond
+	codexDirectScanEnabled = true
+	// Runs first: no poll may read a seam while the cleanups above restore it.
+	t.Cleanup(func() {
+		stopCLIUsagePropagator()
+		resetCLIUsagePropagator()
+	})
+	if cliUsageClaudeFallbackEnabled || openCodeDirectScanEnabled || grokDirectScanEnabled {
+		t.Fatal("this row needs every other fallback feature off")
+	}
+
+	startCLIUsagePropagator(cfg)
+	cliUsagePropagator.rotating.Wait()
+	cliUsagePropagator.mu.Lock()
+	armed := cliUsagePropagator.fallbackTimer != nil
+	cliUsagePropagator.mu.Unlock()
+	if !armed {
+		t.Fatal("the fallback timer must arm for the Codex scan alone")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for h.reconciles() < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("the startup scan never reconciled")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	startup := h.reconciles()
+	h.writeRollout(t, h.dayDir(time.Now()), "shell", "{}\n", time.Now())
+	for h.reconciles() <= startup {
+		if time.Now().After(deadline) {
+			t.Fatal("the poll never ran the Codex scan")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
