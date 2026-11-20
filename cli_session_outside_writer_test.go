@@ -248,9 +248,29 @@ func TestOutsideWriterFrameIsTheSameForEveryEngine(t *testing.T) {
 	}
 }
 
+// connectOutsideWriterLink is runPubSubConnection's step for a new connection
+// whose results publisher is publish: every watcher publishes through it from
+// now on, and each running one repeats its last state on it (how many did is
+// returned). The shared publisher is restored when the test ends.
+func connectOutsideWriterLink(t *testing.T, publish PublishFunc) int {
+	t.Helper()
+	cliOutsideWriterWatches.Lock()
+	prev := cliOutsideWriterWatches.publish
+	cliOutsideWriterWatches.Unlock()
+	t.Cleanup(func() {
+		cliOutsideWriterWatches.Lock()
+		defer cliOutsideWriterWatches.Unlock()
+		cliOutsideWriterWatches.publish = prev
+	})
+	setCliOutsideWriterPublisher(publish)
+	return resendCliSessionOutsideWriterStates(publish)
+}
+
 // A frame published while the Pub/Sub link was down — the `idle` that would
 // release a held message — is never lost for good: a new connection gets
-// every watcher's current state again, and every later change.
+// every watcher's current state again, and every later change. The previous
+// connection's re-send, running late, repeats on its own link only and never
+// moves a watcher back to it.
 func TestOutsideWriterReSendsTheCurrentStateOnReconnect(t *testing.T) {
 	fastOutsideWriterPolls(t)
 	t.Setenv("CODEX_HOME", t.TempDir())
@@ -265,6 +285,7 @@ func TestOutsideWriterReSendsTheCurrentStateOnReconnect(t *testing.T) {
 		return []cliSessionProcess{{PID: 88, Name: "codex", Args: []string{"codex", "resume", owTestThread}}}
 	})
 	oldLink := &outsideWriterSink{}
+	connectOutsideWriterLink(t, oldLink.publish)
 	stop := make(chan struct{})
 	defer close(stop)
 	owner := cliOutsideWriterOwner{ID: owTestSession + "-reconnect", WorkspaceID: "ws1", UID: "u1"}
@@ -281,7 +302,7 @@ func TestOutsideWriterReSendsTheCurrentStateOnReconnect(t *testing.T) {
 	idle := oldLink.last(owner.ID)
 
 	newLink := &outsideWriterSink{}
-	if n := resendCliSessionOutsideWriterStates(newLink.publish); n < 1 {
+	if n := connectOutsideWriterLink(t, newLink.publish); n < 1 {
 		t.Fatalf("re-sent %d frames, want the running watcher's", n)
 	}
 	again := newLink.last(owner.ID)
@@ -291,6 +312,7 @@ func TestOutsideWriterReSendsTheCurrentStateOnReconnect(t *testing.T) {
 	if newLink.last(quiet.ID) != nil {
 		t.Fatal("a watcher that never reported anything was re-sent")
 	}
+	resendCliSessionOutsideWriterStates(oldLink.publish) // the old connection's, late
 
 	mu.Lock()
 	holding = false
@@ -300,9 +322,45 @@ func TestOutsideWriterReSendsTheCurrentStateOnReconnect(t *testing.T) {
 		s := newLink.states(owner.ID)
 		return len(s) == 2 && s[1] == claudeOutsideWriterGone
 	})
-	if got := oldLink.states(owner.ID); len(got) != 1 {
-		t.Fatalf("the closed link got %v after the reconnect", got)
+	if got := oldLink.states(owner.ID); len(got) != 2 || got[1] != claudeOutsideWriterIdle {
+		t.Fatalf("the closed link got %v after the reconnect, want only the idle and its late repeat", got)
 	}
+}
+
+// A Codex app-server or ACP child started before a reconnect, that receives
+// its resume only after the reconnect, starts that session's watcher with the
+// publisher of the connection it started on, closed since: the watcher still
+// publishes through the newest connection.
+func TestOutsideWriterWatcherStartedAfterAReconnectUsesTheNewLink(t *testing.T) {
+	fastOutsideWriterPolls(t)
+	t.Setenv("GROK_HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", t.TempDir())
+	pinCliSessionProcesses(t, func() []cliSessionProcess {
+		return []cliSessionProcess{
+			{PID: 91, Name: "codex", Args: []string{"codex", "resume", owTestThread}},
+			{PID: 92, Name: "grok", Args: []string{"grok", "--resume", owTestThread}},
+		}
+	})
+	oldLink, newLink := &outsideWriterSink{}, &outsideWriterSink{}
+	connectOutsideWriterLink(t, oldLink.publish)
+	codex := &CodexAppServerSession{ID: owTestSession + "-codex-late", WorkspaceID: "ws", UID: "u", processExited: make(chan struct{}), publish: oldLink.publish}
+	acp := &ACPSession{ID: owTestSession + "-acp-late", WorkspaceID: "ws", UID: "u", processExited: make(chan struct{}), publish: oldLink.publish}
+
+	connectOutsideWriterLink(t, newLink.publish)
+	NewCodexAppServerManager(nil).noteCodexResumeWritten(codex, `{"jsonrpc":"2.0","id":2,"method":"thread/resume","params":{"threadId":"`+owTestThread+`"}}`)
+	newACPManager(nil, grokACPProfile).noteACPResumeWritten(acp, `{"jsonrpc":"2.0","id":5,"method":"session/load","params":{"sessionId":"`+owTestThread+`","cwd":"/w","mcpServers":[]}}`)
+	waitForWriterState(t, 3*time.Second, "both watchers' report on the new link", func() bool {
+		return len(newLink.states(codex.ID)) == 1 && len(newLink.states(acp.ID)) == 1
+	})
+	if got := append(oldLink.states(codex.ID), oldLink.states(acp.ID)...); len(got) != 0 {
+		t.Fatalf("the closed link got %v", got)
+	}
+
+	close(codex.processExited)
+	close(acp.processExited)
+	waitForWriterState(t, 3*time.Second, "the watchers to end with their children", func() bool {
+		return !watchRunning(cliSessionEngineCodex+"|"+codex.ID+"|"+owTestThread) && !watchRunning(cliSessionEngineGrok+"|"+acp.ID+"|"+owTestThread)
+	})
 }
 
 // fakeTurnState is a one-shot manager's view of one session.

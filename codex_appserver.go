@@ -166,8 +166,10 @@ type CodexAppServerSession struct {
 	liveFollowUps *liveFollowUpTracker
 	// publish is the publishFn the session was started with, and ownIO when
 	// the child last read or wrote a frame: the outside-writer watcher of a
-	// thread it resumes publishes through the one and never counts the
-	// child's own rollout writes as another writer (cli_session_outside_writer.go).
+	// thread it resumes never counts the child's own rollout writes as
+	// another writer, and publishes through the newest Pub/Sub connection
+	// rather than publish's, which a reconnect may have closed since
+	// (cli_session_outside_writer.go).
 	publish PublishFunc
 	ownIO   cliSessionOwnIO
 

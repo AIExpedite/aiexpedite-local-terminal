@@ -2129,11 +2129,16 @@ func runPubSubConnection(cfg *Config) error {
 
 	topic := client.Publisher(topicName)
 
-	// Every running outside-writer watcher publishes through this connection
-	// from now on and repeats its last state on it: a frame published while
-	// the link was down (an `idle` that releases a held message) is never
-	// lost for good (cli_session_outside_writer.go).
-	go resendCliSessionOutsideWriterStates(newSessionPublishFn(topic, "[outside-writer]"))
+	// Every outside-writer watcher publishes through this connection from now
+	// on, one a resume starts later with its session's older publisher
+	// included, and every running watcher repeats its last state on it: a
+	// frame published while the link was down (an `idle` that releases a held
+	// message) is never lost for good (cli_session_outside_writer.go). The
+	// publisher is set here, before any command is received; only the repeat
+	// runs in the background.
+	outsideWriterPublish := newSessionPublishFn(topic, "[outside-writer]")
+	setCliOutsideWriterPublisher(outsideWriterPublish)
+	go resendCliSessionOutsideWriterStates(outsideWriterPublish)
 
 	fmt.Printf("[pubsub] connected to subscription: %s\n", cfg.CommandsSubscription)
 	if IsSystrayReady() {

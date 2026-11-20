@@ -12,9 +12,11 @@
 // recordOutsideWriterChange), so:
 //
 //   - a frame that misses the cloud (published while the Pub/Sub link was
-//     down) must not strand a held message: every running watcher's last
-//     frame is published again on each new Pub/Sub connection, and its later
-//     frames go through that connection (resendCliSessionOutsideWriterStates);
+//     down) must not strand a held message: every watcher publishes through
+//     the newest Pub/Sub connection, one a resume starts after a reconnect
+//     included (setCliOutsideWriterPublisher), and every running watcher's
+//     last frame is published again on each new connection
+//     (resendCliSessionOutsideWriterStates);
 //   - AI Expedite's own child is never another writer.
 //
 // Writer evidence, per engine:
@@ -210,16 +212,19 @@ func claudeOutsideWriterFrame(session *ClaudeNativeSession, agentID string, w cl
 /* Running watchers: re-sent on reconnect                                     */
 /* -------------------------------------------------------------------------- */
 
-// cliOutsideWriterWatch is one running watcher: the publisher its frames go
-// through and the last frame it published.
+// cliOutsideWriterWatch is one running watcher: the publisher it was started
+// with and the last frame it published.
 type cliOutsideWriterWatch struct {
 	key   string
 	stop  <-chan struct{}
 	alive func() bool
-
-	mu      sync.Mutex
+	// publish is the publisher of the connection the watcher's session was
+	// started on: its frames go through it only while no Pub/Sub connection
+	// has set the one every watcher shares (cliOutsideWriterPublisher).
 	publish PublishFunc
-	last    *resultMsg
+
+	mu   sync.Mutex
+	last *resultMsg
 }
 
 // ended reports whether the session this watcher watches for has ended (its
@@ -235,25 +240,57 @@ func (w *cliOutsideWriterWatch) ended() bool {
 	return w.alive != nil && !w.alive()
 }
 
-// emit records frame as this watcher's current state and publishes it.
+// emit records frame as this watcher's current state and publishes it
+// through the newest Pub/Sub connection.
 func (w *cliOutsideWriterWatch) emit(frame resultMsg) {
 	w.mu.Lock()
 	kept := frame
 	w.last = &kept
-	publish := w.publish
 	w.mu.Unlock()
-	if publish != nil {
+	if publish := cliOutsideWriterPublisher(w.publish); publish != nil {
 		publish(frame)
 	}
 }
 
 // cliOutsideWriterWatches are the running watchers, by engine | AI Expedite
-// session | the engine's session id: a redelivered resume never starts a
-// second watcher for the same pair.
+// session | the engine's session id (a redelivered resume never starts a
+// second watcher for the same pair), and the publisher they all publish
+// through.
 var cliOutsideWriterWatches = struct {
 	sync.Mutex
 	byKey map[string]*cliOutsideWriterWatch
+	// publish is the newest Pub/Sub connection's results publisher
+	// (setCliOutsideWriterPublisher), nil before the first connection.
+	publish PublishFunc
 }{byKey: map[string]*cliOutsideWriterWatch{}}
+
+// setCliOutsideWriterPublisher runs on every new Pub/Sub connection
+// (runPubSubConnection) with that connection's results publisher, before the
+// connection receives a command: every watcher's frames go through it from
+// now on. A watcher is started with its session's publisher, which belongs to
+// the connection the session started on, so a Codex app-server or ACP child
+// that receives its resume after a reconnect would otherwise start a watcher
+// that publishes through a closed client until the next reconnect.
+func setCliOutsideWriterPublisher(publish PublishFunc) {
+	if publish == nil {
+		return
+	}
+	cliOutsideWriterWatches.Lock()
+	defer cliOutsideWriterWatches.Unlock()
+	cliOutsideWriterWatches.publish = publish
+}
+
+// cliOutsideWriterPublisher is the publisher a watcher's frame goes through:
+// the newest Pub/Sub connection's, or started (the watcher's own) before the
+// first connection sets one.
+func cliOutsideWriterPublisher(started PublishFunc) PublishFunc {
+	cliOutsideWriterWatches.Lock()
+	defer cliOutsideWriterWatches.Unlock()
+	if cliOutsideWriterWatches.publish != nil {
+		return cliOutsideWriterWatches.publish
+	}
+	return started
+}
 
 // registerCliOutsideWriterWatch adds t's watcher, or reports false when one
 // is already running for the same pair in a session still running. A
@@ -279,15 +316,16 @@ func unregisterCliOutsideWriterWatch(w *cliOutsideWriterWatch) {
 }
 
 // resendCliSessionOutsideWriterStates runs on every new Pub/Sub connection
-// (runPubSubConnection) with that connection's results publisher. Each
-// running watcher publishes its frames through it from now on — the
-// session's own publisher belonged to the connection that just closed — and
-// the last state it reported is published again. A frame published while the
-// link was down (the `idle` that would release a held message) is never
-// lost for good: the cloud reads a repeat as the same report (the same
-// `outsideWriter.at`), and a newer one as newer. A watcher that has reported
-// nothing has nothing the cloud could be holding for. Returns how many
-// frames went out.
+// (runPubSubConnection), once setCliOutsideWriterPublisher has made that
+// connection's results publisher the one every watcher publishes through, and
+// publishes the last state each running watcher reported through it again. A
+// frame published while the link was down (the `idle` that would release a
+// held message) is never lost for good: the cloud reads a repeat as the same
+// report (the same `outsideWriter.at`), and a newer one as newer. A watcher
+// that has reported nothing has nothing the cloud could be holding for. It
+// never changes which publisher the watchers use, so a re-send that runs late,
+// after a newer connection's, cannot move them back to a closed link. Returns
+// how many frames went out.
 func resendCliSessionOutsideWriterStates(publish PublishFunc) int {
 	if publish == nil {
 		return 0
@@ -301,7 +339,6 @@ func resendCliSessionOutsideWriterStates(publish PublishFunc) int {
 	sent := 0
 	for _, w := range watches {
 		w.mu.Lock()
-		w.publish = publish
 		var frame resultMsg
 		have := w.last != nil
 		if have {
@@ -358,9 +395,11 @@ func startClaudeOutsideWriterWatcher(session *ClaudeNativeSession, claudeSession
 	}, publishFn)
 }
 
-// startCliSessionOutsideWriterWatcher starts t's watcher, publishing through
-// publishFn, and reports whether it did (false for an engine or id this build
-// cannot watch, or one already watched).
+// startCliSessionOutsideWriterWatcher starts t's watcher and reports whether
+// it did (false for an engine or id this build cannot watch, or one already
+// watched). Its frames go through the newest Pub/Sub connection
+// (setCliOutsideWriterPublisher); through publishFn, the publisher of the
+// connection t's session started on, only until a connection sets one.
 func startCliSessionOutsideWriterWatcher(t cliOutsideWriterTarget, publishFn PublishFunc) bool {
 	if publishFn == nil || t.owner.ID == "" || (t.stop == nil && t.alive == nil) {
 		return false
