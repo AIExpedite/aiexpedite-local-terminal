@@ -507,6 +507,9 @@ func (d *cdpDiscovery) destroyed(targetID string, at time.Time, mem *browserFocu
 	delete(d.tabActive, targetID)
 	delete(d.tabURL, targetID)
 	if d.pendingTab == targetID {
+		// The switch to this tab never reached the memory and now never will:
+		// the memory's newest record is not the page the person went to last.
+		mem.interrupt()
 		d.pendingTab = ""
 	}
 	d.continuityLocked(at, mem)

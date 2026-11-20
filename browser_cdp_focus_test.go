@@ -173,6 +173,49 @@ func TestCDPDiscoveryUnresolvedSwitchEndsContinuity(t *testing.T) {
 	}
 }
 
+// An unresolved switch whose tab closes before the next switch still ends
+// continuity: X stays the memory's newest record, but the person left it.
+func TestCDPDiscoveryUnresolvedSwitchToClosedTabEndsContinuity(t *testing.T) {
+	t0 := time.Now().Add(-time.Second)
+	mem := &browserFocusMemory{}
+	cn := &cdpConn{mem: mem}
+	ev := func(info cdpTarget) {
+		raw, _ := json.Marshal(map[string]any{"targetInfo": info})
+		cn.onEvent("Target.targetInfoChanged", "", raw)
+	}
+	gone := func(id string) {
+		raw, _ := json.Marshal(map[string]any{"targetId": id})
+		cn.onEvent("Target.targetDestroyed", "", raw)
+	}
+	for _, info := range []cdpTarget{
+		tabWithURL("TX", `{"tabActive":false}`, docsURL), pageTarget("PX", "", docsURL),
+		tabWithURL("TD1", `{"tabActive":false}`, mailURL), pageTarget("PD1", "", mailURL),
+		tabWithURL("TD2", `{"tabActive":true}`, mailURL), pageTarget("PD2", "", mailURL),
+		tabWithURL("TAPP", `{"tabActive":false}`, appURL), pageTarget("PAPP", "", appURL),
+	} {
+		ev(info)
+	}
+	cn.disc.started(t0, mem)
+	// X (recorded), then one of the two mail tabs (unlinkable), which closes.
+	ev(tabWithURL("TD2", `{"tabActive":false}`, mailURL))
+	ev(tabWithURL("TX", `{"tabActive":true}`, docsURL))
+	ev(tabWithURL("TX", `{"tabActive":false}`, docsURL))
+	ev(tabWithURL("TD1", `{"tabActive":true}`, mailURL))
+	if !cn.disc.unresolved() {
+		t.Fatal("the switch to a shared-URL tab is unresolved")
+	}
+	gone("PD1")
+	gone("TD1")
+	if cn.disc.unresolved() {
+		t.Fatal("a closed tab is no longer pending")
+	}
+	ev(tabWithURL("TAPP", `{"tabActive":true}`, appURL))
+	open := func(id string) (bool, bool) { return id != "", id == "d:PAPP" }
+	if e, cont, ok := mem.recall(open); ok && cont {
+		t.Fatalf("lastActive must not be %s: the person left it for a mail tab that then closed", e.TabID)
+	}
+}
+
 func TestParseFocusProbe(t *testing.T) {
 	cases := map[string][2]string{ // raw -> focused, visible ("t", "f", "")
 		`{"f":true,"v":"visible"}`:    {"t", "t"},
