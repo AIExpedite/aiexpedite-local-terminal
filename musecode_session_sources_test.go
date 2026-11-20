@@ -214,3 +214,24 @@ func TestMuseCodeProbeNeverGuessesAnID(t *testing.T) {
 		t.Fatalf("a non-UUID id = %+v", bad)
 	}
 }
+
+// A listing that says it holds more (a cursor) is only part of the host's
+// list: a session it does not name may be on a later page, which this build
+// cannot ask for, so the probe answers an error (the cloud's "could not check
+// that session"), never gone — while a session that part does name is still
+// confirmed.
+func TestMuseCodeProbeOfAPartialListingNeverSaysGone(t *testing.T) {
+	now := time.Now()
+	partial := museListing(now)
+	partial["nextCursor"] = "page-2"
+	useMuseListingHost(t, &fakeMuseListingHost{list: partial}, true)
+	pinCliSessionProcesses(t, func() []cliSessionProcess { return nil })
+	listed := probeMuseCodeSession(context.Background(), cliSessionProbeRequest{sessionID: muA})
+	if listed.Error != "" || !listed.Exists || !listed.Resumable {
+		t.Fatalf("a session the partial listing names = %+v, want confirmed", listed)
+	}
+	later := probeMuseCodeSession(context.Background(), cliSessionProbeRequest{sessionID: "0199b000-0000-7000-8000-000000000999"})
+	if later.Error != cliSessionErrInternal || later.Exists || later.Resumable {
+		t.Fatalf("a session past the partial listing = %+v, want an error (not checked), never gone or resumable", later)
+	}
+}

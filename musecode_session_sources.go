@@ -25,8 +25,9 @@
 // "updatedAt"|"lastActivityAt"|"createdAt"}], "nextCursor"?}. Anything else
 // is `unrecognised`, never guessed at; a host without the method (JSON-RPC
 // -32601) is providerUnsupported; a list that says it has more (a cursor) is
-// truncated, because its paging param is not known either. Whether the list
-// includes sessions started outside a host (a `muse` TUI's) is the open
+// truncated, because its paging param is not known either, and the probe of a
+// session such a list does not name is an error, never "gone". Whether the
+// list includes sessions started outside a host (a `muse` TUI's) is the open
 // question in the per-agent matrix: if it does not, Muse Code is listed as
 // having none, which is why terminal-service keeps Muse Code's adoption
 // behind a confirmation.
@@ -35,8 +36,8 @@
 // caller (`muse exec --session-id`), and an id it does not hold silently
 // starts a NEW session under it. So a row is only ever a listed session, and
 // the probe confirms a session only from a listing taken there and then: an id
-// the host does not list — or a listing that could not be taken — is never
-// reported resumable.
+// the host does not list — or a listing that could not be taken, or one cut
+// short of the id — is never reported resumable.
 package main
 
 import (
@@ -243,7 +244,8 @@ func discoverMuseCodeSessions(ctx context.Context, req cliSessionDiscoverRequest
 
 // probeMuseCodeSession answers the probe of one session from a listing taken
 // now: listed is resumable, unlisted is gone, and a listing that could not be
-// taken says so (its error) instead of either.
+// taken says so (its error) instead of either — as does one that says it
+// holds more than it listed, when the session is not on the part it listed.
 func probeMuseCodeSession(ctx context.Context, req cliSessionProbeRequest) cliSessionProbeResult {
 	res := cliSessionProbeResult{SessionID: req.sessionID, Writers: []cliSessionWriter{}, OpenInEditors: []string{}, TitleSource: cliSessionTitleNone}
 	if !isValidMuseCodeSessionID(req.sessionID) {
@@ -276,6 +278,16 @@ func probeMuseCodeSession(ctx context.Context, req cliSessionProbeRequest) cliSe
 		res.Exists, res.Resumable = true, true
 		res.TranscriptWrittenAt = s.updated
 		res.Title, res.TitleSource, _ = cliSessionTitleOf(s.title, s.updated, "", "")
+		return res
+	}
+	if listing.more {
+		// Not on the part listed, while the host says it holds more (a cursor
+		// whose paging param is not known, see the file comment): the session
+		// may be on a later page, so whether it exists is unknown. It is
+		// answered the way a listing that could not be taken is: an error,
+		// which terminal-service reads as a session it could not check, never
+		// as one that is gone.
+		res.Error = cliSessionErrInternal
 		return res
 	}
 	// Not listed: a resume under this id would start a new session. A live
