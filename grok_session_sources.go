@@ -21,7 +21,9 @@
 // AI Expedite's own Grok sessions are NOT here: they live in the per-device
 // store its isolated homes share (grok_session_store.go), so everything this
 // reader lists was started outside AI Expedite. Loading one of them needs its
-// folder linked into that store first (linkAdoptedGrokSession). Read-only.
+// folder linked into that store first (linkAdoptedGrokSession). The probe of
+// a session whose folder could not be read, or that a store it could not
+// search in full does not show, is an error, never "gone". Read-only.
 package main
 
 import (
@@ -188,7 +190,10 @@ type grokSessionInfo struct {
 }
 
 // readGrokSessionFolder reads a folder's summary.json and its first prompt.
-// errCliSessionUnrecognised when neither names this session.
+// errCliSessionUnrecognised when neither names this session; updates.jsonl's
+// read error when it is there but could not be read (its permissions, an I/O
+// error) and named no session before the error, since it is what says
+// whether the session loads: that is then unknown, never no.
 func readGrokSessionFolder(folder, sessionID string) (grokSessionInfo, error) {
 	info := grokSessionInfo{id: sessionID}
 	var summary struct {
@@ -231,10 +236,10 @@ func readGrokSessionFolder(folder, sessionID string) (grokSessionInfo, error) {
 		}
 		return true
 	})
+	if !updatesOK && err != nil && !errors.Is(err, os.ErrNotExist) {
+		return info, err
+	}
 	if !summaryOK && !updatesOK {
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return info, err
-		}
 		return info, errCliSessionUnrecognised
 	}
 	if p := strings.TrimSpace(prompt.String()); p != "" && !cliSessionSyntheticPrompt(p) {
@@ -351,31 +356,56 @@ func discoverGrokSessions(ctx context.Context, home string, req cliSessionDiscov
 // cwd's own encoding when cwd is given and has it, else the newest folder of
 // that id under any cwd. "" when none.
 func findGrokSessionFolder(home, sessionID, cwd string) string {
+	folder, _ := searchGrokSessionFolder(home, sessionID, cwd)
+	return folder
+}
+
+// searchGrokSessionFolder is findGrokSessionFolder with the search's error:
+// the first cwd folder of the store, or folder of the session, that is there
+// but could not be read (its permissions, an I/O error). The session may be
+// kept there, so not finding it proves nothing; a folder found elsewhere
+// still answers. No sessions folder is no error: no session was saved.
+func searchGrokSessionFolder(home, sessionID, cwd string) (best string, err error) {
 	if home == "" || !isCliSessionUUID(sessionID) {
-		return ""
+		return "", nil
 	}
 	root := filepath.Join(home, grokSessionsDirName)
 	if filepath.IsAbs(cwd) {
 		p := filepath.Join(root, grokSessionCwdDirName(cwd), sessionID)
-		if fi, err := os.Stat(p); err == nil && fi.IsDir() {
-			return p
+		if fi, statErr := os.Stat(p); statErr == nil && fi.IsDir() {
+			return p, nil
 		}
 	}
-	matches, _ := filepath.Glob(filepath.Join(root, "*", sessionID))
-	best, bestAt := "", int64(-1)
-	for _, m := range matches {
-		fi, err := os.Stat(m)
-		if err != nil || !fi.IsDir() {
+	names, err := cliSessionDirNames(root)
+	bestAt := int64(-1)
+	for _, name := range names {
+		// A cwd folder (session_search.sqlite and its journals are files).
+		cwdDir := filepath.Join(root, name)
+		if fi, statErr := os.Stat(cwdDir); statErr != nil || !fi.IsDir() {
+			cliSessionNoteReadErr(&err, statErr)
 			continue
 		}
-		if at := grokFolderWrittenAt(m); at > bestAt {
-			best, bestAt = m, at
+		p := filepath.Join(cwdDir, sessionID)
+		fi, statErr := os.Stat(p)
+		if statErr != nil || !fi.IsDir() {
+			cliSessionNoteReadErr(&err, statErr)
+			continue
+		}
+		if at := grokFolderWrittenAt(p); at > bestAt {
+			best, bestAt = p, at
 		}
 	}
-	return best
+	return best, err
 }
 
-// probeGrokSession answers the probe of one session.
+// probeGrokSession answers the probe of one session: a folder whose files
+// name it is there (resumable when updates.jsonl does), one naming no
+// session is there but not resumable, and none in a store searched in full
+// is gone. A folder whose files could not be read, or no folder found where a
+// cwd folder of the store could not be searched (searchGrokSessionFolder's
+// error), says so instead: whether the session is kept, and loads, is
+// unknown, so the answer is an error, which terminal-service reads as a
+// session it could not check, never as one that is gone.
 func probeGrokSession(ctx context.Context, home string, req cliSessionProbeRequest) cliSessionProbeResult {
 	res := cliSessionProbeResult{SessionID: req.sessionID, Writers: []cliSessionWriter{}, OpenInEditors: []string{}, TitleSource: cliSessionTitleNone}
 	if !isCliSessionUUID(req.sessionID) {
@@ -383,17 +413,23 @@ func probeGrokSession(ctx context.Context, home string, req cliSessionProbeReque
 		return res
 	}
 	res.Writers = cliSessionProcessWriters(grokWriterEvidence, req.sessionID)
-	if folder := findGrokSessionFolder(home, req.sessionID, req.cwd); folder != "" {
+	folder, err := searchGrokSessionFolder(home, req.sessionID, req.cwd)
+	if folder != "" {
 		res.TranscriptWrittenAt = grokFolderWrittenAt(folder)
-		info, err := readGrokSessionFolder(folder, req.sessionID)
+		var info grokSessionInfo
+		info, err = readGrokSessionFolder(folder, req.sessionID)
 		switch {
 		case err == nil:
 			res.Exists, res.Resumable = true, info.resumable
 			doc := readGrokSessionDocs(ctx, filepath.Join(home, grokSessionsDirName))[req.sessionID]
 			res.Title, res.TitleSource, _ = grokRowTitle(info, doc)
 		case errors.Is(err, errCliSessionUnrecognised):
-			res.Exists = true // a folder is there, not one this build can resume
+			res.Exists, err = true, nil // a folder is there, not one this build can resume
 		}
+	}
+	if err != nil {
+		res.Error = cliSessionErrInternal
+		return res
 	}
 	res.Exists = res.Exists || len(res.Writers) > 0
 	return res

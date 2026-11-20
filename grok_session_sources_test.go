@@ -167,6 +167,66 @@ func TestGrokProbeReportsTheSessionAndItsWriters(t *testing.T) {
 	}
 }
 
+// The probe never reads a session as gone, or as one that does not load,
+// from a store it could not read: a folder whose updates.jsonl is there but
+// could not be read (with a summary or without), or no folder found where a
+// cwd folder of the store could not be listed, answers an error, which
+// terminal-service reads as a session it could not check. A readable folder
+// is still confirmed, and a store read in full without the session still
+// says gone; a listing skips the folder it could not read, as it skips any.
+func TestGrokProbeOfAFolderItCouldNotReadNeverSaysGone(t *testing.T) {
+	home, now := grokFixture(t)
+	pinCliSessionProcesses(t, func() []cliSessionProcess { return nil })
+	const (
+		bare       = "11111111-2222-4333-8444-0000000000a1"
+		summarised = "11111111-2222-4333-8444-0000000000a2"
+		hidden     = "11111111-2222-4333-8444-0000000000a3"
+		absent     = "11111111-2222-4333-8444-0000000000ff"
+	)
+	probe := func(id, cwd string) cliSessionProbeResult {
+		return probeGrokSession(context.Background(), home, cliSessionProbeRequest{sessionID: id, cwd: cwd})
+	}
+	unknown := func(what string, res cliSessionProbeResult) {
+		t.Helper()
+		if res.Error != cliSessionErrInternal || res.Exists || res.Resumable {
+			t.Fatalf("%s = %+v, want an error (not checked), never gone or not resumable", what, res)
+		}
+	}
+	confirmed := func(what string, res cliSessionProbeResult) {
+		t.Helper()
+		if res.Error != "" || !res.Exists || !res.Resumable || res.Title != "Refactor the billing module" {
+			t.Fatalf("%s = %+v, want confirmed", what, res)
+		}
+	}
+
+	putUnreadableFile(t, filepath.Join(home, "sessions", grokSessionCwdDirName("/w/bare"), bare, "updates.jsonl"))
+	unknown("a session whose folder could not be read", probe(bare, "/w/bare"))
+	unknown("a session whose folder could not be read, found without its cwd", probe(bare, ""))
+	folder := writeGrokSession(t, home, "/w/sum", summarised, now, "Has a summary", grokUserChunk("summarised"))
+	if err := os.Remove(filepath.Join(folder, "updates.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	putUnreadableFile(t, filepath.Join(folder, "updates.jsonl"))
+	unknown("a session whose summary reads but whose updates.jsonl could not be read", probe(summarised, "/w/sum"))
+	confirmed("a session a readable folder holds", probe(gkS1, "/w/app"))
+	if res := probe(absent, ""); res.Error != "" || res.Exists || res.Resumable {
+		t.Fatalf("a session a store read in full does not hold = %+v, want gone", res)
+	}
+	res := discoverGrokSessions(context.Background(), home, newCliSessionDiscoverRequest(30, 500))
+	if len(res.Rows) != 3 || res.Rows[0].SessionID != gkS1 || res.Rows[1].SessionID != gkS2 || res.Rows[2].SessionID != gkS3 || len(res.SourcesSkipped) != 0 {
+		t.Fatalf("discovery = %+v, want S1, S2, S3 and neither folder it could not read", res)
+	}
+
+	t.Run("a cwd folder it could not list", func(t *testing.T) {
+		kept := writeGrokSession(t, home, "/w/hidden", hidden, now, "Hidden", grokUserChunk("kept where it cannot be listed"))
+		makeUnlistable(t, filepath.Dir(kept))
+		unknown("a session kept in a cwd folder that could not be listed", probe(hidden, ""))
+		unknown("a session whose own cwd folder could not be listed", probe(hidden, "/w/hidden"))
+		unknown("a session no readable folder holds, beside one that could not be listed", probe(absent, ""))
+		confirmed("a session a readable folder holds", probe(gkS1, ""))
+	})
+}
+
 // The cwd folder name is Grok's own percent-encoding (every byte but the
 // unreserved ones), on both platforms' paths.
 func TestGrokSessionCwdDirNameMatchesGrok(t *testing.T) {

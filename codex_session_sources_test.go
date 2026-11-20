@@ -236,6 +236,55 @@ func TestCodexProbeReportsTheThreadAndItsWriters(t *testing.T) {
 	}
 }
 
+// The probe never reads a thread as gone from a store it could not read: a
+// rollout that is there but could not be read, or no rollout found where a
+// folder of the store could not be listed, answers an error, which
+// terminal-service reads as a session it could not check. A thread a
+// readable rollout holds is still confirmed, and one a store read in full
+// does not hold is still gone.
+func TestCodexProbeOfARolloutItCouldNotReadNeverSaysGone(t *testing.T) {
+	home, now := codexFixture(t)
+	pinCliSessionProcesses(t, func() []cliSessionProcess { return nil })
+	const (
+		unread = "0199a1b2-0000-7000-8000-0000000000f1"
+		hidden = "0199a1b2-0000-7000-8000-0000000000f2"
+		absent = "0199a1b2-0000-7000-8000-0000000000ff"
+	)
+	probe := func(id string) cliSessionProbeResult {
+		return probeCodexSession(home, cliSessionProbeRequest{sessionID: id})
+	}
+	unknown := func(what string, res cliSessionProbeResult) {
+		t.Helper()
+		if res.Error != cliSessionErrInternal || res.Exists || res.Resumable {
+			t.Fatalf("%s = %+v, want an error (not checked), never gone or resumable", what, res)
+		}
+	}
+	confirmed := func(what string, res cliSessionProbeResult) {
+		t.Helper()
+		if res.Error != "" || !res.Exists || !res.Resumable || res.Title != "Fix the flaky login test" {
+			t.Fatalf("%s = %+v, want confirmed", what, res)
+		}
+	}
+
+	started := now.Add(-26 * time.Hour)
+	day := filepath.Join(home, "sessions", started.Format("2006"), started.Format("01"), started.Format("02"))
+	putUnreadableFile(t, filepath.Join(day, "rollout-"+started.Format("2006-01-02T15-04-05")+"-"+unread+".jsonl"))
+	unknown("a thread whose rollout could not be read", probe(unread))
+	confirmed("a thread a readable rollout holds, beside one that could not be read", probe(cxA))
+	if res := probe(absent); res.Error != "" || res.Exists || res.Resumable {
+		t.Fatalf("a thread a store read in full does not hold = %+v, want gone", res)
+	}
+
+	t.Run("a folder it could not list", func(t *testing.T) {
+		then := now.Add(-5 * 24 * time.Hour)
+		path := writeCodexSessionRollout(t, home, hidden, then, then, nil, codexUserEvent("kept where it cannot be listed"))
+		makeUnlistable(t, filepath.Dir(path))
+		unknown("a thread kept in a folder that could not be listed", probe(hidden))
+		unknown("a thread no readable folder holds, beside one that could not be listed", probe(absent))
+		confirmed("a thread a readable folder holds", probe(cxA))
+	})
+}
+
 // The watcher reads the rollout's own write time: within writerQuietMs it is
 // a writer mid-turn, unless AI Expedite's own app-server just wrote it.
 func TestCodexWriterEvidenceReadsTheRolloutsWrites(t *testing.T) {

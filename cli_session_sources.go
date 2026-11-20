@@ -301,6 +301,41 @@ func readJSONLHead(path string, maxBytes int64, maxLines int, visit func(line []
 	return nil
 }
 
+// cliSessionDirNames is the names in dir, read the way filepath.Glob reads a
+// folder (through a symlink; no such folder, or a file, holds none) but with
+// the error Glob drops: a folder that is there and could not be listed (its
+// permissions, an I/O error) may hold the session a probe searches for, so
+// not finding it there proves nothing. The names it did read are returned
+// either way.
+func cliSessionDirNames(dir string) ([]string, error) {
+	fi, err := os.Stat(dir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil, nil
+	case err != nil:
+		return nil, err
+	case !fi.IsDir():
+		return nil, nil
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	return f.Readdirnames(-1)
+}
+
+// cliSessionNoteReadErr keeps in *first the first error that is not "no such
+// file": a read that met one could not see everything it looked through.
+func cliSessionNoteReadErr(first *error, err error) {
+	if *first == nil && err != nil && !errors.Is(err, os.ErrNotExist) {
+		*first = err
+	}
+}
+
 // cliSessionPathFromURI is a file:// URI's local path ("" for another scheme).
 func cliSessionPathFromURI(uri string) string {
 	u, err := url.Parse(strings.TrimSpace(uri))

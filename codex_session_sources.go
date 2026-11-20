@@ -24,7 +24,9 @@
 //
 // Only a rollout's head (the header and the records up to the first prompt,
 // bounded) is read; one whose first record is no session header is
-// `unrecognised`. Read-only. Resuming a thread a terminal or IDE started is
+// `unrecognised`. The probe of a thread whose rollout could not be read, or
+// that a store it could not search in full does not show, is an error, never
+// "gone". Read-only. Resuming a thread a terminal or IDE started is
 // the app-server's `thread/resume` (agent-orchestrator-service): that it
 // accepts one it did not start is not verified on this device.
 package main
@@ -177,17 +179,46 @@ func codexRolloutThreadID(name string) (string, bool) {
 
 // findCodexRollout is the newest rollout of threadID under home, "" for none.
 func findCodexRollout(home, threadID string) string {
+	path, _ := searchCodexRollout(home, threadID)
+	return path
+}
+
+// searchCodexRollout is findCodexRollout with the search's error: the first
+// folder of the rollout tree (sessions/YYYY/MM/DD), or rollout of the thread,
+// that is there but could not be read (its permissions, an I/O error). The
+// thread may be kept there, so not finding it proves nothing; a rollout found
+// elsewhere still answers. No sessions folder is no error: no thread was
+// saved.
+func searchCodexRollout(home, threadID string) (best string, err error) {
 	if home == "" || !isCliSessionUUID(threadID) {
-		return ""
+		return "", nil
 	}
-	matches, _ := filepath.Glob(filepath.Join(home, "sessions", "*", "*", "*", "rollout-*-"+threadID+".jsonl"))
-	best, bestAt := "", int64(0)
-	for _, m := range matches {
-		if at := newestFileMs(m); at > bestAt {
-			best, bestAt = m, at
+	var bestAt int64
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		names, listErr := cliSessionDirNames(dir)
+		cliSessionNoteReadErr(&err, listErr)
+		for _, name := range names {
+			path := filepath.Join(dir, name)
+			if depth < 3 {
+				walk(path, depth+1) // a year, month or day folder
+				continue
+			}
+			if id, ok := codexRolloutThreadID(name); !ok || id != threadID {
+				continue
+			}
+			fi, statErr := os.Stat(path)
+			if statErr != nil {
+				cliSessionNoteReadErr(&err, statErr)
+				continue
+			}
+			if at := fi.ModTime().UnixMilli(); at > bestAt {
+				best, bestAt = path, at
+			}
 		}
 	}
-	return best
+	walk(filepath.Join(home, "sessions"), 0)
+	return best, err
 }
 
 // codexRolloutRecord is the envelope of one rollout record, and the few
@@ -448,7 +479,14 @@ func cliSessionRowRunning(proc *cliSessionRunning, writtenMs int64, now time.Tim
 	return nil
 }
 
-// probeCodexSession answers the probe of one thread.
+// probeCodexSession answers the probe of one thread: a rollout whose header
+// reads is there and resumable, one of a shape this build does not know is
+// there but not resumable, and none in a store searched in full is gone. A
+// rollout that could not be read, or no rollout found where a folder of the
+// store could not be searched (searchCodexRollout's error), says so instead:
+// whether the thread is kept, and resumes, is unknown, so the answer is an
+// error, which terminal-service reads as a session it could not check, never
+// as one that is gone.
 func probeCodexSession(home string, req cliSessionProbeRequest) cliSessionProbeResult {
 	res := cliSessionProbeResult{SessionID: req.sessionID, Writers: []cliSessionWriter{}, OpenInEditors: []string{}, TitleSource: cliSessionTitleNone}
 	if !isCliSessionUUID(req.sessionID) {
@@ -456,17 +494,23 @@ func probeCodexSession(home string, req cliSessionProbeRequest) cliSessionProbeR
 		return res
 	}
 	res.Writers = cliSessionProcessWriters(codexWriterEvidence, req.sessionID)
-	if path := findCodexRollout(home, req.sessionID); path != "" {
+	path, err := searchCodexRollout(home, req.sessionID)
+	if path != "" {
 		res.TranscriptWrittenAt = newestFileMs(path)
-		head, err := readCodexRolloutHead(path)
+		var head codexRolloutHead
+		head, err = readCodexRolloutHead(path)
 		switch {
 		case err == nil && head.threadID == req.sessionID && !head.subagent:
 			res.Exists, res.Resumable = true, true
 			res.Title, res.TitleSource, _ = codexRowTitle(head, readCodexThreadNames(home))
 		case err == nil || errors.Is(err, errCliSessionUnrecognised):
 			// A rollout is there, but not one this build can resume.
-			res.Exists = true
+			res.Exists, err = true, nil
 		}
+	}
+	if err != nil {
+		res.Error = cliSessionErrInternal
+		return res
 	}
 	res.Exists = res.Exists || len(res.Writers) > 0
 	return res
