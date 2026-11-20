@@ -232,6 +232,9 @@ func readCodexRolloutHead(path string) (codexRolloutHead, error) {
 				head.threadID, head.cwd, head.originator = rec.Payload.ID, rec.Payload.Cwd, rec.Payload.Originator
 				head.subagent = codexSourceIsSubagent(rec.Payload.Source) || rec.Payload.ThreadSource == "subagent"
 				sawHeader = true
+				// A sub-agent's thread is never listed or titled: nothing past
+				// its header is read.
+				return !head.subagent
 			case rec.Type == nil && len(rec.ID) > 0:
 				// Rollouts before the typed envelope open with a bare header.
 				_ = json.Unmarshal(rec.ID, &head.threadID)
@@ -374,14 +377,13 @@ func discoverCodexSessions(ctx context.Context, home string, req cliSessionDisco
 		}
 	}
 	sort.Slice(kept, func(i, j int) bool { return kept[i].modified > kept[j].modified })
-	if len(kept) > req.maxRows {
-		kept = kept[:req.maxRows]
-		res.Truncated = true
-	}
 	names := readCodexThreadNames(home)
 	running := cliSessionRunningByID(codexWriterEvidence)
 	timedOut := !complete
 	parsed, unrecognised, failed := 0, 0, 0
+	// maxRows counts the threads listed, not the rollouts read: a sub-agent's
+	// rollout, or one that is no thread, never takes a person's thread's
+	// place, and the answer is truncated only when a listable thread is left.
 	for _, f := range kept {
 		if ctx.Err() != nil {
 			timedOut = true
@@ -399,6 +401,10 @@ func discoverCodexSessions(ctx context.Context, home string, req cliSessionDisco
 		parsed++
 		if head.subagent || head.threadID != f.threadID {
 			continue
+		}
+		if len(res.Rows) == req.maxRows {
+			res.Truncated = true
+			break
 		}
 		row := cliSessionRow{
 			SessionID:           head.threadID,

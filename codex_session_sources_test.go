@@ -179,6 +179,34 @@ func TestCodexDiscoveryTruncatesAtMaxRowsAndAtTheDeadline(t *testing.T) {
 	}
 }
 
+// maxRows counts the threads listed, not the rollouts read: sub-agent
+// threads newer than a person's own never take its place, and the answer is
+// truncated only when a listable thread is left over.
+func TestCodexDiscoveryCapsListedThreadsNotRollouts(t *testing.T) {
+	pinCliSessionProcesses(t, func() []cliSessionProcess { return nil })
+	now := time.Now()
+	day := now.Add(-26 * time.Hour)
+	spawned := map[string]any{"source": map[string]any{"subagent": map[string]any{"thread_spawn": map[string]any{"parent_thread_id": cxA}}}}
+	home := t.TempDir()
+	writeCodexSessionRollout(t, home, cxB, day, now.Add(-time.Minute), spawned, codexUserEvent("sub-agent task"))
+	writeCodexSessionRollout(t, home, cxC, day, now.Add(-2*time.Minute), map[string]any{"thread_source": "subagent"}, codexUserEvent("another sub-agent task"))
+	writeCodexSessionRollout(t, home, cxA, day, now.Add(-time.Hour), nil, codexUserEvent("Fix the flaky login test"))
+
+	one := discoverCodexSessions(context.Background(), home, newCliSessionDiscoverRequest(30, 1))
+	if len(one.Rows) != 1 || one.Rows[0].SessionID != cxA || one.Truncated {
+		t.Fatalf("maxRows 1 = %+v, want the person's thread past the newer sub-agents, and complete", one)
+	}
+	writeCodexSessionRollout(t, home, cxD, day, now.Add(-2*time.Hour), nil, codexUserEvent("an older thread"))
+	more := discoverCodexSessions(context.Background(), home, newCliSessionDiscoverRequest(30, 1))
+	if len(more.Rows) != 1 || more.Rows[0].SessionID != cxA || !more.Truncated {
+		t.Fatalf("maxRows 1 with a second thread = %+v, want the newest thread, truncated", more)
+	}
+	both := discoverCodexSessions(context.Background(), home, newCliSessionDiscoverRequest(30, 2))
+	if len(both.Rows) != 2 || both.Rows[1].SessionID != cxD || both.Truncated {
+		t.Fatalf("maxRows 2 = %+v, want both threads, complete", both)
+	}
+}
+
 // The probe re-reads one thread: whether it exists and resumes, its title,
 // when its rollout was written, and who else holds it — a live `codex`
 // naming it, never this agent's own child.
