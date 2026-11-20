@@ -43,6 +43,8 @@ const (
 	openCodeLegacySessionMaxBytes = 256 * 1024
 	// openCodeLegacyMaxFiles bounds the legacy listing.
 	openCodeLegacyMaxFiles = 20000
+	// openCodeSQLiteMaxRows bounds the rows one session table is read for.
+	openCodeSQLiteMaxRows = 20000
 )
 
 // openCodeStoredSessionIDPattern is the id shape of a session OpenCode keeps
@@ -96,14 +98,19 @@ type openCodeSession struct {
 	child, archived      bool
 }
 
-// openCodeSQLiteSessions reads the session tables of opencode.db: those
-// updated at or after sinceMs, newest first, at most limit per table (merged
-// by id). recognised is false when the database has neither table in a
-// shape this build knows.
-func openCodeSQLiteSessions(ctx context.Context, dbPath string, sinceMs int64, limit int, onlyID string) (sessions map[string]openCodeSession, recognised bool, err error) {
+// openCodeSQLiteSessions reads the session tables of opencode.db, merged by
+// id: the session onlyID names, else those updated at or after sinceMs,
+// newest first. Each table is read until it has given `listable` sessions
+// discovery lists (neither a child nor archived; 0: no such cap), or
+// openCodeSQLiteMaxRows rows. A child or an archived row is read as well — a
+// newer one outranks a stale copy of the same session in the other table or
+// the JSON store — but never counts toward the cap in a listed session's
+// place. cut is true when a table was left unread past its cap. recognised is
+// false when the database has neither table in a shape this build knows.
+func openCodeSQLiteSessions(ctx context.Context, dbPath string, sinceMs int64, listable int, onlyID string) (sessions map[string]openCodeSession, recognised, cut bool, err error) {
 	db, err := openCliSessionSQLite(ctx, dbPath)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	defer db.Close()
 	sessions = map[string]openCodeSession{}
@@ -129,16 +136,18 @@ func openCodeSQLiteSessions(ctx context.Context, dbPath string, sinceMs int64, l
 			args = append(args, onlyID)
 		} else {
 			query += ` WHERE time_updated >= ? ORDER BY time_updated DESC, id LIMIT ?`
-			args = append(args, sinceMs, limit)
+			args = append(args, sinceMs, openCodeSQLiteMaxRows)
 		}
 		rows, qerr := db.QueryContext(ctx, query, args...)
 		if qerr != nil {
 			if ctx.Err() != nil {
-				return sessions, recognised, ctx.Err()
+				return sessions, recognised, cut, ctx.Err()
 			}
 			continue
 		}
+		read, listed := 0, 0
 		for rows.Next() {
+			read++
 			var s openCodeSession
 			if rows.Scan(&s.id, &s.title, &s.directory, &s.created, &s.updated, &s.child, &s.archived) != nil || !isOpenCodeSessionID(s.id) {
 				continue
@@ -146,14 +155,25 @@ func openCodeSQLiteSessions(ctx context.Context, dbPath string, sinceMs int64, l
 			if prev, seen := sessions[s.id]; !seen || s.updated > prev.updated {
 				sessions[s.id] = s
 			}
+			if s.child || s.archived {
+				continue
+			}
+			listed++
+			if listable > 0 && listed >= listable {
+				cut = true
+				break
+			}
 		}
 		rerr := rows.Err()
 		rows.Close()
 		if rerr != nil && ctx.Err() != nil {
-			return sessions, recognised, ctx.Err()
+			return sessions, recognised, cut, ctx.Err()
+		}
+		if onlyID == "" && read >= openCodeSQLiteMaxRows {
+			cut = true
 		}
 	}
-	return sessions, recognised, nil
+	return sessions, recognised, cut, nil
 }
 
 // openCodeNotEmpty is an SQL truth value for "column holds a value", or 0
@@ -239,7 +259,7 @@ func readOpenCodeSession(ctx context.Context, root, id string) (openCodeSession,
 	var best openCodeSession
 	found := false
 	if dbPath := filepath.Join(root, "opencode.db"); fileExists(dbPath) {
-		if rows, _, err := openCodeSQLiteSessions(ctx, dbPath, 0, 1, id); err == nil {
+		if rows, _, _, err := openCodeSQLiteSessions(ctx, dbPath, 0, 0, id); err == nil {
 			if s, ok := rows[id]; ok {
 				best, found = s, true
 			}
@@ -294,10 +314,11 @@ func discoverOpenCodeSessions(ctx context.Context, root string, req cliSessionDi
 		}
 	}
 	dbPath := filepath.Join(root, "opencode.db")
-	haveDB, recognised, timedOut := fileExists(dbPath), false, false
+	haveDB, recognised, timedOut, capped := fileExists(dbPath), false, false, false
 	if haveDB {
-		// One past the cap tells a store holding more sessions than maxRows.
-		rows, ok, err := openCodeSQLiteSessions(ctx, dbPath, since, req.maxRows+1, "")
+		// One listable session past the cap tells a store holding more of them
+		// than maxRows.
+		rows, ok, cut, err := openCodeSQLiteSessions(ctx, dbPath, since, req.maxRows+1, "")
 		switch {
 		case err != nil && ctx.Err() != nil:
 			timedOut = true
@@ -307,7 +328,7 @@ func discoverOpenCodeSessions(ctx context.Context, root string, req cliSessionDi
 			res.skip(src, cliSessionSkipUnreadable)
 			return res
 		default:
-			recognised = ok
+			recognised, capped = ok, cut
 			add(rows)
 		}
 	}
@@ -342,9 +363,12 @@ func discoverOpenCodeSessions(ctx context.Context, root string, req cliSessionDi
 		}
 		return sessions[i].id < sessions[j].id
 	})
+	// A table read that stopped at its cap may have left sessions unread.
+	if len(sessions) > req.maxRows || capped {
+		res.Truncated = true
+	}
 	if len(sessions) > req.maxRows {
 		sessions = sessions[:req.maxRows]
-		res.Truncated = true
 	}
 	for _, s := range sessions {
 		row := cliSessionRow{

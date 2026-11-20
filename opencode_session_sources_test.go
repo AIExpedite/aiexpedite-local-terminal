@@ -131,6 +131,41 @@ func TestOpenCodeDiscoveryMergesV1V2AndLegacy(t *testing.T) {
 	}
 }
 
+// maxRows counts the sessions listed: child and archived rows newer than a
+// person's own session are read — a newer archived row still outranks the
+// stale copy of itself in the 1.x table — but never take its place, and the
+// answer is truncated only when a listable session is left over.
+func TestOpenCodeDiscoveryCapsListedSessionsNotRows(t *testing.T) {
+	pinCliSessionProcesses(t, func() []cliSessionProcess { return nil })
+	now := time.Now()
+	store := func(extra ...openCodeTestRow) string {
+		root := t.TempDir()
+		v2 := append([]openCodeTestRow{
+			{id: ocChild, title: "A child", dir: "/w/new", parent: ocNew, updated: now.Add(-time.Minute)},
+			{id: ocArch, title: "Archived", dir: "/w/new", archived: true, updated: now.Add(-2 * time.Minute)},
+			{id: ocBoth, title: "Archived since the migration", dir: "/w/both", archived: true, updated: now.Add(-3 * time.Minute)},
+			{id: ocNew, title: "Ship the parser", dir: "/w/new", updated: now.Add(-time.Hour)},
+		}, extra...)
+		v1 := []openCodeTestRow{{id: ocBoth, title: "Before the migration", dir: "/w/both", updated: now.Add(-6 * time.Hour)}}
+		writeOpenCodeDB(t, root, map[string][]openCodeTestRow{"session": v1, "session_v2": v2})
+		return root
+	}
+
+	one := discoverOpenCodeSessions(context.Background(), store(), newCliSessionDiscoverRequest(30, 1))
+	if len(one.Rows) != 1 || one.Rows[0].SessionID != ocNew || one.Truncated {
+		t.Fatalf("maxRows 1 = %+v, want the person's session past the newer child and archived rows, and complete", one)
+	}
+	older := store(openCodeTestRow{id: ocV2, title: "An older session", dir: "/w/two", updated: now.Add(-2 * time.Hour)})
+	more := discoverOpenCodeSessions(context.Background(), older, newCliSessionDiscoverRequest(30, 1))
+	if len(more.Rows) != 1 || more.Rows[0].SessionID != ocNew || !more.Truncated {
+		t.Fatalf("maxRows 1 with a second session = %+v, want the newest, truncated", more)
+	}
+	both := discoverOpenCodeSessions(context.Background(), older, newCliSessionDiscoverRequest(30, 2))
+	if len(both.Rows) != 2 || both.Rows[1].SessionID != ocV2 || both.Truncated {
+		t.Fatalf("maxRows 2 = %+v, want both sessions, complete", both)
+	}
+}
+
 // Each layout alone: a 1.x database, and a store that only has the JSON tree.
 func TestOpenCodeDiscoveryReadsEitherLayoutAlone(t *testing.T) {
 	now := time.Now()
