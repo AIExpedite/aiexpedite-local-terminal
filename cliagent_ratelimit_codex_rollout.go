@@ -96,7 +96,7 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 	// an old-account scan clear or overwrite a live capture already scoped to the
 	// newly active account; the next refresh will reconcile under that account.
 	if codexAccountFingerprintAtBase(base) != currentFingerprint {
-		return codexMetricsFromCache(now, currentFingerprint), codexUsageLimitEvidence{}, time.Time{}, codexRolloutNudgeEvidence{}
+		return codexMetricsFromCache(now, currentFingerprint), codexUsageLimitEvidence{}, time.Time{}, codexRolloutNudgeEvidence{incomplete: true}
 	}
 	if ok || highWater != nil {
 		// The forced path passes ctx so its bounded lock wait is clamped to the
@@ -2028,7 +2028,7 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	candidates, discoveryComplete := codexDiscoverRolloutCandidates(discoveryCtx, base, cursor)
 	cancelDiscovery()
 	if len(candidates) == 0 {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{}
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{incomplete: !discoveryComplete}
 	}
 	eligibleCandidates := codexUnconsumedRolloutCandidates(candidates, cursor, now)
 	if len(eligibleCandidates) == 0 {
@@ -2052,7 +2052,7 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 			}
 			return nil, codexUsageLimitEvidence{}, time.Time{}, &progress, false, "", codexRolloutNudgeEvidence{}
 		}
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{}
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{incomplete: true}
 	}
 	// Rank candidates by file mtime descending, NOT by filename (= session
 	// start time). When sessions overlap — e.g. an older still-active session
@@ -2475,6 +2475,12 @@ type codexRolloutNudgeEvidence struct {
 	// useless: the fenced file may be an unrelated overlapping session while the
 	// debt's own rollout has not flushed yet.
 	fencedSinceFloor bool
+	// incomplete is set when the pass did not see the whole tree it was asked
+	// to: discovery or selection ran out of its reserved sub-budget, or the
+	// account switched under it. The parent context can still be live, so a
+	// caller that stores progress of its own (codexDirectScan) reads this
+	// rather than ctx.Err() to decide whether the pass may be treated as done.
+	incomplete bool
 }
 
 // covers reports whether this pass mined telemetry covering the rollout
@@ -2607,7 +2613,7 @@ func codexRolloutLineStartsTurn(line string) bool {
 // codexRolloutNudgeEvidenceFor pairs the uncovered and covered rollouts,
 // withholding only `newest` on an unfinished pass (codexEligibleMtimeFor).
 func codexRolloutNudgeEvidenceFor(newest time.Time, newestEntry string, covered map[string]time.Time, complete bool) codexRolloutNudgeEvidence {
-	evidence := codexRolloutNudgeEvidence{newest: codexEligibleMtimeFor(newest, complete), covered: covered}
+	evidence := codexRolloutNudgeEvidence{newest: codexEligibleMtimeFor(newest, complete), covered: covered, incomplete: !complete}
 	if !evidence.newest.IsZero() {
 		evidence.newestEntry = newestEntry
 	}

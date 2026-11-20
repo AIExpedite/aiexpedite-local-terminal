@@ -28,8 +28,9 @@ type codexDirectHarness struct {
 	held  bool
 	// heldReads counts held-evidence cache reads.
 	heldReads int
-	// reconcile, when set, runs in place of the counted no-op.
-	reconcile func(ctx context.Context, base, fp string, now time.Time)
+	// reconcile, when set, runs in place of the counted no-op and reports
+	// whether the pass was complete.
+	reconcile func(ctx context.Context, base, fp string, now time.Time) bool
 	// realHeld is the production held-evidence read (a cache view).
 	realHeld func(fp string) bool
 }
@@ -56,14 +57,15 @@ func codexDirectFixtureOver(t *testing.T, f codexFreshnessFixture, start time.Ti
 	codexUsageFreshnessNow = h.clock
 	codexForcedReconcileMinInterval = 20 * time.Second
 	cliUsageClaudeFallbackPeriod = time.Minute
-	codexDirectReconcile = func(ctx context.Context, base, fp string, now time.Time) {
+	codexDirectReconcile = func(ctx context.Context, base, fp string, now time.Time) bool {
 		h.mu.Lock()
 		h.bases = append(h.bases, base)
 		run := h.reconcile
 		h.mu.Unlock()
 		if run != nil {
-			run(ctx, base, fp, now)
+			return run(ctx, base, fp, now)
 		}
+		return true
 	}
 	codexDirectHeldEvidence = func(string) bool {
 		h.mu.Lock()
@@ -90,8 +92,8 @@ func (h *codexDirectHarness) endToEnd() {
 	codexForcedReconcileMinInterval = 20 * time.Millisecond
 	codexDirectHeldEvidence = h.realHeld
 	h.mu.Lock()
-	h.reconcile = func(ctx context.Context, base, fp string, now time.Time) {
-		codexReconcileAndNudge(ctx, base, fp, now, false)
+	h.reconcile = func(ctx context.Context, base, fp string, now time.Time) bool {
+		return !codexReconcileAndNudge(ctx, base, fp, now, false).rollouts.incomplete
 	}
 	h.mu.Unlock()
 }
@@ -297,7 +299,7 @@ func TestCodexDirectScan_IntervalSpacesChangesAndKeepsTheSkippedOne(t *testing.T
 func TestCodexDirectScan_BudgetExpiryLeavesTheSignatureUnstored(t *testing.T) {
 	h := codexDirectFixture(t, codexDirectTestStart)
 	codexDirectReconcileBudget = 10 * time.Millisecond
-	h.reconcile = func(ctx context.Context, _, _ string, _ time.Time) { <-ctx.Done() }
+	h.reconcile = func(ctx context.Context, _, _ string, _ time.Time) bool { <-ctx.Done(); return true }
 	h.writeRollout(t, h.dayDir(h.clock()), "a", "{}\n", h.clock())
 
 	codexDirectRunScanIfChanged()
@@ -311,6 +313,78 @@ func TestCodexDirectScan_BudgetExpiryLeavesTheSignatureUnstored(t *testing.T) {
 	h.wantReconciles(t, 3, "the retry that finishes")
 	h.poll()
 	h.wantReconciles(t, 3, "stores the signature")
+}
+
+// A reconcile that returns inside its budget but reports discovery or
+// selection incomplete stores no signature either: the parent context is still
+// live, yet the pass withheld its evidence, and a finished run that writes
+// nothing more would otherwise stay unfound until the next gather.
+func TestCodexDirectScan_IncompleteReconcileLeavesTheSignatureUnstored(t *testing.T) {
+	h := codexDirectFixture(t, codexDirectTestStart)
+	h.mu.Lock()
+	h.reconcile = func(context.Context, string, string, time.Time) bool { return false }
+	h.mu.Unlock()
+	h.writeRollout(t, h.dayDir(h.clock()), "a", "{}\n", h.clock())
+
+	codexDirectRunScanIfChanged()
+	h.poll()
+	h.wantReconciles(t, 2, "a reconcile that reported itself incomplete is retried")
+
+	h.mu.Lock()
+	h.reconcile = nil
+	h.mu.Unlock()
+	h.poll()
+	h.wantReconciles(t, 3, "the retry that completes")
+	h.poll()
+	h.wantReconciles(t, 3, "stores the signature")
+}
+
+// The real reconcile reports a pass whose discovery sub-budget ran out as
+// incomplete even though the parent context it was handed is still live — the
+// case ctx.Err() alone cannot see.
+func TestCodexReconcileFromRollout_DiscoveryCutShortReportsIncomplete(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	writeCodexRunRollout(t, f.home, "slow-discovery", now.Add(-5*time.Minute), now.Add(-time.Minute), now.Add(-time.Minute), true,
+		[]map[string]any{codexRateLimitFrame(41, 42, now.Add(-time.Minute))})
+
+	// Parent budget 2 s: discovery gets the first second (codexRolloutDiscoveryContext
+	// reserves codexRolloutCandidateReadReserve), so stalling the first listing
+	// past it cuts discovery short with the parent still live.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*codexRolloutCandidateReadReserve)
+	defer cancel()
+	discoveryDeadline, _ := ctx.Deadline()
+	discoveryDeadline = discoveryDeadline.Add(-codexRolloutCandidateReadReserve)
+	originalHook := codexRolloutReadDirChunkHook
+	defer func() { codexRolloutReadDirChunkHook = originalHook }()
+	var once sync.Once
+	codexRolloutReadDirChunkHook = func(string, int) {
+		once.Do(func() { time.Sleep(time.Until(discoveryDeadline) + 50*time.Millisecond) })
+	}
+
+	_, _, _, evidence := codexReconcileFromRollout(ctx, f.home, f.fp, now)
+	if ctx.Err() != nil {
+		t.Fatalf("the parent context must still be live for this case: %v", ctx.Err())
+	}
+	if !evidence.incomplete {
+		t.Fatal("a pass whose discovery ran out of budget must report itself incomplete")
+	}
+
+	// Unhurried passes resume the interrupted listing (its preserved stream is
+	// drained over the following refreshes) and then report complete.
+	codexRolloutReadDirChunkHook = originalHook
+	for pass := 1; ; pass++ {
+		full, cancelFull := context.WithTimeout(context.Background(), codexRolloutScanBudget)
+		_, _, _, evidence := codexReconcileFromRollout(full, f.home, f.fp, now)
+		cancelFull()
+		if !evidence.incomplete {
+			t.Logf("complete after %d unhurried pass(es)", pass)
+			break
+		}
+		if pass == 4 {
+			t.Fatal("unhurried passes over the same tree never reported themselves complete")
+		}
+	}
 }
 
 // Held PendingRolloutMtimeMs re-runs the reconcile once per period with no file
@@ -495,9 +569,9 @@ func TestCodexDirectScan_AccountSwitchMidScanMergesNothingForTheNewLogin(t *test
 	writeCodexRunRollout(t, h.f.home, "switch", now.Add(-5*time.Minute), rollout, rollout, true,
 		[]map[string]any{codexRateLimitFrame(81, 82, now)})
 	h.mu.Lock()
-	h.reconcile = func(ctx context.Context, base, fp string, at time.Time) {
+	h.reconcile = func(ctx context.Context, base, fp string, at time.Time) bool {
 		helperCodexAuthAt(t, base, "other@example.com", now.Add(-time.Second))
-		codexReconcileAndNudge(ctx, base, fp, at, false)
+		return !codexReconcileAndNudge(ctx, base, fp, at, false).rollouts.incomplete
 	}
 	h.mu.Unlock()
 	codexDirectScanAtStartup()

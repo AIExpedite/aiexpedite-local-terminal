@@ -34,8 +34,9 @@
 //     codexForcedReconcileMinInterval, never while a run of this process is
 //     open (that run settles itself), and within codexDirectReconcileBudget;
 //   - the signature is stored only after a reconcile that finished inside its
-//     budget, so a cut-short, spaced-out or guarded pass is retried by the next
-//     eligible poll. State is in memory only: the owed rule lives in the
+//     budget and reported its discovery and selection complete, so a
+//     cut-short, spaced-out or guarded pass is retried by the next eligible
+//     poll. State is in memory only: the owed rule lives in the
 //     reconcile's cursor and the nudge's held evidence, both on disk.
 //
 // It runs offline: the reconcile is local file I/O, and the live-read fallback
@@ -69,9 +70,11 @@ var (
 		info := GetMachineInfo()
 		return info != nil && info.DetectedCliAgents[codexUsageProvider].Detected
 	}
-	// codexDirectReconcile is the reconcile a scan runs (a seam for tests).
-	codexDirectReconcile = func(ctx context.Context, base, fp string, now time.Time) {
-		codexReconcileAndNudge(ctx, base, fp, now, false)
+	// codexDirectReconcile is the reconcile a scan runs (a seam for tests). It
+	// reports whether the pass saw the whole tree: discovery and selection run
+	// under their own sub-budgets, which can expire while ctx is still live.
+	codexDirectReconcile = func(ctx context.Context, base, fp string, now time.Time) bool {
+		return !codexReconcileAndNudge(ctx, base, fp, now, false).rollouts.incomplete
 	}
 	// codexDirectHeldEvidence reports whether the nudge still holds rollout
 	// evidence for fp — one cache read (a seam for tests).
@@ -180,8 +183,13 @@ func codexDirectScan(atStartup bool) {
 		fp = codexAccountFingerprintAtBase(base)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), codexDirectReconcileBudget)
-	codexDirectReconcile(ctx, base, fp, now)
-	finished := ctx.Err() == nil
+	// Finished means the reconcile itself says it saw everything AND its budget
+	// held: a live parent context alone is no proof, because discovery's
+	// reserved sub-budget can run out first and the pass then withholds its
+	// evidence. Storing the signature then would leave a completed run that
+	// writes nothing more unfound until the next gather.
+	complete := codexDirectReconcile(ctx, base, fp, now)
+	finished := complete && ctx.Err() == nil
 	cancel()
 	if !finished {
 		return

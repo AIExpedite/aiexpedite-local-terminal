@@ -1515,11 +1515,12 @@ func TestCodexPostUpdate_UnarmedRunWithoutTelemetryFallsToTheLadder(t *testing.T
 
 	var floor int64
 	prevWorker := codexDirectReconcile
-	codexDirectReconcile = func(ctx context.Context, base, fp string, at time.Time) {
-		prevWorker(ctx, base, fp, at)
+	codexDirectReconcile = func(ctx context.Context, base, fp string, at time.Time) bool {
+		complete := prevWorker(ctx, base, fp, at)
 		if snap, ok := loadCodexRateLimitSnapshot(h.f.cache); ok && snap.RefreshOwedAtMs != 0 {
 			floor = snap.RunFloorMs
 		}
+		return complete
 	}
 	codexDirectRunScanIfChanged()
 	drainCodexRunDebtLadder(t)
