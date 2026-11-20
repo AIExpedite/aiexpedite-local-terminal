@@ -26,6 +26,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -289,16 +290,32 @@ func readJSONFile(path string, into any) bool {
 // oversized file reads as absent. The file is closed before it returns, so a
 // caller never holds a handle that blocks another process's rename (Windows).
 func readJSONFileWithin(path string, maxBytes int64, into any) bool {
+	return readJSONFileWithinErr(path, maxBytes, into) == nil
+}
+
+// errJSONFileNotWithin is readJSONFileWithinErr's answer for a file that is
+// empty or larger than its bound.
+var errJSONFileNotWithin = errors.New("JSON file empty or larger than its bound")
+
+// readJSONFileWithinErr is readJSONFileWithin saying why it read nothing: the
+// open or read error (one matching os.ErrNotExist for no such file),
+// errJSONFileNotWithin, or the JSON's own error. A reader that must tell a
+// file it could not read from one that is not there uses it: a session probe
+// never reads the former as a session gone.
+func readJSONFileWithinErr(path string, maxBytes int64, into any) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return err
 	}
 	defer f.Close()
 	b, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
-	if err != nil || len(b) == 0 || int64(len(b)) > maxBytes {
-		return false
+	switch {
+	case err != nil:
+		return err
+	case len(b) == 0 || int64(len(b)) > maxBytes:
+		return errJSONFileNotWithin
 	}
-	return json.Unmarshal(b, into) == nil
+	return json.Unmarshal(b, into)
 }
 
 // writeJSONFileAtomic is readJSONFile's writer: it replaces path with value's

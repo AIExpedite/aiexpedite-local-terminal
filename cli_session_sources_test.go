@@ -23,6 +23,24 @@ func putUnreadableFile(t *testing.T, path string) {
 	}
 }
 
+// putUnstatableFile puts a symbolic link to itself where path's file would
+// be: every stat of it fails for another reason than that it is not there
+// (ELOOP), the way a stat its folder's permissions or the disk refuse does,
+// and it does so for root too. The test is skipped where such a link cannot
+// be made or stats as no such file.
+func putUnstatableFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Base(path), path); err != nil {
+		t.Skipf("no symbolic link can be made here (%v): an unstatable file cannot be staged", err)
+	}
+	if _, err := os.Stat(path); err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Skipf("the stat of a link to itself at %s gave %v: an unstatable file cannot be staged here", path, err)
+	}
+}
+
 // makeUnlistable takes dir's permissions away until the test ends. The test
 // is skipped where this user lists it all the same (root, Windows).
 func makeUnlistable(t *testing.T, dir string) {

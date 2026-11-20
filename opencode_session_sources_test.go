@@ -319,6 +319,80 @@ func TestOpenCodeProbeOfAStoreItCouldNotReadNeverSaysGone(t *testing.T) {
 	}
 }
 
+// A legacy store the probe could not read in full never says a session is
+// gone either: a record of the session that would not read (its permissions,
+// an I/O error) or is not one this build knows (torn, naming another
+// session), a store folder that would not list, and a database that would
+// not stat answer an error, which terminal-service reads as a session it
+// could not check. A record of the session read in another project still
+// confirms it, a session no record names is still gone, and a listing passes
+// over a record it could not read, as it always has.
+func TestOpenCodeProbeOfALegacyStoreItCouldNotReadNeverSaysGone(t *testing.T) {
+	pinCliSessionProcesses(t, func() []cliSessionProcess { return nil })
+	root, now := t.TempDir(), time.Now()
+	writeOpenCodeLegacySession(t, root, ocLeg, "From the JSON store", "/w/legacy", now.Add(-time.Hour))
+	writeOpenCodeLegacySession(t, root, ocBoth, "Kept in another project", "/w/both", now.Add(-2*time.Hour))
+	const absent = "ses_goneaaaaaaaaaaaaaaaaaaaaaa"
+	probe := func(id string) cliSessionProbeResult {
+		return probeOpenCodeSession(context.Background(), root, cliSessionProbeRequest{sessionID: id})
+	}
+	unknown := func(t *testing.T, what string, res cliSessionProbeResult) {
+		t.Helper()
+		if res.Error != cliSessionErrInternal || res.Exists || res.Resumable {
+			t.Fatalf("%s = %+v, want an error (not checked), never gone or resumable", what, res)
+		}
+	}
+	gone := func(t *testing.T, what string, res cliSessionProbeResult) {
+		t.Helper()
+		if res.Error != "" || res.Exists || res.Resumable {
+			t.Fatalf("%s = %+v, want gone", what, res)
+		}
+	}
+	gone(t, "a session a legacy store read in full does not hold", probe(absent))
+
+	sessions := filepath.Join(root, "storage", "session")
+	put := func(project, id, body string) {
+		t.Helper()
+		dir := filepath.Join(sessions, project)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, id+".json"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("prj_legacy", ocV1, `{"id":"`+ocV1+`","title":"torn`)
+	unknown(t, "a session whose record is torn", probe(ocV1))
+	put("prj_legacy", ocV2, `{"id":"`+ocLeg+`","title":"another session's record"}`)
+	unknown(t, "a session whose record names another", probe(ocV2))
+	// prj_a is read first: its torn copy does not hide the record prj_legacy holds.
+	put("prj_a", ocBoth, `{"id":"`+ocBoth+`","ti`)
+	if res := probe(ocBoth); res.Error != "" || !res.Exists || !res.Resumable || res.Title != "Kept in another project" {
+		t.Fatalf("a session a readable record holds, beside a torn copy = %+v, want confirmed", res)
+	}
+	gone(t, "a session no record names, beside records that could not be read", probe(absent))
+	res := discoverOpenCodeSessions(context.Background(), root, newCliSessionDiscoverRequest(30, 500))
+	if len(res.Rows) != 2 || res.Rows[0].SessionID != ocLeg || res.Rows[1].SessionID != ocBoth || len(res.SourcesSkipped) != 0 {
+		t.Fatalf("discovery = %+v, want the two readable records alone", res)
+	}
+
+	t.Run("a record it could not read", func(t *testing.T) {
+		putUnreadableFile(t, filepath.Join(sessions, "prj_legacy", ocNew+".json"))
+		unknown(t, "a session whose record could not be read", probe(ocNew))
+	})
+	t.Run("a store folder it could not list", func(t *testing.T) {
+		makeUnlistable(t, sessions)
+		unknown(t, "a session kept in a store folder that could not be listed", probe(ocLeg))
+	})
+	t.Run("a database it could not stat", func(t *testing.T) {
+		putUnstatableFile(t, filepath.Join(root, "opencode.db"))
+		unknown(t, "a session no record names, beside a database that could not be stat-ed", probe(absent))
+		if res := probe(ocLeg); res.Error != "" || !res.Exists || !res.Resumable || res.Title != "From the JSON store" {
+			t.Fatalf("a legacy session beside a database that could not be stat-ed = %+v, want confirmed", res)
+		}
+	})
+}
+
 // The watcher's busy decision reads OpenCode's store through the owner's live
 // write-ahead log (cliSessionSQLiteDSN): while OpenCode runs, a turn's write
 // its log alone holds yet is a writer mid-turn. An immutable open would read

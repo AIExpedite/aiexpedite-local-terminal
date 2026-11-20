@@ -22,9 +22,11 @@
 // so a title falls back to the newest of those prompts, and otherwise to
 // none: the conversation is still listed (by folder and recency) and never
 // given a title of the device's own making. Sub-conversations and internal
-// ones are not listed. Read-only: the one SQLite store opened, the summaries
-// database, is read through cliSessionSQLiteDSN (nothing created or locked);
-// a conversation's own database is only ever stat-ed.
+// ones are not listed. The probe of a conversation whose database could not
+// be stat-ed is an error, never "gone". Read-only: the one SQLite store
+// opened, the summaries database, is read through cliSessionSQLiteDSN
+// (nothing created or locked); a conversation's own database is only ever
+// stat-ed.
 package main
 
 import (
@@ -330,7 +332,13 @@ func discoverAntigravitySessions(ctx context.Context, base string, req cliSessio
 	return res
 }
 
-// probeAntigravitySession answers the probe of one conversation.
+// probeAntigravitySession answers the probe of one conversation: its
+// database there is a conversation kept, and resumable, and none is gone. A
+// database whose stat failed for another reason than that it is not there
+// (its folder's permissions, an I/O error) says so instead: whether the
+// conversation is kept is unknown, so the answer is an error, which
+// terminal-service reads as a session it could not check, never as one that
+// is gone.
 func probeAntigravitySession(ctx context.Context, base string, req cliSessionProbeRequest) cliSessionProbeResult {
 	res := cliSessionProbeResult{SessionID: req.sessionID, Writers: []cliSessionWriter{}, OpenInEditors: []string{}, TitleSource: cliSessionTitleNone}
 	if !isCliSessionUUID(req.sessionID) {
@@ -338,11 +346,17 @@ func probeAntigravitySession(ctx context.Context, base string, req cliSessionPro
 		return res
 	}
 	res.Writers = cliSessionProcessWriters(antigravityWriterEvidence, req.sessionID)
-	db := antigravityConversationDB(base, req.sessionID)
-	if fi, err := os.Stat(db); db != "" && err == nil && fi.Mode().IsRegular() {
-		res.Exists, res.Resumable = true, true
-		res.TranscriptWrittenAt = antigravityConversationWrittenAt(db)
-		res.Title, res.TitleSource, _ = antigravityRowTitle(readAntigravityMetadata(ctx, base).of(req.sessionID))
+	if db := antigravityConversationDB(base, req.sessionID); db != "" {
+		fi, err := os.Stat(db)
+		switch {
+		case err == nil && fi.Mode().IsRegular():
+			res.Exists, res.Resumable = true, true
+			res.TranscriptWrittenAt = antigravityConversationWrittenAt(db)
+			res.Title, res.TitleSource, _ = antigravityRowTitle(readAntigravityMetadata(ctx, base).of(req.sessionID))
+		case err != nil && !errors.Is(err, os.ErrNotExist):
+			res.Error = cliSessionErrInternal
+			return res
+		}
 	}
 	res.Exists = res.Exists || len(res.Writers) > 0
 	return res

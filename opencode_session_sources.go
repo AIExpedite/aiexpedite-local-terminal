@@ -24,9 +24,10 @@
 // sessions. A child session (parent_id) or an archived one is not listed.
 // OpenCode's own placeholder title ("New session - <date>") is no title.
 // The probe of a session a store it could not read in full does not show (a
-// database that would not open or parse, or of neither family) is an error,
-// never "gone". Read-only: opencode.db through cliSessionSQLiteDSN (nothing
-// created or locked).
+// database that would not stat, open or parse, or of neither family, or a
+// legacy folder or record that would not read) is an error, never "gone".
+// Read-only: opencode.db through cliSessionSQLiteDSN (nothing created or
+// locked).
 package main
 
 import (
@@ -218,13 +219,26 @@ func openCodeNotEmpty(cols map[string]bool, name string) string {
 
 // openCodeLegacySessions reads storage/session/<project>/<ses_…>.json (and
 // the older storage/session/info/ spelling). complete is false when ctx ended
-// or the listing cap was reached first.
-func openCodeLegacySessions(ctx context.Context, root string, onlyID string) (sessions map[string]openCodeSession, found bool, complete bool) {
+// or the listing cap was reached first. In the read of one session (onlyID),
+// err is the first folder or record that is there but could not be read: the
+// store's folder that would not list, or a record of that session that would
+// not open or read (its permissions, an I/O error) or is not one this build
+// knows (empty, over its bound, not JSON, naming another session). That may
+// be where the session is kept, so its absence from what was read proves
+// nothing; a record of it read in another project still counts. A listing
+// passes over such a folder or record, as it always has.
+func openCodeLegacySessions(ctx context.Context, root string, onlyID string) (sessions map[string]openCodeSession, found, complete bool, err error) {
 	sessions = map[string]openCodeSession{}
+	noteUnread := func(e error) {
+		if onlyID != "" {
+			cliSessionNoteReadErr(&err, e)
+		}
+	}
 	base := filepath.Join(root, "storage", "session")
-	projects, err := os.ReadDir(base)
-	if err != nil {
-		return sessions, false, true
+	projects, listErr := os.ReadDir(base)
+	if listErr != nil {
+		noteUnread(listErr)
+		return sessions, false, true, err
 	}
 	found, complete = true, true
 	files := 0
@@ -244,7 +258,7 @@ func openCodeLegacySessions(ctx context.Context, root string, onlyID string) (se
 		}
 		for _, name := range names {
 			if ctx.Err() != nil || files >= openCodeLegacyMaxFiles {
-				return sessions, found, false
+				return sessions, found, false, err
 			}
 			id, ok := strings.CutSuffix(name, ".json")
 			if !ok || !isOpenCodeSessionID(id) {
@@ -263,7 +277,12 @@ func openCodeLegacySessions(ctx context.Context, root string, onlyID string) (se
 				} `json:"time"`
 			}
 			path := filepath.Join(dir, name)
-			if !readJSONFileWithin(path, openCodeLegacySessionMaxBytes, &rec) || rec.ID != id {
+			readErr := readJSONFileWithinErr(path, openCodeLegacySessionMaxBytes, &rec)
+			if readErr == nil && rec.ID != id {
+				readErr = errCliSessionUnrecognised // a record of another session, or of none
+			}
+			if readErr != nil {
+				noteUnread(readErr) // no such file is no error: the session is kept elsewhere, or nowhere
 				continue
 			}
 			s := openCodeSession{
@@ -279,21 +298,24 @@ func openCodeLegacySessions(ctx context.Context, root string, onlyID string) (se
 			}
 		}
 	}
-	return sessions, found, complete
+	return sessions, found, complete, err
 }
 
 // readOpenCodeSession is one session from whichever layout holds it. err says
-// a layout that could hold it is on disk but was not read in full for it: a
-// database that would not open or read (its permissions, an I/O error, a file
-// the driver cannot parse) or is of neither family, or a read that ctx or the
-// legacy listing's cap cut short. A session such a layout does not show may
-// still be kept there, so not found then proves nothing: the probe answers
-// that it could not check, never that the session is gone.
+// a layout that could hold it is on disk, or may be, but was not read in full
+// for it: a database that would not stat, open or read (its permissions, an
+// I/O error, a file the driver cannot parse) or is of neither family, a
+// legacy folder or record that would not read or is not one this build knows
+// (openCodeLegacySessions), or a read that ctx or the legacy listing's cap
+// cut short. A session such a layout does not show may still be kept there,
+// so not found then proves nothing: the probe answers that it could not
+// check, never that the session is gone.
 func readOpenCodeSession(ctx context.Context, root, id string) (best openCodeSession, found bool, err error) {
 	if root == "" || !isOpenCodeSessionID(id) {
 		return openCodeSession{}, false, nil
 	}
-	if dbPath := filepath.Join(root, "opencode.db"); fileExists(dbPath) {
+	dbPath := filepath.Join(root, "opencode.db")
+	if fi, statErr := os.Stat(dbPath); statErr == nil && fi.Mode().IsRegular() {
 		rows, recognised, _, dbErr := openCodeSQLiteSessions(ctx, dbPath, 0, 0, id)
 		if s, ok := rows[id]; ok {
 			best, found = s, true
@@ -304,10 +326,15 @@ func readOpenCodeSession(ctx context.Context, root, id string) (best openCodeSes
 		case !recognised:
 			err = errCliSessionUnrecognised
 		}
+	} else {
+		cliSessionNoteReadErr(&err, statErr) // no such file: OpenCode made no database
 	}
-	legacy, _, complete := openCodeLegacySessions(ctx, root, id)
+	legacy, _, complete, legacyErr := openCodeLegacySessions(ctx, root, id)
 	if s, ok := legacy[id]; ok && (!found || s.updated > best.updated) {
 		best, found = s, true
+	}
+	if err == nil {
+		err = legacyErr
 	}
 	if !complete && err == nil {
 		err = ctx.Err()
@@ -382,7 +409,7 @@ func discoverOpenCodeSessions(ctx context.Context, root string, req cliSessionDi
 			add(rows)
 		}
 	}
-	legacy, haveLegacy, complete := openCodeLegacySessions(ctx, root, "")
+	legacy, haveLegacy, complete, _ := openCodeLegacySessions(ctx, root, "")
 	add(legacy)
 	if !complete {
 		timedOut = true

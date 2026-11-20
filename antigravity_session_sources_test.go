@@ -194,6 +194,51 @@ func TestAntigravityProbeAndWriterEvidence(t *testing.T) {
 	}
 }
 
+// A conversation database the probe could not stat never says the
+// conversation is gone: a stat that failed for another reason than that the
+// database is not there (a link that never resolves, its folder's
+// permissions) answers an error, which terminal-service reads as a session it
+// could not check. A conversation whose database stats is still confirmed
+// beside it, and one a store searched in full does not hold is still gone.
+func TestAntigravityProbeOfADatabaseItCouldNotStatNeverSaysGone(t *testing.T) {
+	base, _ := antigravityFixture(t)
+	pinCliSessionProcesses(t, func() []cliSessionProcess { return nil })
+	const (
+		unstat = "aaaaaaaa-0000-4000-8000-0000000000f1"
+		absent = "aaaaaaaa-0000-4000-8000-0000000000ff"
+	)
+	probe := func(id string) cliSessionProbeResult {
+		return probeAntigravitySession(context.Background(), base, cliSessionProbeRequest{sessionID: id})
+	}
+	unknown := func(t *testing.T, what string, res cliSessionProbeResult) {
+		t.Helper()
+		if res.Error != cliSessionErrInternal || res.Exists || res.Resumable {
+			t.Fatalf("%s = %+v, want an error (not checked), never gone or resumable", what, res)
+		}
+	}
+	gone := func(t *testing.T, what string, res cliSessionProbeResult) {
+		t.Helper()
+		if res.Error != "" || res.Exists || res.Resumable {
+			t.Fatalf("%s = %+v, want gone", what, res)
+		}
+	}
+	gone(t, "a conversation a store searched in full does not hold", probe(absent))
+
+	t.Run("a database whose stat fails", func(t *testing.T) {
+		putUnstatableFile(t, antigravityConversationDB(base, unstat))
+		unknown(t, "a conversation whose database could not be stat-ed", probe(unstat))
+		if res := probe(agA); res.Error != "" || !res.Exists || !res.Resumable || res.Title != "Fix the crash on startup" {
+			t.Fatalf("a conversation whose database stats, beside one that does not = %+v, want confirmed", res)
+		}
+		gone(t, "a conversation with no database, beside one that could not be stat-ed", probe(absent))
+	})
+	t.Run("a folder it could not search", func(t *testing.T) {
+		makeUnlistable(t, filepath.Join(base, "conversations"))
+		unknown(t, "a conversation kept in a folder that could not be searched", probe(agA))
+		unknown(t, "a conversation not seen in a folder that could not be searched", probe(absent))
+	})
+}
+
 // A listing the budget cuts short still answers the conversations it listed
 // (truncated), titled from the metadata read under the reader's own budget;
 // a cut listing is never taken for a store of no known conversation.
