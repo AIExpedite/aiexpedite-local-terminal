@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -656,5 +657,49 @@ func TestCodexReconcileFromRollout_CappedBacklogIsNotSettledUntilWalked(t *testi
 		if pass == 4 {
 			t.Fatalf("the capped backlog never drained: %+v", evidence)
 		}
+	}
+}
+
+// A rollout whose open fails transiently stays in the retry set, but its
+// recovery moves neither mtime nor size, so the pass must not read as settled
+// until a later pass has actually read it.
+func TestCodexReconcileFromRollout_TransientReadFailureIsNotSettled(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	writeCodexRunRollout(t, f.home, "steady", now.Add(-6*time.Minute), now.Add(-2*time.Minute), now.Add(-2*time.Minute), true,
+		[]map[string]any{codexRateLimitFrame(11, 12, now.Add(-2*time.Minute))})
+	writeCodexRunRollout(t, f.home, "locked", now.Add(-5*time.Minute), now.Add(-time.Minute), now.Add(-time.Minute), true,
+		[]map[string]any{codexRateLimitFrame(41, 42, now.Add(-time.Minute))})
+
+	originalOpen := codexOpenRolloutFile
+	t.Cleanup(func() { codexOpenRolloutFile = originalOpen })
+	failedOpens := 0
+	codexOpenRolloutFile = func(path string) (*os.File, error) {
+		if strings.Contains(filepath.Base(path), "locked") {
+			failedOpens++
+			return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}
+		}
+		return os.Open(path)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), codexRolloutScanBudget)
+	_, _, _, evidence := codexReconcileFromRollout(ctx, f.home, f.fp, now)
+	cancel()
+	if failedOpens == 0 {
+		t.Fatal("the failing rollout was never attempted")
+	}
+	if evidence.incomplete || evidence.uncommitted || evidence.workRemaining {
+		t.Fatalf("only the read failure should hold the pass open: %+v", evidence)
+	}
+	if !evidence.readRetry || evidence.settled() {
+		t.Fatalf("a transient open failure must leave the pass unsettled: %+v", evidence)
+	}
+
+	codexOpenRolloutFile = originalOpen
+	ctx, cancel = context.WithTimeout(context.Background(), codexRolloutScanBudget)
+	_, _, _, evidence = codexReconcileFromRollout(ctx, f.home, f.fp, now)
+	cancel()
+	if !evidence.settled() {
+		t.Fatalf("once the read recovers the unchanged tree must settle: %+v", evidence)
 	}
 }

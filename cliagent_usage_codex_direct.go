@@ -35,9 +35,10 @@
 //     open (that run settles itself), and within codexDirectReconcileBudget;
 //   - the signature is stored only after a reconcile that finished inside its
 //     budget, reported its discovery and selection complete, committed its
-//     merge and left no capped rollouts unread, so a cut-short, uncommitted,
-//     capped, spaced-out or guarded pass is retried by the next eligible
-//     poll. State is in memory only: the owed rule lives in the
+//     merge, left no capped rollouts unread and read every attempted rollout
+//     to the end, so a cut-short, uncommitted, capped, read-failed, spaced-out
+//     or guarded pass is retried by the next eligible poll (a recovered read
+//     changes no mtime or size, so the signature alone would never retry it). State is in memory only: the owed rule lives in the
 //     reconcile's cursor and the nudge's held evidence, both on disk.
 //
 // It runs offline: the reconcile is local file I/O, and the live-read fallback

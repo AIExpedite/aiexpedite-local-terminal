@@ -2168,6 +2168,11 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	progressComplete := discoveryComplete && selectionComplete
 	attempted := make([]codexRolloutCandidate, 0, len(selected))
 	retryEntries := codexRolloutRetrySet(cursor.retryEntries)
+	// readRetry records that an attempted file was not fully read (a transient
+	// open/read failure or its file budget expired). Its retry entry is
+	// persisted, but a later recovery changes neither its mtime nor its size,
+	// so a stat-signature caller must keep re-running until the read lands.
+	readRetry := false
 	if discoveryComplete {
 		present := make(map[string]struct{}, len(candidates))
 		for _, candidate := range candidates {
@@ -2190,6 +2195,7 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		cancelFile()
 		retryEntry := codexRolloutBacklogEntryDigest(c)
 		retry := !handled
+		readRetry = readRetry || !handled
 		// A fully read file with neither numeric nor refusal evidence has nothing
 		// account-scoped to merge. It is safe to count as handled even when its
 		// first record does not provide a usable session timestamp.
@@ -2393,6 +2399,9 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	// the persisted backlog/boundary cursor walks them, but only if something
 	// runs another pass.
 	evidence.workRemaining = progressComplete && len(attempted) < len(eligibleCandidates)
+	// An unread file stays queued in retryEntries; a refusal hold (limitEntry)
+	// does not set this, so a long-lived notice does not re-run every poll.
+	evidence.readRetry = readRetry
 	// Fenced only when nothing this pass ACCEPTED already covers the floor: an
 	// accepted reading at or after it pays the debt through the normal merge.
 	evidence.fencedSinceFloor = fencedAfterFloor
@@ -2497,6 +2506,10 @@ type codexRolloutNudgeEvidence struct {
 	// unread — more than codexRolloutScanFileCap of them, or a file budget
 	// expired — so its persisted cursor has more batches to walk.
 	workRemaining bool
+	// readRetry is set when an attempted rollout was not fully read — a
+	// transient open/read failure or an expired file budget — so it sits in
+	// the retry set and a re-run over the unchanged tree must read it again.
+	readRetry bool
 }
 
 // covers reports whether this pass mined telemetry covering the rollout
@@ -2629,11 +2642,12 @@ func codexRolloutLineStartsTurn(line string) bool {
 // codexRolloutNudgeEvidenceFor pairs the uncovered and covered rollouts,
 // withholding only `newest` on an unfinished pass (codexEligibleMtimeFor).
 // settled reports whether the pass left nothing for a re-run to do: it saw the
-// whole tree, committed what it found and read every eligible rollout. A caller
+// whole tree, committed what it found and read every eligible rollout to the
+// end. A caller
 // that stores progress of its own (codexDirectScan) retries an unchanged tree
 // until this holds.
 func (e codexRolloutNudgeEvidence) settled() bool {
-	return !e.incomplete && !e.uncommitted && !e.workRemaining
+	return !e.incomplete && !e.uncommitted && !e.workRemaining && !e.readRetry
 }
 
 func codexRolloutNudgeEvidenceFor(newest time.Time, newestEntry string, covered map[string]time.Time, complete bool) codexRolloutNudgeEvidence {
