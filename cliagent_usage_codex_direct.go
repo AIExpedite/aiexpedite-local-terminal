@@ -34,8 +34,9 @@
 //     codexForcedReconcileMinInterval, never while a run of this process is
 //     open (that run settles itself), and within codexDirectReconcileBudget;
 //   - the signature is stored only after a reconcile that finished inside its
-//     budget and reported its discovery and selection complete, so a
-//     cut-short, spaced-out or guarded pass is retried by the next eligible
+//     budget, reported its discovery and selection complete, committed its
+//     merge and left no capped rollouts unread, so a cut-short, uncommitted,
+//     capped, spaced-out or guarded pass is retried by the next eligible
 //     poll. State is in memory only: the owed rule lives in the
 //     reconcile's cursor and the nudge's held evidence, both on disk.
 //
@@ -71,10 +72,12 @@ var (
 		return info != nil && info.DetectedCliAgents[codexUsageProvider].Detected
 	}
 	// codexDirectReconcile is the reconcile a scan runs (a seam for tests). It
-	// reports whether the pass saw the whole tree: discovery and selection run
-	// under their own sub-budgets, which can expire while ctx is still live.
+	// reports whether the pass settled (codexRolloutNudgeEvidence.settled): it
+	// saw the whole tree — discovery and selection run under their own
+	// sub-budgets, which can expire while ctx is still live — its merge
+	// committed, and no capped rollouts remain for a later batch.
 	codexDirectReconcile = func(ctx context.Context, base, fp string, now time.Time) bool {
-		return !codexReconcileAndNudge(ctx, base, fp, now, false).rollouts.incomplete
+		return codexReconcileAndNudge(ctx, base, fp, now, false).rollouts.settled()
 	}
 	// codexDirectHeldEvidence reports whether the nudge still holds rollout
 	// evidence for fp — one cache read (a seam for tests).

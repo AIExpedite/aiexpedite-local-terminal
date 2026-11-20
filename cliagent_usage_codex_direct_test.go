@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -597,5 +598,63 @@ func TestCodexNewestRolloutFiles_MissingDirIsCompleteAndEmpty(t *testing.T) {
 	cancel()
 	if _, complete := codexNewestRolloutFiles(ctx, t.TempDir(), 4); complete {
 		t.Fatal("a cancelled listing must not read as complete")
+	}
+}
+
+// A non-forced merge that loses the process-local cache lock commits nothing,
+// so the pass must not read as settled: otherwise the detector stores the
+// signature and the reading it mined never reaches the cache until a gather.
+func TestCodexReconcileFromRollout_UncommittedMergeIsNotSettled(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	writeCodexRunRollout(t, f.home, "contended", now.Add(-5*time.Minute), now.Add(-time.Minute), now.Add(-time.Minute), true,
+		[]map[string]any{codexRateLimitFrame(41, 42, now.Add(-time.Minute))})
+
+	codexRateLimitMu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), codexRolloutScanBudget)
+	_, _, _, evidence := codexReconcileFromRollout(ctx, f.home, f.fp, now)
+	cancel()
+	codexRateLimitMu.Unlock()
+	if !evidence.uncommitted || evidence.settled() {
+		t.Fatalf("a merge dropped on lock contention must leave the pass unsettled: %+v", evidence)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), codexRolloutScanBudget)
+	_, _, _, evidence = codexReconcileFromRollout(ctx, f.home, f.fp, now)
+	cancel()
+	if !evidence.settled() {
+		t.Fatalf("an uncontended retry must settle: %+v", evidence)
+	}
+}
+
+// More eligible rollouts than codexRolloutScanFileCap: the first pass is
+// complete but leaves a backlog, so it must not read as settled until later
+// passes have walked every capped batch.
+func TestCodexReconcileFromRollout_CappedBacklogIsNotSettledUntilWalked(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	for i := 0; i <= codexRolloutScanFileCap; i++ {
+		at := now.Add(-time.Duration(i+1) * time.Minute)
+		writeCodexRunRollout(t, f.home, fmt.Sprintf("capped-%02d", i), at.Add(-time.Minute), at, at, true,
+			[]map[string]any{codexRateLimitFrame(10, 20, at)})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), codexRolloutScanBudget)
+	_, _, _, evidence := codexReconcileFromRollout(ctx, f.home, f.fp, now)
+	cancel()
+	if evidence.incomplete || !evidence.workRemaining || evidence.settled() {
+		t.Fatalf("a complete pass that left capped rollouts unread must be unsettled: %+v", evidence)
+	}
+	for pass := 2; ; pass++ {
+		ctx, cancel := context.WithTimeout(context.Background(), codexRolloutScanBudget)
+		_, _, _, evidence = codexReconcileFromRollout(ctx, f.home, f.fp, now)
+		cancel()
+		if evidence.settled() {
+			t.Logf("settled after %d passes", pass)
+			break
+		}
+		if pass == 4 {
+			t.Fatalf("the capped backlog never drained: %+v", evidence)
+		}
 	}
 }

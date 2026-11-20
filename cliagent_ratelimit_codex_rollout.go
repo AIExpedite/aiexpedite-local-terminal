@@ -103,11 +103,15 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 		// gather deadline it is running inside. The stamp names the installed
 		// build only when every merged rollout says that build wrote it; any
 		// other provenance merges unstamped and leaves the existing stamp alone.
-		mergeCodexRateLimitCacheObserved(
+		committed, _ := mergeCodexRateLimitCacheObserved(
 			ctx, codexRateLimitCachePath(), contribs, nil, false, nil, false,
 			now, currentFingerprint, highWater, base, forced, nil,
 			codexRolloutProducerVersion(producer, currentCodexUsageCaptureVersion()), false,
 		)
+		// A non-forced merge may drop on lock contention. The pass's coverage then
+		// describes telemetry that never reached the cache, and its cursor did not
+		// advance either, so a caller tracking its own progress must retry.
+		rollouts.uncommitted = !committed
 	}
 	return codexMetricsFromCache(now, currentFingerprint), limit, latestObservation, rollouts
 }
@@ -2385,6 +2389,10 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		highWater = &progress
 	}
 	evidence := codexRolloutNudgeEvidenceFor(newestUncoveredMtime, newestUncoveredEntry, coveredEntries, progressComplete)
+	// The file cap (or a file budget) left unconsumed rollouts for a later pass:
+	// the persisted backlog/boundary cursor walks them, but only if something
+	// runs another pass.
+	evidence.workRemaining = progressComplete && len(attempted) < len(eligibleCandidates)
 	// Fenced only when nothing this pass ACCEPTED already covers the floor: an
 	// accepted reading at or after it pays the debt through the normal merge.
 	evidence.fencedSinceFloor = fencedAfterFloor
@@ -2481,6 +2489,14 @@ type codexRolloutNudgeEvidence struct {
 	// caller that stores progress of its own (codexDirectScan) reads this
 	// rather than ctx.Err() to decide whether the pass may be treated as done.
 	incomplete bool
+	// uncommitted is set when the pass had a merge to make and it did not
+	// commit (a non-forced merge dropped on lock contention): neither its
+	// telemetry nor its cursor reached the cache.
+	uncommitted bool
+	// workRemaining is set when a complete pass still left eligible rollouts
+	// unread — more than codexRolloutScanFileCap of them, or a file budget
+	// expired — so its persisted cursor has more batches to walk.
+	workRemaining bool
 }
 
 // covers reports whether this pass mined telemetry covering the rollout
@@ -2612,6 +2628,14 @@ func codexRolloutLineStartsTurn(line string) bool {
 
 // codexRolloutNudgeEvidenceFor pairs the uncovered and covered rollouts,
 // withholding only `newest` on an unfinished pass (codexEligibleMtimeFor).
+// settled reports whether the pass left nothing for a re-run to do: it saw the
+// whole tree, committed what it found and read every eligible rollout. A caller
+// that stores progress of its own (codexDirectScan) retries an unchanged tree
+// until this holds.
+func (e codexRolloutNudgeEvidence) settled() bool {
+	return !e.incomplete && !e.uncommitted && !e.workRemaining
+}
+
 func codexRolloutNudgeEvidenceFor(newest time.Time, newestEntry string, covered map[string]time.Time, complete bool) codexRolloutNudgeEvidence {
 	evidence := codexRolloutNudgeEvidence{newest: codexEligibleMtimeFor(newest, complete), covered: covered, incomplete: !complete}
 	if !evidence.newest.IsZero() {
