@@ -328,27 +328,89 @@ type asTab struct {
 	TabID   string `json:"tabId"`
 	Title   string `json:"title"`
 	URL     string `json:"url"`
-	Active  bool   `json:"active"`
 	Loading bool   `json:"loading"`
 }
 
-func (a *asBackend) Tabs(ctx context.Context) ([]browserTabInfo, error) {
+// asList is the helper's `list` answer: Chrome's windows front to back.
+type asList struct {
+	Frontmost bool `json:"frontmost"`
+	Windows   []struct {
+		Minimized   bool    `json:"minimized"`
+		ActiveTabID string  `json:"activeTabId"`
+		Tabs        []asTab `json:"tabs"`
+	} `json:"windows"`
+}
+
+func (a *asBackend) list(ctx context.Context) (asList, error) {
+	var l asList
 	res, err := a.b.request(ctx, map[string]any{"op": "list"})
+	if err != nil {
+		return l, err
+	}
+	if err := json.Unmarshal(res, &l); err != nil {
+		return l, errors.New("unreadable tab list")
+	}
+	return l, nil
+}
+
+// asFocusSnapshot reads focus from window order. Window 1 is the front window:
+// its active tab has focus exactly when Chrome is the frontmost app (and the
+// window is not minimized). When Chrome is not in front, that tab is the page
+// the person left (WindowOrderLast). A minimized window shows nothing; whether
+// another window covers one is not reported, so Visible is left unknown there.
+func asFocusSnapshot(l asList) browserFocusSnapshot {
+	snap := browserFocusSnapshot{Source: browserFocusSourceWindowOrder, Complete: true, HasSignal: true}
+	front := true // the first window not minimized
+	for i, w := range l.Windows {
+		lead := front && !w.Minimized
+		if lead {
+			front = false
+		}
+		for _, t := range w.Tabs {
+			if !browserRawTabIDPattern.MatchString(t.TabID) {
+				continue
+			}
+			id := makeBrowserTabID(browserRouteAppleScript, t.TabID)
+			active := t.TabID == w.ActiveTabID
+			info := browserTabInfo{TabID: id, Title: t.Title, URL: t.URL, Active: boolPtr(active), Window: i + 1}
+			switch {
+			case active && lead && l.Frontmost && i > 0:
+				// Window 1 is minimized: which window macOS focused is not known.
+				snap.Complete = false
+			default:
+				info.Focused = boolPtr(active && lead && l.Frontmost)
+			}
+			if w.Minimized || !active {
+				info.Visible = boolPtr(false)
+			}
+			if active && lead && !l.Frontmost {
+				snap.WindowOrderLast = id
+			}
+			snap.Tabs = append(snap.Tabs, info)
+		}
+	}
+	return snap
+}
+
+func (a *asBackend) Tabs(ctx context.Context) ([]browserTabInfo, error) {
+	l, err := a.list(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var tabs []asTab
-	if err := json.Unmarshal(res, &tabs); err != nil {
-		return nil, errors.New("unreadable tab list")
+	return asFocusSnapshot(l).Tabs, nil
+}
+
+// FocusSnapshot costs the same Apple Events as Tabs: always cheap.
+func (a *asBackend) FocusSnapshot(ctx context.Context, cheapOnly bool) (browserFocusSnapshot, error) {
+	l, err := a.list(ctx)
+	if err != nil {
+		return browserFocusSnapshot{}, err
 	}
-	out := make([]browserTabInfo, 0, len(tabs))
-	for _, t := range tabs {
-		if !browserRawTabIDPattern.MatchString(t.TabID) {
-			continue
-		}
-		out = append(out, browserTabInfo{TabID: makeBrowserTabID(browserRouteAppleScript, t.TabID), Title: t.Title, URL: t.URL, Active: t.Active})
-	}
-	return out, nil
+	return asFocusSnapshot(l), nil
+}
+
+func (a *asBackend) FocusMemory() *browserFocusMemory {
+	return browserFocusMemoryFor(browserRouteAppleScript)
 }
 
 func (a *asBackend) Open(ctx context.Context, url string) (browserPage, error) {

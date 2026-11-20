@@ -22,7 +22,8 @@ const browserDeviceCommand = "__browser__"
 // to a computer whose protocol is at least the minimum.
 const (
 	browserControlCapabilityKey = "browserControl"
-	browserAgentProtocol        = 1
+	// 2: the `current` op (BROWSER_OP_MIN_AGENT_PROTOCOL).
+	browserAgentProtocol = 2
 	// The params envelope version (`v`) this build reads.
 	browserParamsVersion = 1
 )
@@ -36,6 +37,7 @@ const (
 // BROWSER_OPS.
 const (
 	browserOpTabs          = "tabs"
+	browserOpCurrent       = "current"
 	browserOpOpen          = "open"
 	browserOpRead          = "read"
 	browserOpFill          = "fill"
@@ -67,6 +69,23 @@ const (
 	browserErrSubmitFormChanged   = "BROWSER_SUBMIT_FORM_CHANGED"
 	browserErrScreenshotUnsupport = "BROWSER_SCREENSHOT_UNSUPPORTED"
 	browserErrScreenshotNotFound  = "BROWSER_SCREENSHOT_NOT_FOUND"
+	// `current` never guesses: the model asks the person from the candidates.
+	browserErrCurrentPageAmbiguous   = "BROWSER_CURRENT_PAGE_AMBIGUOUS"
+	browserErrCurrentPageUnavailable = "BROWSER_CURRENT_PAGE_UNAVAILABLE"
+)
+
+// BROWSER_CURRENT_PAGE_BASIS: how `current` decided.
+const (
+	browserCurrentBasisFocused    = "focused"
+	browserCurrentBasisVisible    = "visible"
+	browserCurrentBasisLastActive = "lastActive"
+)
+
+// BROWSER_FOCUS_SOURCES: which signal decided (diagnostic only).
+const (
+	browserFocusSourceTabActive   = "tabActive"
+	browserFocusSourcePageProbe   = "pageProbe"
+	browserFocusSourceWindowOrder = "windowOrder"
 )
 
 // BROWSER_FIELD_OUTCOMES the agent itself produces (the kit produces the rest).

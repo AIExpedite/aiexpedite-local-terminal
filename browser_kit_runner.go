@@ -28,10 +28,16 @@ var errBrowserUnsupported = errors.New("not supported on this route")
 var errGaveUp = errors.New("gave up on this page: it stopped responding")
 
 type browserTabInfo struct {
-	TabID  string `json:"tabId"`
-	Title  string `json:"title"`
-	URL    string `json:"url"`
-	Active bool   `json:"active"`
+	TabID string `json:"tabId"`
+	Title string `json:"title"`
+	URL   string `json:"url"`
+	// Active: the tab showing in its window. Focused: the tab with keyboard
+	// focus. Visible: its document is visible. Nil = unknown, never false.
+	Active  *bool `json:"active,omitempty"`
+	Focused *bool `json:"focused,omitempty"`
+	Visible *bool `json:"visible,omitempty"`
+	// Window: an ordinal within this listing, frontmost first, when known.
+	Window int `json:"window,omitempty"`
 }
 
 // browserBackend is one route to Chrome.
@@ -41,6 +47,12 @@ type browserBackend interface {
 	Open(ctx context.Context, url string) (browserPage, error)
 	Page(ctx context.Context, rawTabID string) (browserPage, error)
 	TabInfo(ctx context.Context, rawTabID string) (browserTabInfo, error)
+	// FocusSnapshot reports every tab with what Chrome says about focus (see
+	// browser_focus.go). cheapOnly: return errBrowserFocusNotCheap rather than
+	// probe every page (the tabs op never pays the full probe).
+	FocusSnapshot(ctx context.Context, cheapOnly bool) (browserFocusSnapshot, error)
+	// FocusMemory: the activations recorded for this Chrome instance.
+	FocusMemory() *browserFocusMemory
 }
 
 // browserPage is one tab on a route.

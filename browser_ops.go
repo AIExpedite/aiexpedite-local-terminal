@@ -43,6 +43,8 @@ func (r *browserOpRun) run(ctx context.Context) (any, error) {
 	switch r.p.Op {
 	case browserOpTabs:
 		return r.tabs(ctx)
+	case browserOpCurrent:
+		return r.current(ctx)
 	case browserOpOpen:
 		return r.open(ctx)
 	case browserOpRead:
@@ -79,9 +81,20 @@ type browserTabsResult struct {
 // browserMaxTabs bounds the tab list (a person with 500 tabs open still gets an answer).
 const browserMaxTabs = 200
 
+// tabs lists the tabs, with active / focused / window when the route can tell
+// cheaply (tabActive usable, or AppleScript); otherwise the plain list.
 func (r *browserOpRun) tabs(ctx context.Context) (any, error) {
-	all, err := r.be.Tabs(ctx)
-	if err != nil {
+	var all []browserTabInfo
+	snap, err := r.be.FocusSnapshot(ctx, true)
+	switch {
+	case err == nil:
+		all = snap.Tabs
+		recordFocused(r.be.FocusMemory(), snap, time.Now())
+	case errors.Is(err, errBrowserFocusNotCheap):
+		if all, err = r.be.Tabs(ctx); err != nil {
+			return nil, err
+		}
+	default:
 		return nil, err
 	}
 	out := browserTabsResult{Tabs: []browserTabInfo{}}
@@ -99,6 +112,41 @@ func (r *browserOpRun) tabs(ctx context.Context) (any, error) {
 		}
 	}
 	return out, nil
+}
+
+// browserCurrentBudget: the most `current` spends (inside the command's deadline).
+const browserCurrentBudget = 8 * time.Second
+
+// current answers "which page is the person looking at" (browser_focus.go).
+func (r *browserOpRun) current(ctx context.Context) (any, error) {
+	ctx, cancel := context.WithTimeout(ctx, browserCurrentBudget)
+	defer cancel()
+	snap, err := r.be.FocusSnapshot(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	mem := r.be.FocusMemory()
+	res, berr := resolveCurrentPage(snap, r.p.AppOrigin, mem)
+	// Recorded after resolving, so lastActive is what was known before.
+	recordFocused(mem, snap, time.Now())
+	if berr != nil {
+		return nil, berr
+	}
+	return res, nil
+}
+
+// recordFocused notes the snapshot's focused tab (any, the app's own
+// included: the memory skips those when it recalls).
+func recordFocused(mem *browserFocusMemory, snap browserFocusSnapshot, at time.Time) {
+	var focused []string
+	for _, t := range snap.Tabs {
+		if isTrue(t.Focused) {
+			focused = append(focused, t.TabID)
+		}
+	}
+	if len(focused) == 1 {
+		mem.record(focused[0], at, false)
+	}
 }
 
 type browserPageInfo struct {

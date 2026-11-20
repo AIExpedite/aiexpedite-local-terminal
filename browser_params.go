@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -38,6 +39,9 @@ type browserParams struct {
 	SubmitRef   string             `json:"submitRef,omitempty"`
 	Digest      string             `json:"digest,omitempty"`
 	RequestID   string             `json:"requestId,omitempty"`
+	// AppOrigin (current): the AI Expedite app's own origin; its tabs are
+	// never "this page".
+	AppOrigin string `json:"appOrigin,omitempty"`
 }
 
 // browserError is a failure reported to the cloud: a BROWSER_* code and a
@@ -45,6 +49,8 @@ type browserParams struct {
 type browserError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// Candidates: the pages a `current` refusal offers the person to choose from.
+	Candidates []browserCurrentCandidate `json:"candidates,omitempty"`
 }
 
 func (e *browserError) Error() string { return e.Code + ": " + e.Message }
@@ -118,6 +124,10 @@ func validateBrowserParams(p *browserParams) *browserError {
 	}
 	switch p.Op {
 	case browserOpTabs, browserOpStop:
+		return nil
+	case browserOpCurrent:
+		// A malformed origin is dropped, not refused: the op still runs.
+		p.AppOrigin = normalizeBrowserOrigin(p.AppOrigin)
 		return nil
 	case browserOpOpen:
 		u, err := validateBrowserURL(p.URL)
@@ -240,6 +250,26 @@ func validateBrowserURL(raw string) (string, error) {
 	// The URL goes to Chrome as written (Go would percent-encode an
 	// internationalised host, which Chrome then has to undo).
 	return s, nil
+}
+
+// browserMaxAppOriginChars: BROWSER_LIMITS.MAX_APP_ORIGIN_CHARS.
+const browserMaxAppOriginChars = 200
+
+// normalizeBrowserOrigin returns a bare http(s) origin ("https://host[:port]",
+// an optional trailing "/"), lowercased, or "" for anything else.
+func normalizeBrowserOrigin(raw string) string {
+	if raw == "" || len(raw) > browserMaxAppOriginChars || strings.ContainsAny(raw, "?# ") || strings.ContainsFunc(raw, unicode.IsControl) {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil || u.Host == "" || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return ""
+	}
+	s := strings.ToLower(u.Scheme)
+	if s != "http" && s != "https" {
+		return ""
+	}
+	return s + "://" + strings.ToLower(u.Host)
 }
 
 // isBrowserHTTPURL: a tab worth listing (tabs lists http/https tabs only).

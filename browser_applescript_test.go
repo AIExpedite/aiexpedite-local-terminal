@@ -273,3 +273,96 @@ func TestBrowserChromeHelperCloseInterruptsARequestInFlight(t *testing.T) {
 		t.Fatal("the helper kept running after close")
 	}
 }
+
+func asListFixture(t *testing.T, raw string) asList {
+	t.Helper()
+	var l asList
+	if err := json.Unmarshal([]byte(raw), &l); err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+const asTwoWindows = `{"frontmost":%s,"windows":[
+ {"minimized":false,"activeTabId":"12","tabs":[{"tabId":"11","title":"Mail","url":"https://mail.example.com/"},{"tabId":"12","title":"Docs","url":"https://docs.example.com/"}]},
+ {"minimized":%s,"activeTabId":"21","tabs":[{"tabId":"21","title":"News","url":"https://news.example.com/"},{"tabId":"22","title":"Shop","url":"https://shop.example.com/"}]}
+]}`
+
+// The helper's list shape: every window's active tab is active, in window order.
+func TestASFocusSnapshotPerWindowActive(t *testing.T) {
+	snap := asFocusSnapshot(asListFixture(t, fmt.Sprintf(asTwoWindows, "true", "false")))
+	got := map[string]browserTabInfo{}
+	for _, tb := range snap.Tabs {
+		got[tb.TabID] = tb
+	}
+	if !isTrue(got["a:12"].Active) || !isTrue(got["a:21"].Active) || isTrue(got["a:11"].Active) || isTrue(got["a:22"].Active) {
+		t.Fatalf("per-window active: %+v", snap.Tabs)
+	}
+	if got["a:12"].Window != 1 || got["a:21"].Window != 2 {
+		t.Fatalf("window ordinals: %+v", snap.Tabs)
+	}
+	if snap.Source != browserFocusSourceWindowOrder || !snap.HasSignal {
+		t.Fatalf("%+v", snap)
+	}
+}
+
+// Window 1's active tab is focused only while Chrome is frontmost; otherwise it
+// is the page the person left (windowOrderLast).
+func TestASFocusSnapshotFrontmost(t *testing.T) {
+	front := asFocusSnapshot(asListFixture(t, fmt.Sprintf(asTwoWindows, "true", "false")))
+	res, berr := resolveCurrentPage(front, "", nil)
+	if berr != nil || res.Tab.TabID != "a:12" || res.Basis != browserCurrentBasisFocused || front.WindowOrderLast != "" {
+		t.Fatalf("%+v %v", res, berr)
+	}
+	back := asFocusSnapshot(asListFixture(t, fmt.Sprintf(asTwoWindows, "false", "false")))
+	for _, tb := range back.Tabs {
+		if isTrue(tb.Focused) {
+			t.Fatalf("nothing is focused while Chrome is not in front: %+v", tb)
+		}
+	}
+	if back.WindowOrderLast != "a:12" {
+		t.Fatalf("windowOrderLast %q", back.WindowOrderLast)
+	}
+	res, berr = resolveCurrentPage(back, "", nil)
+	if berr != nil || res.Tab.TabID != "a:12" || res.Basis != browserCurrentBasisLastActive {
+		t.Fatalf("%+v %v", res, berr)
+	}
+	// The front window's active tab is the app's own: it is never the answer.
+	res, berr = resolveCurrentPage(back, "https://docs.example.com", nil)
+	if berr == nil {
+		t.Fatalf("resolved %+v", res)
+	}
+}
+
+// A minimized window is never visible, and never the front window.
+func TestASFocusSnapshotMinimized(t *testing.T) {
+	snap := asFocusSnapshot(asListFixture(t, fmt.Sprintf(asTwoWindows, "false", "true")))
+	for _, tb := range snap.Tabs {
+		if tb.Window == 2 && (tb.Visible == nil || *tb.Visible) {
+			t.Fatalf("a minimized window's tab is visible: %+v", tb)
+		}
+	}
+	minFront := `{"frontmost":false,"windows":[
+ {"minimized":true,"activeTabId":"12","tabs":[{"tabId":"12","title":"Docs","url":"https://docs.example.com/"}]},
+ {"minimized":false,"activeTabId":"21","tabs":[{"tabId":"21","title":"News","url":"https://news.example.com/"}]}]}`
+	snap = asFocusSnapshot(asListFixture(t, minFront))
+	if snap.WindowOrderLast != "a:21" {
+		t.Fatalf("the first window not minimized leads: %q", snap.WindowOrderLast)
+	}
+	// Chrome frontmost with window 1 minimized: which window has focus is unknown.
+	snap = asFocusSnapshot(asListFixture(t, strings.Replace(minFront, `"frontmost":false`, `"frontmost":true`, 1)))
+	if snap.Complete {
+		t.Fatal("focus is unknown, so the snapshot is incomplete")
+	}
+	if _, berr := resolveCurrentPage(snap, "", nil); berr == nil {
+		t.Fatal("must not guess")
+	}
+}
+
+func TestBrowserChromeHelperReportsWindows(t *testing.T) {
+	for _, want := range []string{"chrome.frontmost()", "win.minimized()", "activeTabId", "windows: windows"} {
+		if !strings.Contains(browserChromeHelperJS, want) {
+			t.Errorf("Chrome helper list does not report %s", want)
+		}
+	}
+}

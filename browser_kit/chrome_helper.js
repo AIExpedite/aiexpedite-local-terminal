@@ -32,18 +32,25 @@ function handle(chrome, req) {
   if (req.op === 'status') return { running: chrome.running() };
   if (!chrome.running()) throw new Error('chrome-not-running');
   if (req.op === 'list') {
-    // One Apple Event per property per window, not per tab.
-    var out = [];
+    // Windows front to back (AppleScript's window order), each with its active
+    // tab, and whether Chrome is the frontmost app: the agent reads focus from
+    // these. One Apple Event per property per window, not per tab.
+    var windows = [];
     var ws = chrome.windows();
     for (var i = 0; i < ws.length; i++) {
       var win = ws[i];
-      var activeId = String(win.activeTab.id());
+      var activeId = '';
+      try { activeId = String(win.activeTab.id()); } catch (e) { activeId = ''; }
+      var minimized = false;
+      try { minimized = win.minimized() === true; } catch (e) { minimized = false; }
       var ids = win.tabs.id(), titles = win.tabs.title(), urls = win.tabs.url();
+      var tabs = [];
       for (var j = 0; j < ids.length; j++) {
-        out.push({ tabId: String(ids[j]), title: titles[j], url: urls[j], active: i === 0 && String(ids[j]) === activeId });
+        tabs.push({ tabId: String(ids[j]), title: titles[j], url: urls[j] });
       }
+      windows.push({ minimized: minimized, activeTabId: activeId, tabs: tabs });
     }
-    return out;
+    return { frontmost: chrome.frontmost() === true, windows: windows };
   }
   if (req.op === 'open') {
     var wins = chrome.windows();
