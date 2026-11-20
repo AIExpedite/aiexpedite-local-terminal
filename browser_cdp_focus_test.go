@@ -459,7 +459,12 @@ func TestCDPCloseInterruptsFocusMemory(t *testing.T) {
 	release()
 	conn.mem.startContinuous(time.Now())
 	m.closeAll()
-	if !conn.mem.continuousSince.IsZero() {
+	// Read under the lock: the connection's background discovery call fails
+	// once closeAll shuts the socket, and interrupts the memory concurrently.
+	conn.mem.mu.Lock()
+	since := conn.mem.continuousSince
+	conn.mem.mu.Unlock()
+	if !since.IsZero() {
 		t.Fatal("closeAll must interrupt the focus memory")
 	}
 }
