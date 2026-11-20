@@ -312,11 +312,14 @@ type fakeTurnState struct {
 	lastTurnEnded  time.Time
 }
 
-func (f *fakeTurnState) TurnState(string) (bool, bool, time.Time) {
+// read is the session's turn state, as a bound oneShotSessionTurnState.
+func (f *fakeTurnState) read() (bool, bool, time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.alive, f.running, f.lastTurnEnded
 }
+
+func (f *fakeTurnState) TurnStateOf(string) oneShotSessionTurnState { return f.read }
 
 // A turn of AI Expedite's own that starts and ends between two watcher polls
 // is still its own: when it ran comes from the session, never from what a
@@ -326,7 +329,7 @@ func TestOneShotOwnTurnBetweenPollsIsNeverAnOutsideWriter(t *testing.T) {
 	now := time.Now()
 	ended := now.Add(-2 * time.Second)
 	state := &fakeTurnState{alive: true, lastTurnEnded: ended}
-	own := oneShotOwnActiveAt(state, owTestSession)
+	own := oneShotOwnActiveAt(state.read)
 	if cliSessionStoreWrittenByOther(ended.Add(-time.Second).UnixMilli(), now, own) {
 		t.Fatal("the store write of a turn no poll saw running read as another writer's")
 	}
@@ -340,7 +343,7 @@ func TestOneShotOwnTurnBetweenPollsIsNeverAnOutsideWriter(t *testing.T) {
 	if cliSessionStoreWrittenByOther(later.UnixMilli(), later.Add(time.Second), own) {
 		t.Fatal("a write while a turn of AI Expedite's own runs read as another writer's")
 	}
-	if !cliSessionStoreWrittenByOther(now.Add(-time.Second).UnixMilli(), now, oneShotOwnActiveAt(&fakeTurnState{alive: true}, owTestSession)) {
+	if !cliSessionStoreWrittenByOther(now.Add(-time.Second).UnixMilli(), now, oneShotOwnActiveAt((&fakeTurnState{alive: true}).read)) {
 		t.Fatal("before any turn of its own, a fresh store write must be another writer's")
 	}
 }
@@ -391,7 +394,11 @@ func TestOneShotWatcherNeverReportsItsOwnUnsampledTurn(t *testing.T) {
 func TestOneShotTurnsRecordWhenTheyEnded(t *testing.T) {
 	check := func(t *testing.T, mgr oneShotTurnState, id, doneMark string, send func() error) {
 		t.Helper()
-		if _, _, ended := mgr.TurnState(id); !ended.IsZero() {
+		state := mgr.TurnStateOf(id)
+		if state == nil {
+			t.Fatalf("no session %s to read", id)
+		}
+		if _, _, ended := state(); !ended.IsZero() {
 			t.Fatalf("a session that never ran a turn reports one ended at %v", ended)
 		}
 		before := time.Now()
@@ -399,7 +406,7 @@ func TestOneShotTurnsRecordWhenTheyEnded(t *testing.T) {
 			t.Fatalf("turn: %v", err)
 		}
 		after := time.Now()
-		alive, running, ended := mgr.TurnState(id)
+		alive, running, ended := state()
 		if !alive || running {
 			t.Fatalf("after the turn: alive=%v running=%v, want an idle live session", alive, running)
 		}
@@ -410,7 +417,7 @@ func TestOneShotTurnsRecordWhenTheyEnded(t *testing.T) {
 		if err != nil {
 			t.Fatalf("the stub's last write: %v", err)
 		}
-		if cliSessionStoreWrittenByOther(fi.ModTime().UnixMilli(), time.Now(), oneShotOwnActiveAt(mgr, id)) {
+		if cliSessionStoreWrittenByOther(fi.ModTime().UnixMilli(), time.Now(), oneShotOwnActiveAt(state)) {
 			t.Fatal("the last write of AI Expedite's own turn read as another writer's")
 		}
 	}
@@ -476,6 +483,72 @@ func TestOutsideWriterStartsOnceAndEndsWithItsSession(t *testing.T) {
 	if watchOneShotResumedSession(cliSessionEngineOpenCode, commandMsg{SessionID: "s"}, state, sink.publish) {
 		t.Fatal("a start that resumes nothing started a watcher")
 	}
+}
+
+// A one-shot watcher is bound to the session its START registered, never to
+// that session's id, which a manager reuses once the session ends. A
+// replacement that continues the same conversation gets its own watcher at
+// once (the ended session's never stands in for it), and once a replacement
+// continues another conversation, the watcher of the first one unwinds
+// instead of reporting that conversation's writer against the replacement.
+func TestOneShotWatcherIsBoundToItsSessionNotItsID(t *testing.T) {
+	fastOutsideWriterPolls(t)
+	const convA, convB = "0199b000-0000-7000-8000-0000000000a1", "0199b000-0000-7000-8000-0000000000b2"
+	// Another program holds both conversations open.
+	pinCliSessionProcesses(t, func() []cliSessionProcess {
+		return []cliSessionProcess{
+			{PID: 61, Name: "muse", Args: []string{"muse", "--session-id", convA}},
+			{PID: 62, Name: "muse", Args: []string{"muse", "--session-id", convB}},
+		}
+	})
+	m := installMuseCodeStub(t)
+	const id = owTestSession + "-reused-id"
+	sink := &outsideWriterSink{}
+	keyOf := func(conversation string) string { return cliSessionEngineMuseCode + "|" + id + "|" + conversation }
+	watch := func(conversation string) bool {
+		return watchOneShotResumedSession(cliSessionEngineMuseCode, commandMsg{
+			SessionID: id, WorkspaceID: "ws", UID: "uid", AgentID: "agent-1", ConversationID: conversation,
+		}, m, sink.publish)
+	}
+	cwd := startMuse(t, m, id, convA)
+	replace := func(conversation string) {
+		t.Helper()
+		if err := m.End(id); err != nil {
+			t.Fatalf("end: %v", err)
+		}
+		if err := m.Start(id, cwd, "ws", "uid", conversation, nil, nil); err != nil {
+			t.Fatalf("replacement start: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		_ = m.End(id)
+		waitForWriterState(t, 3*time.Second, "every watcher to end", func() bool {
+			return !watchRunning(keyOf(convA)) && !watchRunning(keyOf(convB))
+		})
+	})
+
+	if !watch(convA) {
+		t.Fatal("watcher not started")
+	}
+	first := m.TurnStateOf(id)
+	waitForWriterState(t, 3*time.Second, "A held open elsewhere", func() bool { return len(sink.states(id)) == 1 })
+
+	replace(convA)
+	if alive, _, _ := first(); alive {
+		t.Fatal("the ended session read as alive through the replacement under its id")
+	}
+	if alive, _, _ := m.TurnStateOf(id)(); !alive {
+		t.Fatal("the replacement does not read as alive")
+	}
+	if !watch(convA) {
+		t.Fatal("the replacement's START was refused its watcher: the ended session's stood in for it")
+	}
+
+	replace(convB)
+	if !watch(convB) {
+		t.Fatal("the replacement continuing B started no watcher")
+	}
+	waitForWriterState(t, 3*time.Second, "the watcher of A to unwind", func() bool { return !watchRunning(keyOf(convA)) })
 }
 
 func TestCliSessionResumedIDReadsOnlyResumeFrames(t *testing.T) {

@@ -879,47 +879,70 @@ func (m *CodexAppServerManager) noteCodexResumeWritten(session *CodexAppServerSe
 	}, session.publish)
 }
 
-// oneShotTurnState is a one-shot manager's view of a session: still
-// registered, whether a turn of it runs now, and when its last turn ended
-// (zero before the first) — recorded by the turn itself as its child exits,
-// before the session reads idle.
+// oneShotTurnState is a one-shot manager's view of its sessions. TurnStateOf
+// binds to the session registered under id now (nil when none is): the read
+// it returns reports that very session, never a replacement a later Start
+// registers under the same id once it has ended (the managers reuse ids).
 type oneShotTurnState interface {
-	TurnState(id string) (alive, running bool, lastTurnEnded time.Time)
+	TurnStateOf(id string) oneShotSessionTurnState
 }
 
-func (m *oneShotNativeManager) TurnState(id string) (alive, running bool, lastTurnEnded time.Time) {
-	s := m.Get(id)
-	if s == nil {
-		return false, false, time.Time{}
+// oneShotSessionTurnState reads one one-shot session: alive while it is still
+// the session its manager holds under its id and has not ended, whether a
+// turn of it runs now, and when its last turn ended (zero before the first) —
+// recorded by the turn itself as its child exits, before the session reads
+// idle.
+type oneShotSessionTurnState func() (alive, running bool, lastTurnEnded time.Time)
+
+// boundOneShotTurnState is TurnStateOf's read of s, the session a manager
+// held under an id when the read was bound; held re-reads what the manager
+// holds under that id now, so a replacement under it is never read as s.
+func boundOneShotTurnState[S comparable](s S, held func() S, status func() string, own *cliSessionOwnIO) oneShotSessionTurnState {
+	return func() (alive, running bool, lastTurnEnded time.Time) {
+		st := status()
+		return st != "ended" && held() == s, st == "running", own.lastAt(time.Time{})
 	}
-	st := s.Status()
-	return st != "ended", st == "running", s.ownIO.lastAt(time.Time{})
 }
 
-func (m *OpenCodeNativeManager) TurnState(id string) (alive, running bool, lastTurnEnded time.Time) {
+func (m *oneShotNativeManager) TurnStateOf(id string) oneShotSessionTurnState {
 	s := m.Get(id)
 	if s == nil {
-		return false, false, time.Time{}
+		return nil
 	}
-	st := s.Status()
-	return st != "ended", st == "running", s.ownIO.lastAt(time.Time{})
+	return boundOneShotTurnState(s, func() *oneShotNativeSession { return m.Get(id) }, s.Status, &s.ownIO)
 }
 
-func (m *AntigravityNativeManager) TurnState(id string) (alive, running bool, lastTurnEnded time.Time) {
+func (m *OpenCodeNativeManager) TurnStateOf(id string) oneShotSessionTurnState {
 	s := m.Get(id)
 	if s == nil {
-		return false, false, time.Time{}
+		return nil
 	}
-	st := s.Status()
-	return st != "ended", st == "running", s.ownIO.lastAt(time.Time{})
+	return boundOneShotTurnState(s, func() *OpenCodeNativeSession { return m.Get(id) }, s.Status, &s.ownIO)
+}
+
+func (m *AntigravityNativeManager) TurnStateOf(id string) oneShotSessionTurnState {
+	s := m.Get(id)
+	if s == nil {
+		return nil
+	}
+	return boundOneShotTurnState(s, func() *AntigravityNativeSession { return m.Get(id) }, s.Status, &s.ownIO)
 }
 
 // watchOneShotResumedSession starts the watcher of a one-shot session a START
 // seeded with the conversation it continues (the signed `conversationId`):
 // between turns no process runs, so the session's own manager says when it
-// ended and when a turn of AI Expedite's own runs or last ran.
+// ended and when a turn of AI Expedite's own runs or last ran. It is bound to
+// the session this START registered (or re-acknowledged), never to its id:
+// once that session ends, a replacement a later START registers under the
+// same id is not read as it still running, so the watcher unwinds instead of
+// reporting this conversation's writer against the replacement, and the
+// replacement's own START watches the conversation it continues.
 func watchOneShotResumedSession(engine string, cmd commandMsg, mgr oneShotTurnState, publishFn PublishFunc) bool {
 	if mgr == nil || cmd.ConversationID == "" || cmd.SessionID == "" {
+		return false
+	}
+	state := mgr.TurnStateOf(cmd.SessionID)
+	if state == nil {
 		return false
 	}
 	return startCliSessionOutsideWriterWatcher(cliOutsideWriterTarget{
@@ -928,10 +951,10 @@ func watchOneShotResumedSession(engine string, cmd commandMsg, mgr oneShotTurnSt
 		owner:     cliOutsideWriterOwner{ID: cmd.SessionID, WorkspaceID: cmd.WorkspaceID, UID: cmd.UID},
 		agentID:   cmd.AgentID,
 		alive: func() bool {
-			alive, _, _ := mgr.TurnState(cmd.SessionID)
+			alive, _, _ := state()
 			return alive
 		},
-		ownActiveAt: oneShotOwnActiveAt(mgr, cmd.SessionID),
+		ownActiveAt: oneShotOwnActiveAt(state),
 	}, publishFn)
 }
 
@@ -939,9 +962,9 @@ func watchOneShotResumedSession(engine string, cmd commandMsg, mgr oneShotTurnSt
 // it runs, else when its last turn ended. Both come from the turn itself,
 // never from what a poll happened to see, so a turn that starts and ends
 // between two polls still owns the store writes it made.
-func oneShotOwnActiveAt(mgr oneShotTurnState, sessionID string) func(now time.Time) time.Time {
+func oneShotOwnActiveAt(state oneShotSessionTurnState) func(now time.Time) time.Time {
 	return func(now time.Time) time.Time {
-		_, running, lastTurnEnded := mgr.TurnState(sessionID)
+		_, running, lastTurnEnded := state()
 		if running {
 			return now
 		}
