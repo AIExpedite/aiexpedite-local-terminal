@@ -239,6 +239,86 @@ func TestOpenCodeProbeAndWriterEvidence(t *testing.T) {
 	}
 }
 
+// A store the probe could not read in full never says a session is gone: a
+// session no layout it read shows is an error (the cloud's "could not check
+// that session"), while one a layout it read does show is still confirmed, and
+// a store read in full still says gone. Covers a database the driver cannot
+// read (a torn or unreadable file reads as not a database), one of neither
+// family, one table's row that cannot be read beside the other table, and a
+// probe out of time.
+func TestOpenCodeProbeOfAStoreItCouldNotReadNeverSaysGone(t *testing.T) {
+	pinCliSessionProcesses(t, func() []cliSessionProcess { return nil })
+	probe := func(ctx context.Context, root, id string) cliSessionProbeResult {
+		return probeOpenCodeSession(ctx, root, cliSessionProbeRequest{sessionID: id})
+	}
+	unknown := func(what string, res cliSessionProbeResult) {
+		t.Helper()
+		if res.Error != cliSessionErrInternal || res.Exists || res.Resumable {
+			t.Fatalf("%s = %+v, want an error (not checked), never gone or resumable", what, res)
+		}
+	}
+
+	broken := t.TempDir()
+	if err := os.WriteFile(filepath.Join(broken, "opencode.db"), []byte(strings.Repeat("not a database ", 64)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unknown("a session in a database that could not be read", probe(context.Background(), broken, ocBoth))
+	writeOpenCodeLegacySession(t, broken, ocLeg, "From the JSON store", "/w/legacy", time.Now())
+	if res := probe(context.Background(), broken, ocLeg); res.Error != "" || !res.Exists || !res.Resumable || res.Title != "From the JSON store" {
+		t.Fatalf("a legacy session beside a database that could not be read = %+v, want confirmed", res)
+	}
+	unknown("a session the legacy store does not hold, beside a database that could not be read", probe(context.Background(), broken, ocBoth))
+
+	odd := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(odd, "opencode.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE conversations (id TEXT, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	unknown("a session in a database of neither family", probe(context.Background(), odd, ocBoth))
+
+	// OpenCode 2's copy of two sessions cannot be read (a time that does not
+	// scan); the frozen 1.x table holds only the older of them.
+	now := time.Now()
+	torn := t.TempDir()
+	writeOpenCodeDB(t, torn, map[string][]openCodeTestRow{
+		"session": {{id: ocBoth, title: "Before the migration", dir: "/w/both", updated: now.Add(-6 * time.Hour)}},
+		"session_v2": {
+			{id: ocBoth, title: "Fix the session store", dir: "/w/both", updated: now.Add(-time.Hour)},
+			{id: ocNew, title: "Ship the parser", dir: "/w/new", updated: now.Add(-time.Hour)},
+		},
+	})
+	db, err = sql.Open("sqlite", filepath.Join(torn, "opencode.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE session_v2 SET time_updated = 'not a time'`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	unknown("a session whose only row could not be read", probe(context.Background(), torn, ocNew))
+	if res := probe(context.Background(), torn, ocBoth); res.Error != "" || !res.Exists || res.Title != "Before the migration" {
+		t.Fatalf("a session the other table holds = %+v, want confirmed from it", res)
+	}
+	// A listing still skips the row it cannot read, as it always has.
+	if res := discoverOpenCodeSessions(context.Background(), torn, newCliSessionDiscoverRequest(30, 500)); len(res.Rows) != 1 || res.Rows[0].SessionID != ocBoth || len(res.SourcesSkipped) != 0 {
+		t.Fatalf("discovery of the torn store = %+v, want the 1.x row alone", res)
+	}
+
+	root, _ := openCodeFixture(t)
+	if res := probe(context.Background(), root, "ses_goneaaaaaaaaaaaaaaaaaaaaaa"); res.Error != "" || res.Exists || res.Resumable {
+		t.Fatalf("a session no layout of a store read in full holds = %+v, want gone", res)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if res := probe(ctx, root, ocBoth); res.Error != cliSessionErrTimeout || res.Exists || res.Resumable {
+		t.Fatalf("a probe out of time = %+v, want timeout, never gone", res)
+	}
+}
+
 // The watcher's busy decision reads OpenCode's store through the owner's live
 // write-ahead log (cliSessionSQLiteDSN): while OpenCode runs, a turn's write
 // its log alone holds yet is a writer mid-turn. An immutable open would read

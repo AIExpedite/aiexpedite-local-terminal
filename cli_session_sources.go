@@ -226,21 +226,39 @@ func openCliSessionSQLite(ctx context.Context, path string) (*sql.DB, error) {
 }
 
 // sqliteColumns is the set of table's column names (empty when there is no
-// such table).
+// such table, or when it could not be read: sqliteTableColumns tells the two
+// apart).
 func sqliteColumns(ctx context.Context, db *sql.DB, table string) map[string]bool {
+	cols, _ := sqliteTableColumns(ctx, db, table)
+	return cols
+}
+
+// sqliteTableColumns is sqliteColumns with the read's error: empty and nil
+// when there is no such table, an error when the database could not be read
+// for it (a file the driver cannot parse, an I/O error, ctx). The columns it
+// did read are returned either way.
+func sqliteTableColumns(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
 	cols := map[string]bool{}
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`SELECT name FROM pragma_table_info(%s)`, sqliteQuote(table)))
 	if err != nil {
-		return cols
+		return cols, err
 	}
 	defer rows.Close()
+	var scanErr error
 	for rows.Next() {
 		var name string
-		if rows.Scan(&name) == nil {
-			cols[name] = true
+		if err := rows.Scan(&name); err != nil {
+			if scanErr == nil {
+				scanErr = err
+			}
+			continue
 		}
+		cols[name] = true
 	}
-	return cols
+	if err := rows.Err(); err != nil {
+		return cols, err
+	}
+	return cols, scanErr
 }
 
 // sqliteQuote is s as an SQL string literal.
