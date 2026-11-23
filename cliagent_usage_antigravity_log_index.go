@@ -2119,6 +2119,10 @@ type antigravityOwedFloor struct {
 	// got too old (antigravityAgedReadingFloor). It owes one ordinary debt,
 	// but it never replaces a terminal one — only a newer RUN may do that.
 	Aged bool
+	// Outdated marks an Aged floor raised because the replayed reading was
+	// written under an older antigravityQuotaSchemaVersion
+	// (antigravityOutdatedSchemaFloor). It changes only the log wording.
+	Outdated bool
 }
 
 // antigravityDiscover runs one pass and applies its floors; returns the newest

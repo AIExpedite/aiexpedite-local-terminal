@@ -1267,8 +1267,10 @@ closes that gap by reading the server **while it exists**:
   slower in-flight probe age the card backwards for the same account; an account
   switch always wins regardless of timestamps.
 - **Redaction allowlist.** Only `observedAt`, `accountFingerprint`, `account`,
-  `plan`, the numeric buckets and the unobserved ones (no fraction; see "Rows"
-  below) are persisted
+  `plan`, the numeric buckets, the disabled ones (`disabledBuckets`) and the
+  unobserved ones (both identity-only — `bucketId`, `group`, `displayName`,
+  `window`, `resetTime`, never a fraction, description or remaining amount;
+  see "Rows" below) are persisted
   (`sanitizeAntigravityQuotaSnapshot`, which also drops unplottable windows and
   length-clamps every string). Discovered ports, log text, argv, prompts and
   `settings.json` contents are never written to the cache and never logged. A
@@ -1849,7 +1851,7 @@ can.
   CLI mode `antigravity-pid-block` writes a real second-stamped log with its own
   PID block (and, with `TEST_MOCK_AGY_EXHAUSTED_AS`, a login and a 429).
 
-### Rows: one-model groups, window spellings and unobserved buckets
+### Rows: one-model groups, window spellings, disabled and unobserved buckets
 
 `antigravityQuotaMetrics` renders one row per bucket, labelled
 `<group without " Models"> — <window label>` exactly as before.
@@ -1885,15 +1887,46 @@ can.
   beats Unknown, less left wins): both receipt verifiers reject a whole refresh
   over a duplicate. Past the 32-row cap, the first rows in display order are
   kept.
-- **Unobserved buckets.** An omitted fraction that no evidence names, with a
-  recognised window and a reset, is cached in `unobservedBuckets` (never in
-  `buckets`, which an older agent charts by fraction) for diagnosis only. It is
-  never published as a row and never counts toward an observation. Google omits
-  a SPENT bucket's fraction (proto3 drops a zero), and also a disabled one's. An
-  Unknown row would read server-side as an open, fail-open pool: a fully spent
-  account would read Partial, and as the newest sample it would displace
-  another computer's evidence that the bucket is spent. Shape counters
-  `windowsGeneric` and `omittedUnobserved` count both new cases.
+- **Disabled buckets.** Google marks a bucket the account is not entitled to
+  with `"disabled": true` (`agy`'s `QuotaSummaryBucket.GetDisabled`). It is
+  classified FIRST, before its fraction or any exhaustion evidence is looked
+  at: a disabled bucket is never a row and never a routing input, so a disabled
+  one-model group (Argon) leaves its model unpooled, and an omitted fraction
+  that evidence names can no longer read "Limit reached" for capacity the
+  account never had. Only a literal JSON `true` disables; absent, `false`,
+  `null` and any malformed value (string, number, object) leave the bucket
+  enabled, so a reply-shape change can never suppress real capacity — if Google
+  renames the field, disabled buckets reappear as rows until the decoder
+  follows, and the `disabled` shape counter drops to 0 in agent.log. An enabled
+  bucket, spent or not, is unchanged. A disabled bucket with a recognised
+  window is cached by identity in `disabledBuckets` (never in `buckets`, which
+  an older agent charts by fraction); an unrecognised one is dropped. The
+  32-entry cap is shared: numeric buckets, then disabled, then unobserved.
+- **All-disabled replies.** A reply holding a disabled bucket with a
+  recognised window is an observation even with nothing to chart: it replaces
+  the cached rows, settles a run's refresh debt (`codeassist_ok` on the Code
+  Assist route), and the card shows the two Unknown placeholders, which stay
+  fail-open server-side. A reply of only unrecognised-window disabled buckets
+  is no observation and leaves the cache alone.
+- **Schema 2.** The cache is written under `schemaVersion: 2`. A replayed
+  reading from an older schema may chart a disabled bucket, so a gather that
+  replays one (no fresh reading, no own child running) hands the nudge an aged
+  floor at now (`antigravityOutdatedSchemaFloor`) unless a run floor the
+  reading does not cover, or a gated build's aged floor, already applies. It
+  costs one Code Assist read per computer with a stored login, bounded by the
+  nudge cooldown, the minimum read interval, the retry ladder, the attempt
+  limit and the debt's age-out; it never replaces a terminal debt, so a
+  computer with no stored login keeps its v1 rows until a run brings a new
+  reading. The version is still never a read gate.
+- **Unobserved buckets.** An enabled bucket's omitted fraction that no evidence
+  names, with a recognised window and a reset, is cached in `unobservedBuckets`
+  (never in `buckets`) for diagnosis only. It is never published as a row and
+  never counts toward an observation. Google omits a SPENT bucket's fraction
+  (proto3 drops a zero). An Unknown row would read server-side as an open,
+  fail-open pool: a fully spent account would read Partial, and as the newest
+  sample it would displace another computer's evidence that the bucket is
+  spent. Shape counters `windowsGeneric`, `omittedUnobserved` and `disabled`
+  count these cases — integers only, never a bucket identity or a figure.
 - **Saved default model.** `agy` runs its saved `/model` choice whenever no
   `--model` is passed. The agent reads only the `model` key of
   `~/.gemini/antigravity-cli/settings.json`, or of `~/.agy/config.json` when the

@@ -516,3 +516,68 @@ func TestAntigravityCodeAssistAttempt_NoteIsScopedToItsProbe(t *testing.T) {
 		t.Errorf("debt note=%+v, want its own skew expiry %d", got, expiry)
 	}
 }
+
+// helperDisabledWeeklyCodeAssistFixture is antigravityCodeAssistFixture with
+// the weekly bucket marked disabled; its fraction must never be charted.
+var helperDisabledWeeklyCodeAssistFixture = strings.Replace(antigravityCodeAssistFixture,
+	`"window":"weekly","remainingFraction":0.6,`, `"window":"weekly","remainingFraction":0.6,"disabled":true,`, 1)
+
+// helperAllDisabledCodeAssistFixture marks both buckets disabled.
+var helperAllDisabledCodeAssistFixture = strings.Replace(helperDisabledWeeklyCodeAssistFixture,
+	`"window":"5h","remainingFraction":0.96,`, `"window":"5h","remainingFraction":0.96,"disabled":true,`, 1)
+
+// Code Assist spells the reply bare or under "response"; both suppress a
+// disabled bucket, and the stored-login attestation is kept.
+func TestProbeAntigravityQuotaCodeAssist_SuppressesDisabledBuckets(t *testing.T) {
+	if helperDisabledWeeklyCodeAssistFixture == antigravityCodeAssistFixture ||
+		helperAllDisabledCodeAssistFixture == helperDisabledWeeklyCodeAssistFixture {
+		t.Fatal("fixture: a bucket was not marked disabled")
+	}
+	for _, tc := range []struct{ name, body string }{
+		{"bare", helperDisabledWeeklyCodeAssistFixture},
+		{"response envelope", `{"response":` + helperDisabledWeeklyCodeAssistFixture + `}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			helperStubAntigravityKeyring(t, helperStoredLogin())
+			helperCodeAssistServers(t, func(string) (int, string) { return http.StatusOK, tc.body }, helperUserinfoAda)
+			if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistOK {
+				t.Fatalf("outcome=%q, want ok", got)
+			}
+			var snap antigravityQuotaSnapshot
+			if !readJSONFile(os.Getenv("AIEXPEDITE_AGY_QUOTA_CACHE"), &snap) {
+				t.Fatal("no snapshot cached")
+			}
+			if len(snap.Buckets) != 1 || snap.Buckets[0].BucketID != "gemini-5h" {
+				t.Errorf("buckets=%+v, want only the enabled 5h bucket", snap.Buckets)
+			}
+			if len(snap.DisabledBuckets) != 1 || snap.DisabledBuckets[0].BucketID != "gemini-weekly" {
+				t.Errorf("disabled=%+v, want the weekly bucket", snap.DisabledBuckets)
+			}
+			if !snap.StoredLoginRead || snap.SchemaVersion != antigravityQuotaSchemaVersion {
+				t.Errorf("storedLoginRead=%v schema=%d, want the attestation under schema %d", snap.StoredLoginRead, snap.SchemaVersion, antigravityQuotaSchemaVersion)
+			}
+		})
+	}
+}
+
+// An all-disabled reply is a reading: codeassist_ok, cached with no numeric
+// bucket, and it settles the debt it was taken for.
+func TestProbeAntigravityQuotaCodeAssist_AllDisabledIsAnObservation(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	helperStubAntigravityKeyring(t, helperStoredLogin())
+	helperCodeAssistServers(t, func(string) (int, string) { return http.StatusOK, helperAllDisabledCodeAssistFixture }, helperUserinfoAda)
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	floor := time.Now().Add(-time.Second)
+	helperOwedDebt(t, antigravityUsageFreshness{RefreshOwedFloorMs: floor.UnixMilli(), RefreshOwedAtMs: floor.UnixMilli()})
+
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistOK {
+		t.Fatalf("outcome=%q, want ok", got)
+	}
+	snap, ok := cachedAntigravityQuotaSnapshot()
+	if !ok || len(snap.Buckets) != 0 || len(snap.DisabledBuckets) != 2 {
+		t.Fatalf("snap=%+v ok=%v, want a cached reading of two disabled buckets", snap, ok)
+	}
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
+		t.Errorf("state=%+v, want the debt settled", state)
+	}
+}

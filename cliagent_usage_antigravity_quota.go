@@ -75,8 +75,12 @@ const (
 	// Readers deliberately do NOT reject an unknown value: after a rollback the
 	// older agent must still be able to replay a cache a newer one wrote, and
 	// every field it does not understand is simply absent from its struct. The
-	// version is diagnostic metadata, not a gate.
-	antigravityQuotaSchemaVersion = 1
+	// version is never a read gate; a replayed reading older than this one owes
+	// one bounded refresh instead (antigravityOutdatedSchemaFloor).
+	//
+	// 2: DisabledBuckets. A version-1 reading may hold a bucket Google marked
+	// disabled as a numeric row, so it is refreshed once rather than trusted.
+	antigravityQuotaSchemaVersion = 2
 	// Per-string byte caps applied before the cache is written. The top-level
 	// cap matches canonicalCLIUsageMetric's 256-byte bound so a value that
 	// survives the cache also survives the signed refresh. Bucket fields are
@@ -114,11 +118,10 @@ type antigravityQuotaBucket struct {
 	ResetTime         string  `json:"resetTime"`
 }
 
-// antigravityUnobservedBucket is a bucket the reply named WITHOUT a
-// remainingFraction, with no evidence that it is spent
-// (antigravitySnapshotFromGroups). The window exists and resets at ResetTime,
-// but nothing says how much is left, so it has no fraction field at all.
-type antigravityUnobservedBucket struct {
+// antigravityBucketIdentity is the identity-only allowlist a bucket that is
+// never charted is persisted with: which bucket, which window, when it resets.
+// No fraction, description or remaining amount is ever part of it.
+type antigravityBucketIdentity struct {
 	BucketID    string `json:"bucketId"`
 	Group       string `json:"group"`
 	DisplayName string `json:"displayName"`
@@ -126,10 +129,34 @@ type antigravityUnobservedBucket struct {
 	ResetTime   string `json:"resetTime"`
 }
 
+// clamped bounds every field exactly as the cache stores a numeric bucket's.
+func (b antigravityBucketIdentity) clamped() antigravityBucketIdentity {
+	return antigravityBucketIdentity{
+		BucketID:    clampAntigravityQuotaField(b.BucketID, antigravityQuotaMaxBucketFieldBytes),
+		Group:       clampAntigravityQuotaField(b.Group, antigravityQuotaMaxBucketFieldBytes),
+		DisplayName: clampAntigravityQuotaField(b.DisplayName, antigravityQuotaMaxBucketFieldBytes),
+		Window:      clampAntigravityQuotaField(b.Window, antigravityQuotaMaxBucketFieldBytes),
+		ResetTime:   clampAntigravityQuotaField(b.ResetTime, antigravityQuotaMaxBucketFieldBytes),
+	}
+}
+
+// antigravityUnobservedBucket is a bucket the reply named WITHOUT a
+// remainingFraction, with no evidence that it is spent
+// (antigravitySnapshotFromGroups). The window exists and resets at ResetTime,
+// but nothing says how much is left, so it has no fraction field at all.
+type antigravityUnobservedBucket antigravityBucketIdentity
+
+// antigravityDisabledBucket is a bucket the reply marked disabled
+// ("disabled": true — the account is not entitled to it). It is no capacity of
+// this account at all: never a row, never a routing input, whatever fraction
+// or exhaustion evidence came with it. Kept so a cached reading still records
+// that the bucket was suppressed, not that it was missing.
+type antigravityDisabledBucket antigravityBucketIdentity
+
 // antigravityQuotaSnapshot is what we cache between `agy` runs. The persisted
 // shape is an allowlist, not a dump: observation time, the account it belongs
-// to, the plan name, the numeric buckets and the buckets named without a
-// figure. Discovered ports, log excerpts, argv, prompts and settings.json
+// to, the plan name, the numeric buckets, the disabled buckets and the buckets
+// named without a figure. Discovered ports, log excerpts, argv, prompts and settings.json
 // contents are deliberately absent.
 type antigravityQuotaSnapshot struct {
 	// SchemaVersion is written but never enforced on read — see
@@ -153,6 +180,12 @@ type antigravityQuotaSnapshot struct {
 	// fraction, so after a rollback a bucket stored there would read 100%
 	// consumed, while it ignores this field.
 	UnobservedBuckets []antigravityUnobservedBucket `json:"unobservedBuckets,omitempty"`
+	// DisabledBuckets are the buckets the reply marked disabled, by identity
+	// only. Never published (antigravityQuotaMetrics reads Buckets alone) and
+	// kept out of Buckets for the same rollback reason as UnobservedBuckets: an
+	// older agent would chart one there as live capacity. They do count as an
+	// observation, so an all-disabled reply replaces the rows it supersedes.
+	DisabledBuckets []antigravityDisabledBucket `json:"disabledBuckets,omitempty"`
 	// StoredLoginRead marks a reading taken through Code Assist with the stored
 	// keyring login itself — the login `agy` runs as. It is the persisted half
 	// of the producer attestation (cliagent_usage_live_probe.go): the in-memory
@@ -600,7 +633,20 @@ type antigravityQuotaGroupWire struct {
 		Window            string                  `json:"window"`
 		RemainingFraction antigravityWireFraction `json:"remainingFraction"`
 		ResetTime         string                  `json:"resetTime"`
+		Disabled          antigravityWireDisabled `json:"disabled"`
 	} `json:"buckets"`
+}
+
+// antigravityWireDisabled decodes a bucket's entitlement flag. Only a literal
+// JSON true disables a bucket: absent, false, null and any malformed value
+// (a string, a number, an object) leave it enabled, so a reply-shape change can
+// never suppress real capacity — and, like antigravityWireFraction, a
+// malformed flag never fails the reply.
+type antigravityWireDisabled bool
+
+func (d *antigravityWireDisabled) UnmarshalJSON(raw []byte) error {
+	*d = antigravityWireDisabled(string(bytes.TrimSpace(raw)) == "true")
+	return nil
 }
 
 // antigravityFractionState is what the wire said about a bucket's
@@ -656,32 +702,39 @@ type antigravityQuotaShape struct {
 	OmittedCharted      int
 	OmittedUnobserved   int
 	WindowsGeneric      int // recognised windows given an open kind (antigravityOpenWindow)
+	Disabled            int // buckets marked disabled, whatever their window
 }
 
 func (s antigravityQuotaShape) String() string {
-	return fmt.Sprintf("groups=%d buckets=%d windowsRecognised=%d windowsUnrecognised=%d windowsGeneric=%d fractionValid=%d fractionOmitted=%d fractionNull=%d fractionInvalid=%d resetMissing=%d omittedCharted=%d omittedUnobserved=%d",
-		s.Groups, s.Buckets, s.WindowsRecognised, s.WindowsUnrecognised, s.WindowsGeneric, s.FractionValid,
+	return fmt.Sprintf("groups=%d buckets=%d windowsRecognised=%d windowsUnrecognised=%d windowsGeneric=%d disabled=%d fractionValid=%d fractionOmitted=%d fractionNull=%d fractionInvalid=%d resetMissing=%d omittedCharted=%d omittedUnobserved=%d",
+		s.Groups, s.Buckets, s.WindowsRecognised, s.WindowsUnrecognised, s.WindowsGeneric, s.Disabled, s.FractionValid,
 		s.FractionOmitted, s.FractionNull, s.FractionInvalid, s.ResetMissing, s.OmittedCharted, s.OmittedUnobserved)
 }
 
 // antigravitySnapshotFromGroups turns a QuotaSummary into the persisted
-// snapshot shape. ok is false when nothing in it can be plotted: a response we
-// cannot plot is not an observation, and counting raw buckets would let a
-// schema change pass as success and overwrite the last usable cached reading
-// with rows that all render Unknown.
+// snapshot shape. ok is false when the reply is not an observation: it holds
+// neither a plottable bucket nor a disabled one with a recognised window.
+// Counting raw buckets would let a schema change pass as success and overwrite
+// the last usable cached reading with rows that all render Unknown.
 //
-// An OMITTED fraction is unknown unless evidence names that bucket: a managed
-// run of the same account hit RESOURCE_EXHAUSTED with a reset within
-// antigravityExhaustionMatch of the bucket's own reset. Only then is it
-// charted as fully consumed. Without evidence a bucket with a recognised
+// A DISABLED bucket ("disabled": true) is classified first, before its
+// fraction or any exhaustion evidence is looked at: the account is not
+// entitled to it, so it is never a row whatever it says. A recognised window
+// keeps it in DisabledBuckets by identity only, and that IS an observation —
+// an all-disabled reply replaces the rows it supersedes, and the gather shows
+// the Unknown placeholders. An unrecognised one is dropped.
+//
+// An enabled bucket's OMITTED fraction is unknown unless evidence names that
+// bucket: a managed run of the same account hit RESOURCE_EXHAUSTED with a
+// reset within antigravityExhaustionMatch of the bucket's own reset. Only then
+// is it charted as fully consumed. Without evidence a bucket with a recognised
 // window and a reset is kept in UnobservedBuckets (for diagnosis, never
-// published) and never counts as plottable: Google also omits the fraction of a
-// DISABLED bucket, so an omitted one is no proof that it is spent. Null and
-// invalid fractions are always skipped.
+// published) and never counts as an observation. Null and invalid fractions
+// are always skipped.
 func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.Time, evidence []antigravityExhaustionEvent) (antigravityQuotaSnapshot, antigravityQuotaShape, bool) {
 	snap := antigravityQuotaSnapshot{ObservedAt: now.UTC().Format(time.RFC3339), ObservedAtMs: now.UnixMilli()}
 	shape := antigravityQuotaShape{Groups: len(groups)}
-	plottable := 0
+	observed := 0
 	for _, group := range groups {
 		for _, bucket := range group.Buckets {
 			shape.Buckets++
@@ -698,6 +751,21 @@ func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.
 			if resetErr != nil {
 				shape.ResetMissing++
 			}
+			identity := antigravityBucketIdentity{
+				BucketID:    bucket.BucketID,
+				Group:       group.DisplayName,
+				DisplayName: bucket.DisplayName,
+				Window:      bucket.Window,
+				ResetTime:   bucket.ResetTime,
+			}
+			if bucket.Disabled {
+				shape.Disabled++
+				if recognised {
+					snap.DisabledBuckets = append(snap.DisabledBuckets, antigravityDisabledBucket(identity))
+					observed++
+				}
+				continue
+			}
 			var fraction float64
 			switch bucket.RemainingFraction.State {
 			case antigravityFractionValid:
@@ -711,13 +779,7 @@ func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.
 				if !antigravityEvidenceNamesReset(evidence, reset) {
 					if recognised {
 						shape.OmittedUnobserved++
-						snap.UnobservedBuckets = append(snap.UnobservedBuckets, antigravityUnobservedBucket{
-							BucketID:    bucket.BucketID,
-							Group:       group.DisplayName,
-							DisplayName: bucket.DisplayName,
-							Window:      bucket.Window,
-							ResetTime:   bucket.ResetTime,
-						})
+						snap.UnobservedBuckets = append(snap.UnobservedBuckets, antigravityUnobservedBucket(identity))
 					}
 					continue
 				}
@@ -739,11 +801,11 @@ func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.
 				ResetTime:         bucket.ResetTime,
 			})
 			if recognised {
-				plottable++
+				observed++
 			}
 		}
 	}
-	if plottable == 0 {
+	if observed == 0 {
 		return antigravityQuotaSnapshot{}, shape, false
 	}
 	return snap, shape, true
@@ -854,10 +916,17 @@ func readAntigravityQuotaCache() (antigravityQuotaSnapshot, bool) {
 	if !antigravityQuotaFile.readJSON(antigravityQuotaCachePath(), &snap) {
 		return antigravityQuotaSnapshot{}, false
 	}
-	if len(snap.Buckets) == 0 {
+	if !snap.isObservation() {
 		return antigravityQuotaSnapshot{}, false
 	}
 	return snap, true
+}
+
+// isObservation reports whether a cached reading says anything about the
+// account: a numeric bucket, or a disabled one. Unobserved buckets alone never
+// do (antigravitySnapshotFromGroups).
+func (snap antigravityQuotaSnapshot) isObservation() bool {
+	return len(snap.Buckets) > 0 || len(snap.DisabledBuckets) > 0
 }
 
 // saveAntigravityQuotaSnapshot persists a fresh reading unconditionally.
@@ -937,7 +1006,7 @@ func writeAntigravityQuotaSnapshotLocked(snap antigravityQuotaSnapshot) bool {
 	// Sanitizing can empty a snapshot whose every window was unrecognized; such
 	// a file is unreadable anyway (readAntigravityQuotaCache rejects it) and
 	// writing it would only destroy a good previous reading.
-	if len(snap.Buckets) == 0 {
+	if !snap.isObservation() {
 		return false
 	}
 	path := antigravityQuotaCachePath()
@@ -972,10 +1041,11 @@ func writeAntigravityQuotaSnapshotLocked(snap antigravityQuotaSnapshot) bool {
 
 // sanitizeAntigravityQuotaSnapshot reduces a reading to exactly what may be
 // persisted: observation time, the account it belongs to, the plan name, the
-// plottable numeric buckets and the unobserved ones. Unrecognized windows are
-// dropped (they can never render, and keeping them would let a renamed window
-// bloat the cache), the two bucket lists together are capped at the
-// signed-refresh metric cap (numeric buckets first), and every string is
+// plottable numeric buckets, the disabled ones and the unobserved ones.
+// Unrecognized windows are dropped (they can never render, and keeping them
+// would let a renamed window bloat the cache), the three bucket lists together
+// are capped at the signed-refresh metric cap (numeric buckets first, then
+// disabled, then unobserved), and every string is
 // length-clamped so a hostile or malformed server payload cannot grow the file
 // or overflow the receipt's per-field bounds.
 func sanitizeAntigravityQuotaSnapshot(snap antigravityQuotaSnapshot) antigravityQuotaSnapshot {
@@ -1004,20 +1074,24 @@ func sanitizeAntigravityQuotaSnapshot(snap antigravityQuotaSnapshot) antigravity
 			break
 		}
 	}
-	for _, bucket := range snap.UnobservedBuckets {
-		if len(out.Buckets)+len(out.UnobservedBuckets) >= cliUsageMaxMetricsPerProvider {
+	kept := func() int { return len(out.Buckets) + len(out.DisabledBuckets) + len(out.UnobservedBuckets) }
+	for _, bucket := range snap.DisabledBuckets {
+		if kept() >= cliUsageMaxMetricsPerProvider {
 			break
 		}
 		if _, _, ok := antigravityWindowKind(bucket.Window); !ok {
 			continue
 		}
-		out.UnobservedBuckets = append(out.UnobservedBuckets, antigravityUnobservedBucket{
-			BucketID:    clampAntigravityQuotaField(bucket.BucketID, antigravityQuotaMaxBucketFieldBytes),
-			Group:       clampAntigravityQuotaField(bucket.Group, antigravityQuotaMaxBucketFieldBytes),
-			DisplayName: clampAntigravityQuotaField(bucket.DisplayName, antigravityQuotaMaxBucketFieldBytes),
-			Window:      clampAntigravityQuotaField(bucket.Window, antigravityQuotaMaxBucketFieldBytes),
-			ResetTime:   clampAntigravityQuotaField(bucket.ResetTime, antigravityQuotaMaxBucketFieldBytes),
-		})
+		out.DisabledBuckets = append(out.DisabledBuckets, antigravityDisabledBucket(antigravityBucketIdentity(bucket).clamped()))
+	}
+	for _, bucket := range snap.UnobservedBuckets {
+		if kept() >= cliUsageMaxMetricsPerProvider {
+			break
+		}
+		if _, _, ok := antigravityWindowKind(bucket.Window); !ok {
+			continue
+		}
+		out.UnobservedBuckets = append(out.UnobservedBuckets, antigravityUnobservedBucket(antigravityBucketIdentity(bucket).clamped()))
 	}
 	return out
 }
@@ -1271,8 +1345,11 @@ func antigravityGroupModelKey(name string) string {
 // Claude and Codex cards read. A model-scoped group's rows name its model
 // (antigravityGroupModelScope).
 //
-// An unobserved bucket (UnobservedBuckets: Google omitted its fraction and no
-// evidence names it) is never published. Google omits the fraction of a spent
+// Only numeric Buckets reach a row. A disabled bucket (DisabledBuckets) is not
+// this account's capacity and is never published, so a one-model group the
+// account is not entitled to never pools its model. An unobserved bucket
+// (UnobservedBuckets: Google omitted its fraction and no evidence names it) is
+// never published either. Google omits the fraction of a spent
 // bucket, so an Unknown row would read server-side as an open, fail-open pool:
 // it would make a fully spent account read Partial, and as the newest sample it
 // would displace another computer's evidence that the bucket is spent.
