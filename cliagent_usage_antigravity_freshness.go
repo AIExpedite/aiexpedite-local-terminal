@@ -1459,8 +1459,8 @@ func antigravityDebtAccountAnswers(id antigravityDebtID, account string) bool {
 // antigravityUsageRunSettled (a managed run's completion), the nudge (a run the
 // log index found; aged: a gated build's reading that aged past
 // antigravityGatedReadingMaxAge, or a reading an older quota schema wrote) or
-// the startup replay. In memory only, the same leaf-lock
-// shape as antigravityDebtAccount; a generation nobody noted (a restart) reports
+// the startup replay. In memory only, the same leaf-lock shape as
+// antigravityDebtAccount; a generation nobody noted (a restart) reports
 // adopted.
 const (
 	antigravityDebtRouteSettle  = "settle"

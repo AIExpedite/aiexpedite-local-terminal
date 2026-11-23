@@ -329,3 +329,35 @@ func TestAntigravityQuotaCache_OlderAgentNeverChartsADisabledBucket(t *testing.T
 		t.Error("the replayed disabled Argon bucket was published")
 	}
 }
+
+// The gather's own loopback read: a live server answering with every bucket
+// disabled replaces the cached enabled rows, and the card shows the two Unknown
+// placeholders instead of replaying the older figure.
+func TestAntigravityUsageParser_LiveAllDisabledReplyReplacesTheCache(t *testing.T) {
+	home := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "agyq.json")
+	helperIsolateAntigravityQuotaState(t, cache)
+	prior := helperArgonSnapshot(t)
+	prior.Account = "ada@example.com"
+	prior.AccountFingerprint = fingerprintAccount("antigravity", prior.Account)
+	saveAntigravityQuotaSnapshot(prior)
+
+	const reply = `{"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+    {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.9,"disabled":true,"resetTime":"2126-08-12T04:37:41Z"},
+    {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.75,"disabled":true,"resetTime":"2126-08-14T14:17:13Z"}]}]}}`
+	helperAntigravityServer(t, filepath.Join(home, ".gemini", "antigravity-cli"), reply, helperStatusJSON)
+
+	usage := helperGather(t, home)
+	if len(usage.Metrics) != 2 {
+		t.Fatalf("metrics=%+v, want the two placeholders", usage.Metrics)
+	}
+	for _, m := range usage.Metrics {
+		if !m.Unknown || m.Consumed != nil || m.Model != "" {
+			t.Errorf("metric %+v, want an Unknown placeholder", m)
+		}
+	}
+	cached, ok := cachedAntigravityQuotaSnapshot()
+	if !ok || len(cached.Buckets) != 0 || len(cached.DisabledBuckets) != 2 {
+		t.Errorf("cached=%+v ok=%v, want the all-disabled reading to replace the prior rows", cached, ok)
+	}
+}

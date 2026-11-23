@@ -840,9 +840,7 @@ func TestAntigravityStaleRegression_DisabledBucketLeavesTheCard(t *testing.T) {
 	reads := atomic.LoadInt32(f.quotaCalls)
 	helperStopAntigravityRefreshSchedule()
 	helperResetAntigravityLiveRuns()
-	antigravityRefreshNudge.mu.Lock()
-	antigravityRefreshNudge.lastAt = time.Time{}
-	antigravityRefreshNudge.mu.Unlock()
+	helperResetAntigravityNudgeCooldown(t)
 	assertOnlyTheSessionRow("after a restart")
 	antigravityUsageRefreshWaitIdle()
 	if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {

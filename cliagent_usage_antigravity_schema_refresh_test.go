@@ -34,11 +34,11 @@ func helperResetAntigravityNudgeCooldown(t *testing.T) {
 	n.mu.Unlock()
 }
 
+// helperGatherAntigravity is helperGather plus waiting out any refresh the
+// gather's nudge started.
 func helperGatherAntigravity(t *testing.T, home string) {
 	t.Helper()
-	if _, ok := (antigravityUsageParser{}).Parse(home, detectedCLIAgent{Detected: true}, time.Now()); !ok {
-		t.Fatal("Parse failed")
-	}
+	helperGather(t, home)
 	antigravityUsageRefreshWaitIdle()
 }
 

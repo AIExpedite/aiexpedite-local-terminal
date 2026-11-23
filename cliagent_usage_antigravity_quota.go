@@ -156,8 +156,8 @@ type antigravityDisabledBucket antigravityBucketIdentity
 // antigravityQuotaSnapshot is what we cache between `agy` runs. The persisted
 // shape is an allowlist, not a dump: observation time, the account it belongs
 // to, the plan name, the numeric buckets, the disabled buckets and the buckets
-// named without a figure. Discovered ports, log excerpts, argv, prompts and settings.json
-// contents are deliberately absent.
+// named without a figure. Discovered ports, log excerpts, argv, prompts and
+// settings.json contents are deliberately absent.
 type antigravityQuotaSnapshot struct {
 	// SchemaVersion is written but never enforced on read — see
 	// antigravityQuotaSchemaVersion.
@@ -1349,10 +1349,10 @@ func antigravityGroupModelKey(name string) string {
 // this account's capacity and is never published, so a one-model group the
 // account is not entitled to never pools its model. An unobserved bucket
 // (UnobservedBuckets: Google omitted its fraction and no evidence names it) is
-// never published either. Google omits the fraction of a spent
-// bucket, so an Unknown row would read server-side as an open, fail-open pool:
-// it would make a fully spent account read Partial, and as the newest sample it
-// would displace another computer's evidence that the bucket is spent.
+// never published either. Google omits the fraction of a spent bucket, so an
+// Unknown row would read server-side as an open, fail-open pool: it would make
+// a fully spent account read Partial, and as the newest sample it would
+// displace another computer's evidence that the bucket is spent.
 //
 // The group is clamped exactly as the cache stores it, so a fresh reading and
 // its replay render the same labels and models. Rows sharing an identity
