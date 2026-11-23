@@ -418,3 +418,62 @@ func TestAntigravityColdStartLines_CarryNoSecrets(t *testing.T) {
 		}
 	}
 }
+
+// A disabled bucket's description, remaining amount and fraction never reach
+// the agent log, the cache or the signed refresh; its allowlisted display name
+// is clamped in the cache and never becomes a published row label.
+func TestAntigravityDisabledBucket_NeverLeaks(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "agyq.json")
+	helperIsolateAntigravityQuotaState(t, cache)
+	longName := "Disabled-Label-" + strings.Repeat("x", 200)
+	reply := `{"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+    {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.9,"resetTime":"2126-08-12T04:37:41Z"},
+    {"bucketId":"gemini-weekly","displayName":"` + longName + `","window":"weekly","disabled":true,
+     "remainingFraction":0.314159,"remainingAmount":"` + helperSecretScriptSecret + `",
+     "description":"` + helperSecretScriptToken + `","resetTime":"2126-08-14T14:17:13Z"}]}]}}`
+
+	var snap antigravityQuotaSnapshot
+	logged := captureStdout(t, func() {
+		var shape antigravityQuotaShape
+		var ok bool
+		snap, shape, ok = antigravitySnapshotFromGroups(helperGroupsJSON(t, reply), time.Now(), nil)
+		if !ok {
+			t.Error("want an observation")
+		}
+		logAntigravityQuotaShapeOnce(shape)
+		snap.Account = "ada@example.com"
+		snap.AccountFingerprint = fingerprintAccount("antigravity", snap.Account)
+		saveAntigravityQuotaSnapshot(snap)
+	})
+	helperAssertNoSecrets(t, "agent log", logged)
+
+	raw, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperAssertNoSecrets(t, "cache", string(raw))
+	if strings.Contains(string(raw), "0.314159") {
+		t.Error("the cache holds the disabled bucket's fraction")
+	}
+	cached, _ := cachedAntigravityQuotaSnapshot()
+	if len(cached.DisabledBuckets) != 1 || len(cached.DisabledBuckets[0].DisplayName) != antigravityQuotaMaxBucketFieldBytes {
+		t.Errorf("disabled=%+v, want the display name clamped to %d bytes", cached.DisabledBuckets, antigravityQuotaMaxBucketFieldBytes)
+	}
+
+	metrics := antigravityQuotaMetrics(cached, time.Now())
+	_, signed, _, err := signCLIUsageRefreshReceipt("secret", "refresh-1", 1, true,
+		[]cliAgentUsage{{Provider: "antigravity", Metrics: metrics}}, nil)
+	if err != nil {
+		t.Fatalf("the rows were rejected from the signed refresh: %v", err)
+	}
+	body, _ := json.Marshal(signed)
+	helperAssertNoSecrets(t, "signed refresh", string(body))
+	if strings.Contains(string(body), "Disabled-Label") || strings.Contains(string(body), "0.314159") {
+		t.Errorf("the signed refresh carries the disabled bucket: %s", body)
+	}
+	for _, m := range metrics {
+		if strings.Contains(m.Label, "Disabled-Label") {
+			t.Errorf("row label %q names the disabled bucket", m.Label)
+		}
+	}
+}

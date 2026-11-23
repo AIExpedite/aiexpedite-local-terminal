@@ -952,6 +952,60 @@ func TestSaveAntigravityQuotaSnapshot_RefusesASnapshotWithNoPlottableBucket(t *t
 	}
 }
 
+// A disabled-only reading is an observation and round-trips through the cache;
+// one whose three bucket lists are all empty (or holds only unobserved
+// buckets) is neither written nor read.
+func TestAntigravityQuotaCache_DisabledOnlyIsAcceptedAndEmptyIsRejected(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "agyq.json")
+	helperIsolateAntigravityQuotaState(t, cache)
+	base := antigravityQuotaSnapshot{
+		ObservedAt:         "2026-08-28T06:00:00Z",
+		AccountFingerprint: fingerprintAccount("antigravity", "ada@example.com"),
+		Account:            "ada@example.com",
+	}
+
+	unobservedOnly := base
+	unobservedOnly.UnobservedBuckets = []antigravityUnobservedBucket{{Group: "Gemini Models", Window: "weekly"}}
+	for name, snap := range map[string]antigravityQuotaSnapshot{"empty": base, "unobserved only": unobservedOnly} {
+		saveAntigravityQuotaSnapshot(snap)
+		if _, err := os.Stat(cache); err == nil {
+			t.Fatalf("%s: the snapshot was written", name)
+		}
+		helperWriteJSON(t, cache, snap)
+		if _, ok := cachedAntigravityQuotaSnapshot(); ok {
+			t.Errorf("%s: the cache was read", name)
+		}
+		_ = os.Remove(cache)
+	}
+
+	disabledOnly := base
+	disabledOnly.DisabledBuckets = []antigravityDisabledBucket{{BucketID: "argon-weekly", Group: "Gemini 4 Argon", Window: "weekly"}}
+	saveAntigravityQuotaSnapshot(disabledOnly)
+	snap, ok := cachedAntigravityQuotaSnapshot()
+	if !ok || len(snap.DisabledBuckets) != 1 || len(snap.Buckets) != 0 {
+		t.Fatalf("snap=%+v ok=%v, want the disabled-only reading cached and read back", snap, ok)
+	}
+}
+
+// The shape line is the one log of a reply: integers only, the disabled
+// counter included, and nothing that names a bucket, a window, an account or a
+// figure.
+func TestAntigravityQuotaShape_CountsDisabledWithoutIdentity(t *testing.T) {
+	const reply = `{"response":{"groups":[{"displayName":"Gemini 4 Argon","buckets":[
+    {"bucketId":"argon-secret-id","displayName":"Argon Secret Label","window":"weekly","remainingFraction":0.123456,"disabled":true,
+     "resetTime":"2126-11-09T14:22:54Z"}]}]}}`
+	_, shape, _ := antigravitySnapshotFromGroups(helperGroupsJSON(t, reply), time.Now(), nil)
+	line := shape.String()
+	if !strings.Contains(line, "disabled=1") {
+		t.Errorf("shape=%q, want disabled=1", line)
+	}
+	for _, forbidden := range []string{"argon", "Argon", "weekly", "0.123456", "2126", "ada@example.com"} {
+		if strings.Contains(line, forbidden) {
+			t.Errorf("shape=%q names %q", line, forbidden)
+		}
+	}
+}
+
 // Both install trees are probed, and the legacy one leads only when it is the
 // one holding config. Single-sourcing this is what keeps the capture poller and
 // the gather parser reading the same logs.

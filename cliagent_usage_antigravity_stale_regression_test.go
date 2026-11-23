@@ -800,3 +800,80 @@ func TestAntigravityStaleRegression_ExpiredLoginRenewsOnceAcrossRestarts(t *test
 		t.Errorf("renewals=%d, want one for the whole debt", spawned.Load())
 	}
 }
+
+// helperGather renders the provider entry the CLI Agents card reads.
+func helperGather(t *testing.T, home string) *cliAgentUsage {
+	t.Helper()
+	usage, ok := antigravityUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if !ok {
+		t.Fatal("Parse failed")
+	}
+	return usage
+}
+
+// A direct run on a gated build, paid by a Code Assist reply in which Google
+// disabled the weekly bucket: the newer reading replaces the seeded one whose
+// weekly bucket was charted, the card shows only the enabled 5h row — and it
+// still does after a restart (live-run state gone), with no refresh owed.
+func TestAntigravityStaleRegression_DisabledBucketLeavesTheCard(t *testing.T) {
+	f := helperStaleRegressionFixtureQuota(t, helperStoredLogin(),
+		func(string) (int, string) { return http.StatusOK, helperDisabledWeeklyCodeAssistFixture }, helperUserinfoAda)
+
+	helperRunDirectAgy(t, f)
+	helperDrainAntigravityRefreshSchedule(t)
+	snap := helperAwaitPaidRefresh(t, f.cache, f.stale)
+	if len(snap.DisabledBuckets) != 1 || snap.SchemaVersion != antigravityQuotaSchemaVersion {
+		t.Fatalf("snap=%+v, want the disabled weekly bucket recorded under schema %d", snap, antigravityQuotaSchemaVersion)
+	}
+
+	assertOnlyTheSessionRow := func(why string) {
+		t.Helper()
+		usage := helperGather(t, f.home)
+		if len(usage.Metrics) != 1 || usage.Metrics[0].Label != "Gemini — 5-hour session window" ||
+			usage.Metrics[0].Remaining == nil || *usage.Metrics[0].Remaining != 96 {
+			t.Errorf("%s: metrics=%+v, want only the enabled 5h row at 96%% left", why, usage.Metrics)
+		}
+	}
+	assertOnlyTheSessionRow("after the run")
+
+	// The next process: nothing in memory, only the schema-2 cache.
+	reads := atomic.LoadInt32(f.quotaCalls)
+	helperStopAntigravityRefreshSchedule()
+	helperResetAntigravityLiveRuns()
+	helperResetAntigravityNudgeCooldown(t)
+	assertOnlyTheSessionRow("after a restart")
+	antigravityUsageRefreshWaitIdle()
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
+		t.Errorf("state=%+v, want no refresh owed for a schema-%d reading", state, antigravityQuotaSchemaVersion)
+	}
+	if got := atomic.LoadInt32(f.quotaCalls); got != reads {
+		t.Errorf("Code Assist reads=%d after the restart gather, want still %d", got, reads)
+	}
+}
+
+// Every bucket disabled: the reply is still the run's reading. It replaces the
+// seeded rows, settles the run's debt, and the card falls back to the two
+// Unknown placeholders.
+func TestAntigravityStaleRegression_AllDisabledReplyShowsPlaceholders(t *testing.T) {
+	f := helperStaleRegressionFixtureQuota(t, helperStoredLogin(),
+		func(string) (int, string) { return http.StatusOK, helperAllDisabledCodeAssistFixture }, helperUserinfoAda)
+
+	helperRunDirectAgy(t, f)
+	helperDrainAntigravityRefreshSchedule(t)
+	snap := helperAwaitPaidRefresh(t, f.cache, f.stale)
+	if len(snap.Buckets) != 0 || len(snap.DisabledBuckets) != 2 {
+		t.Fatalf("snap=%+v, want a reading of two disabled buckets", snap)
+	}
+	if state := helperFreshnessState(t); state.RunFloorMs != 0 || state.RefreshOwedAtMs != 0 {
+		t.Errorf("state=%+v, want the run floor settled", state)
+	}
+	usage := helperGather(t, f.home)
+	if len(usage.Metrics) != 2 {
+		t.Fatalf("metrics=%+v, want the two placeholders", usage.Metrics)
+	}
+	for i, want := range []string{"5-hour session window", "Weekly quota"} {
+		if m := usage.Metrics[i]; m.Label != want || !m.Unknown || m.Consumed != nil {
+			t.Errorf("metric %d = %+v, want the Unknown %q placeholder", i, m, want)
+		}
+	}
+}

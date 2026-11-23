@@ -223,20 +223,24 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		//
 		// A gated build is also nudged by AGE: nothing else reads Google
 		// between its runs, so a reading older than
-		// antigravityGatedReadingMaxAge owes one read too.
+		// antigravityGatedReadingMaxAge owes one read too. And any build
+		// replaying a reading an older schema wrote owes one read, so a bucket
+		// that schema charted though Google disabled it stops being replayed.
 		observedMs := antigravitySnapshotObservedMs(snap)
 		floor := owed
 		if gatedBuild {
 			floor = antigravityAgedReadingFloor(now, observedMs, owed)
 		}
+		floor = antigravityOutdatedSchemaFloor(now, snap, floor)
 		nudgeAntigravityUsageRefreshFloor(now, observedMs, floor)
 	}
 
 	usage.Metrics = antigravityQuotaMetrics(snap, now)
 	if len(usage.Metrics) == 0 {
 		// Never observed on this machine (no session since install, or a plan
-		// with no metered pool). Keep placeholder rows so the agent still shows
-		// up as "limits exist, values unobservable".
+		// with no metered pool), or every bucket the reading holds is disabled.
+		// Keep placeholder rows so the agent still shows up as "limits exist,
+		// values unobservable".
 		usage.Metrics = []cliAgentUsageMetric{
 			{Kind: limitKindSession, Label: "5-hour session window", Unit: "%", Unknown: true},
 			{Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%", Unknown: true},

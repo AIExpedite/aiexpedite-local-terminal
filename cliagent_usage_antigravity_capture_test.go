@@ -491,7 +491,10 @@ func TestAntigravityQuotaCapture_PersistsOnlyTheAllowlistedFields(t *testing.T) 
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
 	reply := strings.TrimSuffix(helperQuotaJSON, "]}}") + `,
 	  {"displayName":"Gemini 4 Argon","buckets":[
-	    {"bucketId":"gemini-argon-wtu-weekly","displayName":"Gemini 4 Argon Weekly Limit","window":"weekly","resetTime":"2126-08-19T01:11:09Z"}]}]}}`
+	    {"bucketId":"gemini-argon-wtu-weekly","displayName":"Gemini 4 Argon Weekly Limit","window":"weekly","resetTime":"2126-08-19T01:11:09Z"}]},
+	  {"displayName":"Gemini 4 Carbon","buckets":[
+	    {"bucketId":"gemini-carbon-weekly","displayName":"Gemini 4 Carbon Weekly Limit","window":"weekly","disabled":true,
+	     "remainingFraction":0.123456,"remainingAmount":"424242","description":"disabled-description-sentinel","resetTime":"2126-08-19T01:11:09Z"}]}]}}`
 	server := helperStartCaptureServer(t, base, reply, helperStatusJSON)
 	// A settings file whose contents must never reach the cache.
 	helperWriteJSON(t, filepath.Join(base, "settings.json"), map[string]any{
@@ -510,7 +513,8 @@ func TestAntigravityQuotaCapture_PersistsOnlyTheAllowlistedFields(t *testing.T) 
 		t.Fatalf("read cache: %v", err)
 	}
 	for _, forbidden := range []string{server.port, "sk-super-secret", "mcpServers", "ws-123",
-		"previous-login@example.com", "listening on random port"} {
+		"previous-login@example.com", "listening on random port",
+		"0.123456", "424242", "disabled-description-sentinel", "remainingAmount", "description"} {
 		if strings.Contains(string(raw), forbidden) {
 			t.Errorf("persisted cache leaked %q:\n%s", forbidden, raw)
 		}
@@ -522,7 +526,7 @@ func TestAntigravityQuotaCapture_PersistsOnlyTheAllowlistedFields(t *testing.T) 
 	}
 	allowedTop := map[string]bool{
 		"schemaVersion": true, "observedAt": true, "observedAtMs": true, "accountFingerprint": true,
-		"account": true, "plan": true, "buckets": true, "unobservedBuckets": true,
+		"account": true, "plan": true, "buckets": true, "unobservedBuckets": true, "disabledBuckets": true,
 	}
 	for key := range decoded {
 		if !allowedTop[key] {
@@ -533,7 +537,7 @@ func TestAntigravityQuotaCapture_PersistsOnlyTheAllowlistedFields(t *testing.T) 
 		"bucketId": true, "group": true, "displayName": true,
 		"window": true, "remainingFraction": true, "resetTime": true,
 	}
-	for _, list := range []string{"buckets", "unobservedBuckets"} {
+	for _, list := range []string{"buckets", "unobservedBuckets", "disabledBuckets"} {
 		var buckets []map[string]json.RawMessage
 		if err := json.Unmarshal(decoded[list], &buckets); err != nil || len(buckets) == 0 {
 			t.Fatalf("%s are not a non-empty list of objects: %v", list, err)
@@ -544,9 +548,9 @@ func TestAntigravityQuotaCapture_PersistsOnlyTheAllowlistedFields(t *testing.T) 
 					t.Errorf("unexpected persisted %s field %q", list, key)
 				}
 			}
-			// A bucket the reply named without a fraction never carries one.
-			if _, charted := bucket["remainingFraction"]; list == "unobservedBuckets" && charted {
-				t.Errorf("an unobserved bucket persisted a fraction: %v", bucket)
+			// A bucket that is never charted never carries a fraction.
+			if _, charted := bucket["remainingFraction"]; list != "buckets" && charted {
+				t.Errorf("a %s entry persisted a fraction: %v", list, bucket)
 			}
 		}
 	}
@@ -1394,5 +1398,31 @@ func TestAntigravityCaptureFinishDoesNotBlockOnAHeldNoteLock(t *testing.T) {
 	<-holdersDone
 	if !capture.waitReleased(10 * time.Second) {
 		t.Fatal("the release never completed after the locks were given up")
+	}
+}
+
+// The run-scoped poller reads a reply in which Google disabled the weekly
+// bucket: the cache records it as disabled, and the gather that follows
+// publishes only the enabled 5h row.
+func TestAntigravityQuotaCapture_SuppressesADisabledBucket(t *testing.T) {
+	home, cache := helperIsolateAntigravityCapture(t, "20ms")
+	const reply = `{"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+    {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0,"disabled":true,"resetTime":"2126-08-14T14:17:13Z"},
+    {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.9,"resetTime":"2126-08-12T04:37:41Z"}]}]}}`
+	helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"), reply, helperStatusJSON)
+
+	finish := startAntigravityQuotaCapture("disabled run").Finish
+	snap := helperAwaitSnapshot(t, cache, time.Time{}, "a capture holding a disabled bucket")
+	helperStopCapture(t, finish)
+
+	if len(snap.Buckets) != 1 || snap.Buckets[0].BucketID != "gemini-5h" {
+		t.Errorf("buckets=%+v, want only the enabled 5h bucket", snap.Buckets)
+	}
+	if len(snap.DisabledBuckets) != 1 || snap.DisabledBuckets[0].BucketID != "gemini-weekly" {
+		t.Errorf("disabled=%+v, want the weekly bucket", snap.DisabledBuckets)
+	}
+	metrics := antigravityQuotaMetrics(snap, time.Now())
+	if len(metrics) != 1 || metrics[0].Label != "Gemini — 5-hour session window" {
+		t.Errorf("rows=%+v, want only the 5h row", metrics)
 	}
 }

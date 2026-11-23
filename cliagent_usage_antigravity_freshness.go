@@ -1457,9 +1457,10 @@ func antigravityDebtAccountAnswers(id antigravityDebtID, account string) bool {
 
 // The route that raised a debt generation, for its close-out line only:
 // antigravityUsageRunSettled (a managed run's completion), the nudge (a run the
-// log index found, or a gated build's reading that aged past
-// antigravityGatedReadingMaxAge) or the startup replay. In memory only, the same leaf-lock
-// shape as antigravityDebtAccount; a generation nobody noted (a restart) reports
+// log index found; aged: a gated build's reading that aged past
+// antigravityGatedReadingMaxAge, or a reading an older quota schema wrote) or
+// the startup replay. In memory only, the same leaf-lock shape as
+// antigravityDebtAccount; a generation nobody noted (a restart) reports
 // adopted.
 const (
 	antigravityDebtRouteSettle  = "settle"

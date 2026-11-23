@@ -92,6 +92,27 @@ func antigravityAgedReadingFloor(now time.Time, observedMs int64, owed antigravi
 	return antigravityOwedFloor{At: now, Proven: true, Aged: true}
 }
 
+// antigravityOutdatedSchemaFloor is the floor a gather replaying a cached
+// reading hands the nudge when that reading was written under an older
+// antigravityQuotaSchemaVersion: version 1 charted a bucket Google marked
+// disabled as live capacity, and nothing in the cached figure says which. An
+// observed reading from an older schema gets an aged floor at now, which the
+// next reading — written under this version — satisfies; owed wins when it is
+// a floor the reading does not cover yet (a run, or a gated build's aged
+// floor). Bounded by the ordinary nudge: its cooldown, the minimum read
+// interval, the retry ladder, the attempt limit and the debt's age-out, and an
+// aged floor never replaces a terminal debt.
+func antigravityOutdatedSchemaFloor(now time.Time, snap antigravityQuotaSnapshot, owed antigravityOwedFloor) antigravityOwedFloor {
+	observedMs := antigravitySnapshotObservedMs(snap)
+	if !owed.At.IsZero() && (observedMs == 0 || owed.At.UnixMilli() > observedMs) {
+		return owed
+	}
+	if observedMs <= 0 || !snap.isObservation() || snap.SchemaVersion >= antigravityQuotaSchemaVersion {
+		return owed
+	}
+	return antigravityOwedFloor{At: now, Proven: true, Aged: true, Outdated: true}
+}
+
 // antigravityRunDebtRetryTimer is the single pending retry. gen invalidates a
 // timer that was replaced or stopped after it had already fired but before its
 // callback took the lock.
@@ -425,7 +446,10 @@ func nudgeAntigravityUsageRefreshFloor(now time.Time, observedMs int64, owed ant
 		return false
 	}
 	n.lastAt = now
-	if created && owed.Aged {
+	if created && owed.Outdated {
+		fmt.Printf("%s[antigravity-freshness] The cached reading predates quota schema %d; refresh owed%s\n",
+			colorCyan, antigravityQuotaSchemaVersion, colorReset)
+	} else if created && owed.Aged {
 		fmt.Printf("%s[antigravity-freshness] The cached reading of a gated build is older than %s (age=%s); refresh owed%s\n",
 			colorCyan, antigravityGatedReadingMaxAge, antigravityBehindBy(observedMs, owedLog), colorReset)
 	} else if created {
