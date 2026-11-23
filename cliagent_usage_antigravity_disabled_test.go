@@ -114,14 +114,8 @@ func TestAntigravitySnapshotFromGroups_EnabledExhaustedBucketIsStillARow(t *test
 			if !ok || len(snap.DisabledBuckets) != 0 {
 				t.Fatalf("ok=%v disabled=%+v, want an observation with nothing disabled", ok, snap.DisabledBuckets)
 			}
-			var argon *cliAgentUsageMetric
-			metrics := antigravityQuotaMetrics(snap, time.Now())
-			for i := range metrics {
-				if metrics[i].Label == helperArgonWeeklyLabel {
-					argon = &metrics[i]
-				}
-			}
-			if argon == nil || argon.Consumed == nil || *argon.Consumed != 100 || argon.Model != "gemini-4-argon" {
+			argon := helperMetricLabeled(t, antigravityQuotaMetrics(snap, time.Now()), helperArgonWeeklyLabel)
+			if argon.Consumed == nil || *argon.Consumed != 100 || argon.Model != "gemini-4-argon" {
 				t.Fatalf("Argon row=%+v, want 100%% consumed and gemini-4-argon's", argon)
 			}
 		})
