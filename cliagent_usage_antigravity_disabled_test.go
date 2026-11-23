@@ -50,6 +50,17 @@ func helperHasLabel(metrics []cliAgentUsageMetric, label string) bool {
 
 const helperArgonWeeklyLabel = "Gemini 4 Argon — Weekly quota"
 
+// helperDisabledArgonReply is helperArgonReply with the Argon bucket disabled.
+func helperDisabledArgonReply(t *testing.T) string {
+	t.Helper()
+	disabled := strings.Replace(helperArgonReply,
+		`"window":"weekly","remainingFraction":0,`, `"window":"weekly","remainingFraction":0,"disabled":true,`, 1)
+	if disabled == helperArgonReply {
+		t.Fatal("fixture: the Argon bucket was not marked disabled")
+	}
+	return disabled
+}
+
 // A disabled bucket never becomes a row — not with a literal fraction, not with
 // an omitted one that exhaustion evidence names — and it is recorded by
 // identity, never charted or kept unobserved.
@@ -245,11 +256,7 @@ func TestSanitizeAntigravityQuotaSnapshot_DisabledBucketsPrecedeUnobserved(t *te
 // unpooled; the remaining rows still sign. Enabled and spent, the same group
 // still pools its model.
 func TestAnnotateModelPoolsFromUsage_DisabledArgonLeavesTheModelUnpooled(t *testing.T) {
-	disabled := strings.Replace(helperArgonReply,
-		`"window":"weekly","remainingFraction":0,`, `"window":"weekly","remainingFraction":0,"disabled":true,`, 1)
-	if disabled == helperArgonReply {
-		t.Fatal("fixture: the Argon bucket was not marked disabled")
-	}
+	disabled := helperDisabledArgonReply(t)
 	snap, _, ok := antigravitySnapshotFromGroups(helperGroupsJSON(t, disabled), helperArgonObservedAt, nil)
 	if !ok {
 		t.Fatal("want an observation")
@@ -288,8 +295,7 @@ func TestAnnotateModelPoolsFromUsage_DisabledArgonLeavesTheModelUnpooled(t *test
 func TestAntigravityQuotaCache_OlderAgentNeverChartsADisabledBucket(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "agyq.json")
 	helperIsolateAntigravityQuotaState(t, cache)
-	disabled := strings.Replace(helperArgonReply,
-		`"window":"weekly","remainingFraction":0,`, `"window":"weekly","remainingFraction":0,"disabled":true,`, 1)
+	disabled := helperDisabledArgonReply(t)
 	snap, _, _ := antigravitySnapshotFromGroups(helperGroupsJSON(t, disabled), helperArgonObservedAt, nil)
 	snap.Account = "ada@example.com"
 	snap.AccountFingerprint = fingerprintAccount("antigravity", snap.Account)
