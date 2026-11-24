@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Every destination maps to exactly one fixed argv, and no argv ever carries a
@@ -153,7 +155,7 @@ func TestSetupOpenerOutcomes(t *testing.T) {
 	o := &browserSetupOpener{
 		goos:       "windows",
 		findChrome: func(context.Context) string { return `C:\Program Files\Google\Chrome\Application\chrome.exe` },
-		start:      func(argv []string) error { started = append(started, argv); return nil },
+		start:      func(_ context.Context, argv []string) error { started = append(started, argv); return nil },
 	}
 	res, berr := o.open(context.Background(), browserSetupChromeRemoteDebugging)
 	if berr != nil || res["outcome"] != browserSetupOutcomeOpened || len(started) != 1 || started[0][1] != setupChromeRemoteDebuggingAddress {
@@ -165,7 +167,7 @@ func TestSetupOpenerOutcomes(t *testing.T) {
 		t.Fatalf("not installed: %v %v", res, berr)
 	}
 	o.findChrome = func(context.Context) string { return "chrome.exe" }
-	o.start = func([]string) error { return errors.New("exec failed") }
+	o.start = func(context.Context, []string) error { return errors.New("exec failed") }
 	if _, berr = o.open(context.Background(), browserSetupChromeRemoteDebugging); berr == nil || !strings.Contains(berr.Message, "exec failed") {
 		t.Fatalf("launch failure: %v", berr)
 	}
@@ -235,5 +237,43 @@ func TestBrowserDispatcherOpenSetup(t *testing.T) {
 	}
 	if !reflect.DeepEqual(dests, []string{"chromeRemoteDebugging", "macosAutomation"}) {
 		t.Fatalf("setup ran for %v", dests)
+	}
+}
+
+// startAndWatch re-runs this test binary as the launched process: an early
+// non-zero exit is an error carrying stderr, an early clean exit (Chrome handing
+// off to its running instance) and a process still running past the grace
+// window (a fresh Chrome) are both "opened".
+func TestStartAndWatchReportsEarlyFailures(t *testing.T) {
+	if mode := os.Getenv("AIX_SETUP_LAUNCH_HELPER"); mode != "" {
+		switch mode {
+		case "fail":
+			fmt.Fprint(os.Stderr, "profile is locked")
+			os.Exit(21)
+		case "ok":
+			os.Exit(0)
+		case "linger":
+			time.Sleep(time.Second)
+			os.Exit(0)
+		}
+	}
+	run := func(mode string, grace time.Duration) error {
+		t.Setenv("AIX_SETUP_LAUNCH_HELPER", mode)
+		return startAndWatch(context.Background(), []string{os.Args[0], "-test.run=^TestStartAndWatchReportsEarlyFailures$"}, grace)
+	}
+	if err := run("fail", 10*time.Second); err == nil || !strings.Contains(err.Error(), "profile is locked") || !strings.Contains(err.Error(), "21") {
+		t.Fatalf("early failure: %v", err)
+	}
+	if err := run("ok", 10*time.Second); err != nil {
+		t.Fatalf("clean hand-off: %v", err)
+	}
+	began := time.Now()
+	if err := run("linger", 200*time.Millisecond); err != nil || time.Since(began) > 900*time.Millisecond {
+		t.Fatalf("still running: %v after %v", err, time.Since(began))
+	}
+	// Let the lingering helper exit: Windows cannot delete a running test binary.
+	time.Sleep(time.Second)
+	if err := startAndWatch(context.Background(), []string{"aix-no-such-binary-xyz"}, time.Second); err == nil {
+		t.Fatal("missing binary accepted")
 	}
 }

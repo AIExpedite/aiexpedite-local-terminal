@@ -29,6 +29,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
 )
 
 // BROWSER_SETUP_DESTINATIONS (shared-constants browserControl.js).
@@ -146,7 +148,7 @@ func resolveChromeExecutable(ctx context.Context, goos string, candidates []stri
 type browserSetupOpener struct {
 	goos       string
 	findChrome func(ctx context.Context) string
-	start      func(argv []string) error
+	start      func(ctx context.Context, argv []string) error
 }
 
 func newBrowserSetupOpener() *browserSetupOpener {
@@ -157,19 +159,81 @@ func newBrowserSetupOpener() *browserSetupOpener {
 				chromeExecutableCandidates(runtime.GOOS, os.Getenv, exec.LookPath, filepath.EvalSymlinks),
 				fileExists, verifyChromeExecutable)
 		},
-		start: startDetached,
+		start: func(ctx context.Context, argv []string) error {
+			return startAndWatch(ctx, argv, setupLaunchGrace)
+		},
 	}
 }
 
-// startDetached starts argv with no shell, no extra arguments and the agent's
-// own environment, and reaps it in the background.
-func startDetached(argv []string) error {
+const (
+	// setupLaunchGrace is how long a launch is watched for an early failure.
+	// A Chrome handing the address to its running instance, and macOS `open`,
+	// exit within it; a Chrome that starts fresh keeps running past it.
+	setupLaunchGrace = 3 * time.Second
+	// setupLaunchStderrMax bounds the stderr kept for the failure reason.
+	setupLaunchStderrMax = 4 << 10
+)
+
+// startAndWatch starts argv with no shell, no extra arguments and the agent's
+// own environment, then watches it for `grace`:
+//
+//   - it exits non-zero (a locked profile, `open` refusing the pane): the
+//     exit status and the start of its stderr come back as the error, so the
+//     setup result never says "opened" for a launch that failed;
+//   - it exits zero (Chrome handed the address to its running instance;
+//     `open` launched the pane): nil;
+//   - it is still running when `grace` (or ctx) ends (a Chrome that started
+//     fresh): nil, and it is reaped in the background.
+//
+// Stderr is drained into a bounded buffer for as long as the process lives, so
+// a chatty Chrome never blocks on a full pipe. WaitDelay stops Wait from
+// hanging on a pipe a grandchild inherited once the launcher itself exited.
+func startAndWatch(ctx context.Context, argv []string, grace time.Duration) error {
 	cmd := exec.Command(argv[0], argv[1:]...)
+	stderr := &lockedBoundedBuffer{b: boundedBuffer{limit: setupLaunchStderrMax}}
+	cmd.Stderr = stderr
+	cmd.WaitDelay = 500 * time.Millisecond
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	go func() { _ = cmd.Wait() }()
-	return nil
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err == nil {
+			return nil
+		}
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("%v: %s", err, msg)
+		}
+		return err
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+// lockedBoundedBuffer keeps the first b.limit bytes and discards the rest while
+// still reporting a full write (see boundedBuffer), safe for the os/exec copy
+// goroutine and a concurrent reader.
+type lockedBoundedBuffer struct {
+	mu sync.Mutex
+	b  boundedBuffer
+}
+
+func (l *lockedBoundedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBoundedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return string(l.b.Bytes())
 }
 
 // open runs the destination's fixed action. The result is `{outcome}`.
@@ -188,7 +252,7 @@ func (o *browserSetupOpener) open(ctx context.Context, destination string) (map[
 	if berr != nil {
 		return nil, berr
 	}
-	if err := o.start(argv); err != nil {
+	if err := o.start(ctx, argv); err != nil {
 		return nil, browserErr(browserErrChromeNotReachable, "the setup page could not be opened: %s", trimErr(err))
 	}
 	return map[string]any{"outcome": browserSetupOutcomeOpened}, nil
