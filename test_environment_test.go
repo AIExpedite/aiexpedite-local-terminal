@@ -225,9 +225,12 @@ func captureStdoutStderr(t *testing.T, fn func()) string {
 }
 
 // captureProcessOutput points every stream in streams at one pipe while fn
-// runs, then restores them and returns what was written. The restore is
-// deferred so a fn that calls t.Fatal cannot leave the process writing into a
-// closed pipe.
+// runs, then restores them and returns what was written.
+//
+// The cleanup is also deferred, for a fn that exits early through t.Fatal:
+// the streams are put back so later tests do not write into this pipe, and both
+// ends are closed so neither the descriptors nor the reader goroutine leak.
+// A second Close on the normal path is harmless.
 func captureProcessOutput(t *testing.T, fn func(), streams ...**os.File) string {
 	t.Helper()
 	reader, writer, err := os.Pipe()
@@ -243,7 +246,11 @@ func captureProcessOutput(t *testing.T, fn func(), streams ...**os.File) string 
 			*s = originals[i]
 		}
 	}
-	defer restore()
+	defer func() {
+		restore()
+		_ = writer.Close()
+		_ = reader.Close()
+	}()
 
 	done := make(chan string, 1)
 	go func() {
