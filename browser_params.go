@@ -42,6 +42,9 @@ type browserParams struct {
 	// AppOrigin (current): the AI Expedite app's own origin; its tabs are
 	// never "this page".
 	AppOrigin string `json:"appOrigin,omitempty"`
+	// Destination (openSetup): a setup destination CODE from the compiled-in
+	// allowlist (browser_setup_open.go). Never a URL.
+	Destination string `json:"destination,omitempty"`
 }
 
 // browserError is a failure reported to the cloud: a BROWSER_* code and a
@@ -124,6 +127,13 @@ func validateBrowserParams(p *browserParams) *browserError {
 	}
 	switch p.Op {
 	case browserOpTabs, browserOpStop:
+		return nil
+	case browserOpOpenSetup:
+		if !isBrowserSetupDestination(p.Destination) {
+			return browserErr(browserErrCommandInvalid, "unknown setup destination")
+		}
+		// Every other field is ignored: a URL is never read for a setup open.
+		*p = browserParams{V: p.V, CommandID: p.CommandID, Op: p.Op, DeadlineMs: p.DeadlineMs, Destination: p.Destination}
 		return nil
 	case browserOpCurrent:
 		// A malformed origin is dropped, not refused: the op still runs.
