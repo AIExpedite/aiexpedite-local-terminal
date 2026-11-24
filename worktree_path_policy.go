@@ -361,13 +361,81 @@ const worktreeParentWalkMaxDepth = 64
 // working tree, so nobody sets a working directory inside one, and a second
 // heuristic (HEAD + objects + refs) would start refusing directories that
 // merely resemble one.
+//
+// The walk is bounded by worktreeParentWalkCeiling, which is empty — and so
+// bounds nothing — in production.
 func enclosingRepositoryOf(dir string) string {
+	return enclosingRepositoryWithin(dir, worktreeParentWalkCeiling)
+}
+
+// worktreeParentWalkCeiling stops the walk up from a root once it leaves this
+// directory. EMPTY IN PRODUCTION, and set only by TestMain (to the suite's
+// sandbox), so a `.git` that encloses the sandbox — a coding agent's temp
+// folder inside its own worktree, a home folder that is a dotfiles repository —
+// cannot turn every test into a parent_inside_repository refusal. It bounds
+// pathHasWorktreeRootSegment the same way, for an `aixwt` folder above the
+// sandbox.
+//
+// Deliberately NOT read from GIT_CEILING_DIRECTORIES. The rule protects the
+// owner's data from their own later `git clean -fdx`, which runs in THEIR shell,
+// not in the agent's environment; an inherited variable must not be able to
+// switch that protection off.
+var worktreeParentWalkCeiling string
+
+// pathHasWorktreeRootSegment reports whether any component of p is an `aixwt`
+// directory, i.e. whether p is (inside) a worktree rather than a root checkout.
+//
+// Under the same test-only ceiling as the parent walk, the components p SHARES
+// with the ceiling do not count: they belong to the host the suite runs on.
+// A coding agent's own worktree lives under an `aixwt` folder, so a suite whose
+// TEMP sits inside it would otherwise see every fixture repository as a
+// worktree. Production leaves the ceiling empty, so every component counts
+// there.
+func pathHasWorktreeRootSegment(p string) bool {
+	p = filepath.Clean(p)
+	if ceiling := strings.TrimSpace(worktreeParentWalkCeiling); ceiling != "" {
+		shared := filepath.Clean(ceiling)
+		for i := 0; i < worktreeParentWalkMaxDepth && !isPathWithin(shared, p); i++ {
+			parent := filepath.Dir(shared)
+			if parent == shared {
+				break
+			}
+			shared = parent
+		}
+		if isPathWithin(shared, p) {
+			if rel, err := filepath.Rel(shared, p); err == nil {
+				p = rel
+			}
+		}
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+		if strings.EqualFold(seg, worktreeRootSegment) {
+			return true
+		}
+	}
+	return false
+}
+
+// enclosingRepositoryWithin is enclosingRepositoryOf with an explicit ceiling.
+// A walk is bounded only when it STARTS within its ceiling: it then stops as
+// soon as it leaves it, before lstat-ing anything above. A walk that starts
+// outside its ceiling, or has none, goes to the volume root as before (capped by
+// worktreeParentWalkMaxDepth).
+func enclosingRepositoryWithin(dir, ceiling string) string {
 	cur := strings.TrimSpace(dir)
 	if cur == "" {
 		return ""
 	}
 	cur = filepath.Clean(cur)
+	bounded := false
+	if ceiling = strings.TrimSpace(ceiling); ceiling != "" {
+		ceiling = filepath.Clean(ceiling)
+		bounded = isPathWithin(ceiling, cur)
+	}
 	for i := 0; i < worktreeParentWalkMaxDepth; i++ {
+		if bounded && !isPathWithin(ceiling, cur) {
+			return ""
+		}
 		if _, err := os.Lstat(filepath.Join(cur, ".git")); err == nil {
 			return cur
 		}
@@ -447,7 +515,10 @@ const worktreeLinkHops = 8
 // which is the obvious thing to do and is exactly who this rule is for.
 //
 // The remedy is in the message, because the owner is the only one who can
-// apply it: the setting is theirs.
+// apply it: the setting is theirs. THE PATHS ARE NOT: the refusal travels to
+// the server as command output, so the root and the enclosing checkout go only
+// to the local agent.log (logLocalOnly). The owner already knows which Default
+// working directory they set.
 func assertWorktreeParentOutsideRepository(root string) error {
 	// BOTH SPELLINGS OF THE ROOT ARE CHECKED, because they fail in two different
 	// ways and the policy deliberately ALLOWS an aliased root (see
@@ -461,18 +532,43 @@ func assertWorktreeParentOutsideRepository(root string) error {
 	//     `.git` above `/work/alias`, yet the directories physically land inside
 	//     `/repos/project`, where that same `git clean` deletes the files
 	//     themselves. A lexical walk alone misses this entirely. (Codex P2, #263.)
-	repo := enclosingRepositoryOf(root)
+	ceiling := worktreeParentWalkCeiling
+	repo := enclosingRepositoryWithin(root, ceiling)
 	if repo == "" {
 		if resolved := resolveWorktreeRootLinks(root); resolved != filepath.Clean(root) {
-			repo = enclosingRepositoryOf(resolved)
+			repo = enclosingRepositoryWithin(resolved, resolvedWalkCeiling(resolved, ceiling))
 		}
 	}
 	if repo == "" {
 		return nil
 	}
-	return policyRefusal(ruleParentInsideRepository, fmt.Sprintf(
-		"the worktree root %q is inside the git checkout at %q, so worktrees would be created inside that repository's working tree — where `git clean -fdx` deletes them and `git status` reports them as its own. Point the Default working directory at a folder ABOVE your checkouts.",
-		root, repo))
+	logLocalOnly("[worktree] path policy %s: the worktree root %q is inside the git checkout at %q",
+		ruleParentInsideRepository, root, repo)
+	return policyRefusal(ruleParentInsideRepository, parentInsideRepositoryRemedy)
+}
+
+// resolvedWalkCeiling is the ceiling for the walk over a root's RESOLVED
+// spelling: the ceiling itself when the resolved root is still within it,
+// otherwise the ceiling's own resolved spelling — the case where the ceiling is
+// itself reached through a junction. Empty stays empty (production).
+func resolvedWalkCeiling(resolvedRoot, ceiling string) string {
+	if ceiling == "" || isPathWithin(ceiling, resolvedRoot) {
+		return ceiling
+	}
+	return resolveWorktreeRootLinks(ceiling)
+}
+
+// parentInsideRepositoryRemedy is the whole server-bound text of a
+// parent_inside_repository refusal: the rule's consequence and the remedy, and
+// never a path (see assertWorktreeParentOutsideRepository).
+const parentInsideRepositoryRemedy = "the worktree root is inside a git checkout, so worktrees would be created inside that repository's working tree — where `git clean -fdx` deletes them and `git status` reports them as its own. Point the Default working directory at a folder ABOVE your checkouts."
+
+// parentInsideRepositoryNote is the note ensureWorktree attaches when it REUSES
+// an existing worktree under such a root. Path-free for the same reason as the
+// refusal.
+func parentInsideRepositoryNote() string {
+	return ruleParentInsideRepository +
+		": reused; no new worktree will be created under this root, because " + parentInsideRepositoryRemedy
 }
 
 // isWorktreeLink reports whether an lstat'd path is a symlink or, on Windows, a

@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -169,4 +171,92 @@ func TestLogTeeConsoleSwap(t *testing.T) {
 	if setLogTeeConsole(c1, c1) {
 		t.Fatal("setLogTeeConsole returned true while the tee is inactive")
 	}
+}
+
+// logLocalOnly is the one writer for diagnostics that must never leave the
+// computer: it lands in agent.log and NOT on the console mirror, which in a
+// terminal-managed run is published back to the server as command output.
+func TestLogLocalOnlyWritesTheFileAndNeverTheConsole(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "logs", logFileName)
+	rw, err := newRotatingWriter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rw.f.Close() })
+
+	consoleR, consoleW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consoleR.Close()
+
+	prevOut, prevErr := teeOutConsole.Load(), teeErrConsole.Load()
+	teeOutConsole.Store(consoleW)
+	teeErrConsole.Store(consoleW)
+	teeFile.Store(rw)
+	teeActive.Store(true)
+	t.Cleanup(func() {
+		teeActive.Store(false)
+		teeFile.Store(nil)
+		teeOutConsole.Store(prevOut)
+		teeErrConsole.Store(prevErr)
+	})
+
+	const secret = `C:\Users\someone\checkouts\private-repo`
+	logLocalOnly("root %q is inside %q", secret, secret)
+	_ = consoleW.Close()
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b); !strings.Contains(got, "private-repo") || !strings.HasSuffix(got, "\n") || strings.Count(got, "\n") != 1 {
+		t.Fatalf("agent.log = %q, want exactly one line naming the path", got)
+	}
+	console, _ := io.ReadAll(consoleR)
+	if len(console) != 0 {
+		t.Fatalf("logLocalOnly reached the console: %q", console)
+	}
+}
+
+// With no tee (go test, or file logging disabled) logLocalOnly is a silent no-op.
+func TestLogLocalOnlyIsANoOpWithoutATee(t *testing.T) {
+	prev := teeFile.Load()
+	teeFile.Store(nil)
+	t.Cleanup(func() { teeFile.Store(prev) })
+
+	out := captureStdoutStderr(t, func() {
+		logLocalOnly("nothing should be written: %s", "x")
+	})
+	if out != "" {
+		t.Fatalf("logLocalOnly wrote %q with the tee inactive", out)
+	}
+}
+
+// captureStdoutStderr redirects BOTH os.Stdout and os.Stderr for the duration
+// of fn and returns everything written to either: what a terminal-managed run
+// would publish as command output.
+func captureStdoutStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origOut, origErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = writer, writer
+	defer func() { os.Stdout, os.Stderr = origOut, origErr }()
+
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(reader)
+		done <- string(b)
+	}()
+
+	fn()
+
+	os.Stdout, os.Stderr = origOut, origErr
+	_ = writer.Close()
+	captured := <-done
+	_ = reader.Close()
+	return captured
 }

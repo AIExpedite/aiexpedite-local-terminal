@@ -52,9 +52,22 @@ func makeAbsDirLink(t *testing.T, link, target string) {
 
 // tempRootDir returns a resolved temp directory, so containment comparisons
 // compare like with like (macOS hands out /var -> /private/var).
+//
+// SHORT ON PURPOSE, not t.TempDir(): t.TempDir() adds the test's name (up to
+// 64 characters) to every path, and git on Windows cannot write objects past
+// MAX_PATH whatever core.longpaths says — measured on 2.49, a push into a bare
+// repository fails in its quarantine directory, and a direct object write
+// fails too. A terminal-managed run already starts deep (its TEMP is inside
+// the coding agent's worktree), so the fixtures must not spend 64 characters
+// on a name. The directory is still under the sandbox's TEMP, which TestMain
+// removes as a whole.
 func tempRootDir(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir, err := os.MkdirTemp("", "wt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
 		dir = resolved
 	}

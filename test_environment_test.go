@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -135,13 +136,52 @@ func sandboxTestConfigDir() func() {
 	setEnvOrDie("TEMP", tempDir)
 	setEnvOrDie("TMP", tempDir)
 
+	fenceSandboxFromEnclosingRepositories(dir)
+
 	baseDir = resolveBaseDir(runtime.GOOS, EnvConfigSuffix, dir, appData, xdgConfigHome)
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "sandboxTestConfigDir: cannot create %s: %v\n", baseDir, err)
 		os.Exit(1)
 	}
 
-	return func() { _ = os.RemoveAll(dir) }
+	return func() {
+		worktreeParentWalkCeiling = ""
+		_ = os.RemoveAll(dir)
+	}
+}
+
+// fenceSandboxFromEnclosingRepositories makes the suite independent of WHERE
+// the sandbox was created. A terminal-managed run puts TEMP inside the coding
+// agent's own worktree, and a home folder can be a dotfiles repository; either
+// way a `.git` sits above every fixture, and without a fence every
+// __worktree_ensure__ under test is refused as parent_inside_repository.
+//
+// Must run AFTER HOME/USERPROFILE point at the sandbox: the core.longpaths
+// write below is to the SANDBOX's global config, never the developer's.
+func fenceSandboxFromEnclosingRepositories(dir string) {
+	// The Go walk: a `.git` above the sandbox cannot reach a test, and one a
+	// test creates inside it is still found. Production leaves this empty.
+	worktreeParentWalkCeiling = dir
+	// Git's own discovery: a git command run in a non-repository fixture folder
+	// (fx.Base, the control worktrees) cannot find an enclosing repository.
+	setEnvOrDie("GIT_CEILING_DIRECTORIES", dir)
+
+	// Windows only, and required: the fixture's `git push` into remote.git runs
+	// before any worktree exists, so createWorktree's own core.longpaths write
+	// comes too late, and in a deep temp folder the push failed with
+	// "Filename too long". No git on PATH: skipped, and the git fixtures skip
+	// on their own. Git present but the write failing: setup fails, because a
+	// silently missing setting brings the flake back.
+	if runtime.GOOS != "windows" {
+		return
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		return
+	}
+	if out, err := exec.Command("git", "config", "--global", "core.longpaths", "true").CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "sandboxTestConfigDir: cannot set the sandbox's global core.longpaths: %v: %s\n", err, out)
+		os.Exit(1)
+	}
 }
 
 func setEnvOrDie(key, value string) {
