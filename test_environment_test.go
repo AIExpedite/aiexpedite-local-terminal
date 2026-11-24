@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -206,4 +207,55 @@ func setTestOffline(t *testing.T, offline bool) {
 		isOffline = was
 		offlineMutex.Unlock()
 	})
+}
+
+// captureStdout redirects os.Stdout for the duration of fn and returns whatever
+// was written. Used to prove what actually reaches this device's log, rather
+// than trusting the call site to be well-behaved.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	return captureProcessOutput(t, fn, &os.Stdout)
+}
+
+// captureStdoutStderr is captureStdout for BOTH streams: everything a
+// terminal-managed run would publish as command output.
+func captureStdoutStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	return captureProcessOutput(t, fn, &os.Stdout, &os.Stderr)
+}
+
+// captureProcessOutput points every stream in streams at one pipe while fn
+// runs, then restores them and returns what was written. The restore is
+// deferred so a fn that calls t.Fatal cannot leave the process writing into a
+// closed pipe.
+func captureProcessOutput(t *testing.T, fn func(), streams ...**os.File) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originals := make([]*os.File, len(streams))
+	for i, s := range streams {
+		originals[i], *s = *s, writer
+	}
+	restore := func() {
+		for i, s := range streams {
+			*s = originals[i]
+		}
+	}
+	defer restore()
+
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(reader)
+		done <- string(b)
+	}()
+
+	fn()
+
+	restore()
+	_ = writer.Close()
+	captured := <-done
+	_ = reader.Close()
+	return captured
 }

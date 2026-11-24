@@ -194,9 +194,7 @@ func TestLogLocalOnlyWritesTheFileAndNeverTheConsole(t *testing.T) {
 	teeOutConsole.Store(consoleW)
 	teeErrConsole.Store(consoleW)
 	teeFile.Store(rw)
-	teeActive.Store(true)
 	t.Cleanup(func() {
-		teeActive.Store(false)
 		teeFile.Store(nil)
 		teeOutConsole.Store(prevOut)
 		teeErrConsole.Store(prevErr)
@@ -231,32 +229,4 @@ func TestLogLocalOnlyIsANoOpWithoutATee(t *testing.T) {
 	if out != "" {
 		t.Fatalf("logLocalOnly wrote %q with the tee inactive", out)
 	}
-}
-
-// captureStdoutStderr redirects BOTH os.Stdout and os.Stderr for the duration
-// of fn and returns everything written to either: what a terminal-managed run
-// would publish as command output.
-func captureStdoutStderr(t *testing.T, fn func()) string {
-	t.Helper()
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	origOut, origErr := os.Stdout, os.Stderr
-	os.Stdout, os.Stderr = writer, writer
-	defer func() { os.Stdout, os.Stderr = origOut, origErr }()
-
-	done := make(chan string, 1)
-	go func() {
-		b, _ := io.ReadAll(reader)
-		done <- string(b)
-	}()
-
-	fn()
-
-	os.Stdout, os.Stderr = origOut, origErr
-	_ = writer.Close()
-	captured := <-done
-	_ = reader.Close()
-	return captured
 }
