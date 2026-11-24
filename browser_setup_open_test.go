@@ -124,11 +124,11 @@ func TestResolveChromeExecutableVerifies(t *testing.T) {
 	exists := func(string) bool { return true }
 	ctx := context.Background()
 	// The real verifier on the real install paths (non-macOS: name and path).
-	if got := resolveChromeExecutable(ctx, "windows", []string{`C:\Windows\notepad.exe`, `C:\Program Files\Google\Chrome\Application\chrome.exe`}, exists, verifyChromeExecutable); got != `C:\Program Files\Google\Chrome\Application\chrome.exe` {
-		t.Fatalf("windows: %q", got)
+	if got, err := resolveChromeExecutable(ctx, "windows", []string{`C:\Windows\notepad.exe`, `C:\Program Files\Google\Chrome\Application\chrome.exe`}, exists, verifyChromeExecutable); err != nil || got != `C:\Program Files\Google\Chrome\Application\chrome.exe` {
+		t.Fatalf("windows: %q %v", got, err)
 	}
-	if got := resolveChromeExecutable(ctx, "linux", []string{"/usr/bin/chromium", "/opt/google/chrome/chrome"}, exists, verifyChromeExecutable); got != "/opt/google/chrome/chrome" {
-		t.Fatalf("linux: %q", got)
+	if got, err := resolveChromeExecutable(ctx, "linux", []string{"/usr/bin/chromium", "/opt/google/chrome/chrome"}, exists, verifyChromeExecutable); err != nil || got != "/opt/google/chrome/chrome" {
+		t.Fatalf("linux: %q %v", got, err)
 	}
 	// macOS: the code-signature check stubbed to pass for Google's bundle only.
 	macVerify := func(_ context.Context, _ string, exe string) error {
@@ -138,35 +138,37 @@ func TestResolveChromeExecutableVerifies(t *testing.T) {
 		return errors.New("not signed by Google")
 	}
 	mac := "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-	if got := resolveChromeExecutable(ctx, "darwin", []string{"/Applications/Evil.app/Contents/MacOS/chrome", mac}, exists, macVerify); got != mac {
-		t.Fatalf("darwin: %q", got)
+	if got, err := resolveChromeExecutable(ctx, "darwin", []string{"/Applications/Evil.app/Contents/MacOS/chrome", mac}, exists, macVerify); err != nil || got != mac {
+		t.Fatalf("darwin: %q %v", got, err)
 	}
 	// A non-Chrome binary is never chosen; nothing found is "".
-	if got := resolveChromeExecutable(ctx, "linux", []string{"/usr/bin/firefox"}, exists, verifyChromeExecutable); got != "" {
-		t.Fatalf("non-chrome accepted: %q", got)
+	if got, err := resolveChromeExecutable(ctx, "linux", []string{"/usr/bin/firefox"}, exists, verifyChromeExecutable); err != nil || got != "" {
+		t.Fatalf("non-chrome accepted: %q %v", got, err)
 	}
-	if got := resolveChromeExecutable(ctx, "linux", []string{"/opt/google/chrome/chrome"}, func(string) bool { return false }, verifyChromeExecutable); got != "" {
-		t.Fatalf("missing file accepted: %q", got)
+	if got, err := resolveChromeExecutable(ctx, "linux", []string{"/opt/google/chrome/chrome"}, func(string) bool { return false }, verifyChromeExecutable); err != nil || got != "" {
+		t.Fatalf("missing file accepted: %q %v", got, err)
 	}
 }
 
 func TestSetupOpenerOutcomes(t *testing.T) {
 	var started [][]string
 	o := &browserSetupOpener{
-		goos:       "windows",
-		findChrome: func(context.Context) string { return `C:\Program Files\Google\Chrome\Application\chrome.exe` },
-		start:      func(_ context.Context, argv []string) error { started = append(started, argv); return nil },
+		goos: "windows",
+		findChrome: func(context.Context) (string, error) {
+			return `C:\Program Files\Google\Chrome\Application\chrome.exe`, nil
+		},
+		start: func(_ context.Context, argv []string) error { started = append(started, argv); return nil },
 	}
 	res, berr := o.open(context.Background(), browserSetupChromeRemoteDebugging)
 	if berr != nil || res["outcome"] != browserSetupOutcomeOpened || len(started) != 1 || started[0][1] != setupChromeRemoteDebuggingAddress {
 		t.Fatalf("%v %v %v", res, berr, started)
 	}
-	o.findChrome = func(context.Context) string { return "" }
+	o.findChrome = func(context.Context) (string, error) { return "", nil }
 	res, berr = o.open(context.Background(), browserSetupChromeRemoteDebugging)
 	if berr != nil || res["outcome"] != browserSetupOutcomeChromeNotInstalled || len(started) != 1 {
 		t.Fatalf("not installed: %v %v", res, berr)
 	}
-	o.findChrome = func(context.Context) string { return "chrome.exe" }
+	o.findChrome = func(context.Context) (string, error) { return "chrome.exe", nil }
 	o.start = func(context.Context, []string) error { return errors.New("exec failed") }
 	if _, berr = o.open(context.Background(), browserSetupChromeRemoteDebugging); berr == nil || !strings.Contains(berr.Message, "exec failed") {
 		t.Fatalf("launch failure: %v", berr)
