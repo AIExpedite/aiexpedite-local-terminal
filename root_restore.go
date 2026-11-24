@@ -167,11 +167,9 @@ func restoreRootCheckout(ctx context.Context, req rootRestoreRequest) (rootResto
 	}
 	repoPath = filepath.Clean(repoPath)
 	res.RepoPath = repoPath
-	for _, seg := range strings.Split(filepath.ToSlash(repoPath), "/") {
-		if strings.EqualFold(seg, worktreeRootSegment) {
-			return refuseRestore(res, restoreReasonInsideAixwt,
-				fmt.Sprintf("%s is a worktree, not a root checkout", repoPath))
-		}
+	if pathHasWorktreeRootSegment(repoPath) {
+		return refuseRestore(res, restoreReasonInsideAixwt,
+			fmt.Sprintf("%s is a worktree, not a root checkout", repoPath))
 	}
 	if strings.TrimSpace(req.Root) != "" {
 		root := filepath.Clean(strings.TrimSpace(req.Root))

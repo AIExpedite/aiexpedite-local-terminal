@@ -5,8 +5,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // The agent runs as a background tray app with no persisted console, so its
@@ -147,7 +149,26 @@ var (
 	teeOutConsole atomic.Pointer[os.File]
 	teeErrConsole atomic.Pointer[os.File]
 	teeActive     atomic.Bool
+	// teeFile is the rotating agent.log the active tee writes to, published so
+	// logLocalOnly can reach the FILE without going through stdout. nil when
+	// the tee is inactive (setup failed, logging disabled, or under go test).
+	teeFile atomic.Pointer[rotatingWriter]
 )
+
+// logLocalOnly writes one line to agent.log and NOWHERE else — not the console
+// mirror, not stdout, not stderr. It exists for diagnostics that must never
+// leave the computer: in a terminal-managed run the agent's stdout is
+// published back to the server as command output, so anything that names an
+// absolute local path (a user name, a checkout layout) goes here instead of
+// through fmt.Print. A no-op when the tee is inactive.
+func logLocalOnly(format string, args ...any) {
+	rw := teeFile.Load()
+	if rw == nil {
+		return
+	}
+	line := strings.TrimRight(fmt.Sprintf(format, args...), "\r\n")
+	_, _ = fmt.Fprintf(rw, "%s %s\n", time.Now().Format(time.RFC3339), line)
+}
 
 // teeSink writes to the log file and (best-effort) the current console target.
 // It NEVER returns an error, so the io.Copy pump feeding it can never stop
@@ -234,6 +255,7 @@ func setupLogTee() func() {
 
 	closeOut := pump(&os.Stdout, &teeOutConsole)
 	closeErr := pump(&os.Stderr, &teeErrConsole)
+	teeFile.Store(rw)
 	teeActive.Store(true)
 
 	fmt.Printf("[log] mirroring stdout/stderr → %s (rotating, max %d MB × %d files)\n",
@@ -241,6 +263,7 @@ func setupLogTee() func() {
 
 	return func() {
 		teeActive.Store(false)
+		teeFile.Store(nil)
 		os.Stdout, os.Stderr = origOut, origErr
 		closeOut()
 		closeErr()

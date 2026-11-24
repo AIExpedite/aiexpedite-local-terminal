@@ -177,11 +177,9 @@ func resolveMainRepoPath(mainRepo string) (string, error) {
 		return "", policyRefusal(ruleMainRepoNotAbsolute, fmt.Sprintf("main repository %q is not absolute", mainRepo))
 	}
 	mainRepo = filepath.Clean(mainRepo)
-	for _, seg := range strings.Split(filepath.ToSlash(mainRepo), "/") {
-		if strings.EqualFold(seg, worktreeRootSegment) {
-			return "", policyRefusal(ruleMainRepoInsideAixwt,
-				fmt.Sprintf("%q sits inside an %s directory, so it is a worktree and not a main repository", mainRepo, worktreeRootSegment))
-		}
+	if pathHasWorktreeRootSegment(mainRepo) {
+		return "", policyRefusal(ruleMainRepoInsideAixwt,
+			fmt.Sprintf("%q sits inside an %s directory, so it is a worktree and not a main repository", mainRepo, worktreeRootSegment))
 	}
 	if !isGitCheckout(mainRepo) {
 		return "", policyRefusal(ruleMainRepoNotCheckout, fmt.Sprintf("%q is not a git checkout", mainRepo))
@@ -455,7 +453,17 @@ func ensureWorktree(ctx context.Context, req worktreeEnsureRequest) (worktreeEns
 	// anything — the run would fall back to the root checkout, which is the very
 	// sharing worktrees exist to stop, and `__worktree_remove__` has to keep
 	// working so the sweep can still clean the directory up. So the rule stops
-	// the hole growing and the note tells the owner where it already is.
+	// the hole growing and the note tells the owner it is there.
+	//
+	// THE CONTRACT, in full:
+	//   - creating a worktree under such a root is refused, and so is
+	//     RECREATING a registered one whose directory is gone — that would build
+	//     exactly the nested tree the rule exists to stop;
+	//   - the refusal returns BEFORE the stale admin record is cleared, so a
+	//     nested root never loses git's bookkeeping either;
+	//   - a registered worktree that already exists is reused and reported;
+	//   - neither the refusal nor the note carries a path. Both travel to the
+	//     server; the paths go only to the local agent.log.
 	parentErr := assertWorktreeParentOutsideRepository(wt.Root)
 
 	switch {
@@ -497,7 +505,7 @@ func ensureWorktree(ctx context.Context, req worktreeEnsureRequest) (worktreeEns
 	}
 
 	if parentErr != nil {
-		res.Notes = append(res.Notes, parentErr.Error())
+		res.Notes = append(res.Notes, parentInsideRepositoryNote())
 	}
 
 	// Step 4: seeding — ONCE, at creation only.
