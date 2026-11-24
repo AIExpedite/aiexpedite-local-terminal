@@ -1568,14 +1568,11 @@ func TestResetClaudeUsageProbeGate_StopsThePendingRetryRung(t *testing.T) {
 // The drain must be bounded: a probe that never releases the latch cannot be
 // allowed to hang the whole suite in a cleanup.
 //
-// The real deadline is shortened here rather than waited out. CI runs this
-// package under `go test -race -timeout 5m`, and sleeping the production five
-// seconds to assert one boolean is wall-clock the whole suite has to pay for.
-// Saving and restoring the package var is the same seam stubClaudeProbes uses.
+// The real deadline is shortened (pinClaudeDrainTimeout) rather than waited
+// out: sleeping the production five seconds, twice, to assert one boolean is
+// wall-clock the whole suite has to pay for.
 func TestResetClaudeUsageProbeGate_DrainIsBounded(t *testing.T) {
-	originalTimeout := claudeUsageProbeDrainTimeout
-	claudeUsageProbeDrainTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { claudeUsageProbeDrainTimeout = originalTimeout })
+	pinClaudeDrainTimeout(t, 50*time.Millisecond)
 
 	// A latch nothing will ever release — the wedged-probe case. Released in
 	// cleanup, and the gate then reset for real: registered first so it runs

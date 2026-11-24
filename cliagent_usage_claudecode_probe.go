@@ -608,9 +608,9 @@ func SetClaudeUsageProbeDisabled(disabled bool) {
 }
 
 // claudeUsageProbeDrainTimeout bounds resetClaudeUsageProbeGate's wait for an
-// in-flight probe. A var rather than a const so the test that asserts the
-// give-up behaviour can pin it small: CI runs this package under `go test -race
-// -timeout 5m`, where a hard-coded five-second sleep is pure wall-clock spent
+// in-flight probe; an undrained reset waits it once more after cancelling.
+// A var rather than a const so the tests that wedge a probe can pin it small
+// (pinClaudeDrainTimeout) instead of spending ten seconds of suite wall-clock
 // asserting one boolean.
 var claudeUsageProbeDrainTimeout = 5 * time.Second
 
