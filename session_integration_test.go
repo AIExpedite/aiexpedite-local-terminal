@@ -2057,10 +2057,13 @@ func startManagedClaudeSession(t *testing.T, mode string) (*SessionManager, stri
 	}
 	// Registered FIRST, so LIFO cleanup runs it AFTER each test's own
 	// EndSession and BEFORE armClaudeUsageProbe's resetClaudeUsageProbeGate:
-	// end the run, wait for its exit path to finish, then clear the gate.
+	// end the run, wait for its exit path to finish, then require a reset that
+	// drains — removal alone does not prove the post-run trigger's goroutine
+	// (counted in `settling` before it spawns) has finished.
 	t.Cleanup(func() {
 		_ = sm.EndSession(id)
 		waitForManagedSessionDrained(t, sm, id)
+		requireClaudeResetDrained(t)
 	})
 	return sm, id
 }
@@ -2160,13 +2163,7 @@ func TestClaudeNativeLifecycle_RecentPreRunObservationStillAdvances(t *testing.T
 		},
 	}, preRun, "", claudeRateLimitSourceStatusLine)
 
-	tmpDir := installMockClaude(t, "claude-heartbeat-result")
-	m := NewClaudeNativeManager(nil)
-	id := fmt.Sprintf("claude-prerun-%d", time.Now().UnixNano())
-	if err := m.Start(id, tmpDir, nil, "hello", "ws", "uid", func(resultMsg) {}, nil); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	t.Cleanup(func() { _ = m.End(id) })
+	startNativeClaudeRun(t, "claude-heartbeat-result")
 
 	waitForClaudeObservationAfter(t, cache, preRun)
 	if got := atomic.LoadInt64(calls); got != 1 {

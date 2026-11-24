@@ -602,6 +602,54 @@ func seedStaleClaudeObservation(t *testing.T, cache string) time.Time {
 	return seeded
 }
 
+// startNativeClaudeRun starts a direct (chat-native) run against the mock
+// `claude` binary in `mode` and gives it the drain barrier managed runs already
+// have (startManagedClaudeSession). Call it AFTER armClaudeUsageProbe, so its
+// cleanup runs first (LIFO):
+//
+//  1. End the run, unless it already ended.
+//  2. Wait for the session to leave the manager. ClaudeNativeManager.End
+//     returns once the process has exited, but the watcher may still run the
+//     abnormal-exit post-run trigger and the artifact collection; removal is
+//     its LAST act.
+//  3. Require a reset that drains. The trigger counts `settling` on the caller
+//     before it spawns, so a drained reset proves the trigger's goroutine
+//     finished — removal alone does not.
+//
+// Without it a direct run's exit path could record a debt, or hold the gate,
+// inside the NEXT test and refuse that test's post-run probe for spacing.
+func startNativeClaudeRun(t *testing.T, mode string) (*ClaudeNativeManager, string, string) {
+	t.Helper()
+	return startNativeClaudeRunWith(t, mode, "hello", func(resultMsg) {})
+}
+
+// startNativeClaudeRunWith is startNativeClaudeRun for a caller that needs its
+// own prompt or publish callback.
+func startNativeClaudeRunWith(t *testing.T, mode, prompt string, publish PublishFunc) (*ClaudeNativeManager, string, string) {
+	t.Helper()
+	tmpDir := installMockClaude(t, mode)
+	m := NewClaudeNativeManager(nil)
+	id := fmt.Sprintf("claude-native-%d", time.Now().UnixNano())
+	if err := m.Start(id, tmpDir, nil, prompt, "ws", "uid", publish, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		if m.Get(id) != nil {
+			_ = m.End(id)
+		}
+		deadline := time.Now().Add(sessionStreamDrainTimeout + sessionArtifactCollectTimeout + 30*time.Second)
+		for m.Get(id) != nil {
+			if time.Now().After(deadline) {
+				t.Errorf("direct session %s never drained — its exit path can still record a post-run debt inside a later test", id)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		requireClaudeResetDrained(t)
+	})
+	return m, id, tmpDir
+}
+
 // waitForClaudeObservationAfter polls the cache until the five-hour window
 // carries a PROBE reading observed after `after`. The probe is deliberately
 // asynchronous (it must never delay frame ordering or waitForExit), so polling
@@ -639,14 +687,7 @@ func TestClaudeNativeLifecycle_TerminalResultAdvancesUtilization(t *testing.T) {
 			time.Now().Add(3*time.Hour).Unix())
 	})
 	seeded := seedStaleClaudeObservation(t, cache)
-	tmpDir := installMockClaude(t, "claude-heartbeat-result")
-
-	m := NewClaudeNativeManager(nil)
-	id := fmt.Sprintf("claude-freshness-%d", time.Now().UnixNano())
-	if err := m.Start(id, tmpDir, nil, "hello", "ws", "uid", func(resultMsg) {}, nil); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	t.Cleanup(func() { _ = m.End(id) })
+	startNativeClaudeRun(t, "claude-heartbeat-result")
 
 	waitForClaudeObservationAfter(t, cache, seeded)
 	if got := atomic.LoadInt64(calls); got != 1 {
@@ -671,13 +712,7 @@ func TestClaudeNativeLifecycle_KilledRunStillProbesOnExit(t *testing.T) {
 			time.Now().Add(3*time.Hour).Unix())
 	})
 	seeded := seedStaleClaudeObservation(t, cache)
-	tmpDir := installMockClaude(t, "claude-heartbeat-hang")
-
-	m := NewClaudeNativeManager(nil)
-	id := fmt.Sprintf("claude-killed-%d", time.Now().UnixNano())
-	if err := m.Start(id, tmpDir, nil, "hello", "ws", "uid", func(resultMsg) {}, nil); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	m, id, _ := startNativeClaudeRun(t, "claude-heartbeat-hang")
 	// Let the usage-less heartbeat land, then kill the run mid-turn.
 	time.Sleep(200 * time.Millisecond)
 	if err := m.End(id); err != nil {
@@ -702,14 +737,7 @@ func TestClaudeNativeLifecycle_SettledTurnLeavesNoTrailingDebt(t *testing.T) {
 	// A production-shaped interval, so a debt left outstanding stays outstanding
 	// rather than being paid instantly by a zero-interval retry.
 	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
-	tmpDir := installMockClaude(t, "claude-heartbeat-result-linger")
-
-	m := NewClaudeNativeManager(nil)
-	id := fmt.Sprintf("claude-settled-%d", time.Now().UnixNano())
-	if err := m.Start(id, tmpDir, nil, "hello", "ws", "uid", func(resultMsg) {}, nil); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	t.Cleanup(func() { _ = m.End(id) })
+	startNativeClaudeRun(t, "claude-heartbeat-result-linger")
 
 	waitForClaudeObservationAfter(t, cache, seeded)
 	waitForNoOutstandingClaudeUsageDebt(t, 5*time.Second, 1500*time.Millisecond)
@@ -727,21 +755,13 @@ func TestClaudeNativeLifecycle_RejectionFrameSurvivesProbeWiring(t *testing.T) {
 		fmt.Fprintf(w, `{"five_hour":{"utilization":1.0,"resets_at":%d,"status":"rejected"}}`,
 			time.Now().Add(45*time.Minute).Unix())
 	})
-	tmpDir := installMockClaude(t, "claude-native-ratelimit")
-
-	m := NewClaudeNativeManager(nil)
-	id := fmt.Sprintf("claude-reject-probe-%d", time.Now().UnixNano())
-
 	var mu sync.Mutex
 	var captured []resultMsg
-	if err := m.Start(id, tmpDir, nil, "trigger", "ws", "uid", func(res resultMsg) {
+	startNativeClaudeRunWith(t, "claude-native-ratelimit", "trigger", func(res resultMsg) {
 		mu.Lock()
 		defer mu.Unlock()
 		captured = append(captured, res)
-	}, nil); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	t.Cleanup(func() { _ = m.End(id) })
+	})
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {

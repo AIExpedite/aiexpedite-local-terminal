@@ -104,6 +104,8 @@ var claudeRunDebtRetryTimer struct {
 	mu    sync.Mutex
 	timer *time.Timer
 	gen   uint64
+	// due is when the armed timer fires; meaningful only while timer != nil.
+	due time.Time
 }
 
 // claudeFreeRetryDelay is the free rung for a debt owed for `owedFor`. Shared
@@ -341,6 +343,7 @@ func claudeArmRunDebtRetryLocked(delay time.Duration, run func()) {
 	}
 	t.gen++
 	gen := t.gen
+	t.due = time.Now().Add(delay)
 	t.timer = time.AfterFunc(delay, func() { claudeRunDebtRetryFired(gen, run) })
 }
 
@@ -415,10 +418,20 @@ func persistClaudeRunDebtForShutdown() {
 
 // claudeRunDebtRetryPending reports whether a retry timer is armed.
 func claudeRunDebtRetryPending() bool {
+	_, ok := claudeRunDebtRetryDue()
+	return ok
+}
+
+// claudeRunDebtRetryDue reports when the armed retry timer fires, and whether
+// one is armed at all.
+func claudeRunDebtRetryDue() (time.Time, bool) {
 	t := &claudeRunDebtRetryTimer
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.timer != nil
+	if t.timer == nil {
+		return time.Time{}, false
+	}
+	return t.due, true
 }
 
 // nudgeClaudeCredentialChanged is the gather's trigger. When the schedule is

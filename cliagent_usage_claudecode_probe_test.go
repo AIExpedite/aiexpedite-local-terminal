@@ -62,6 +62,12 @@ func armClaudeUsageProbe(t *testing.T, handler http.HandlerFunc) (string, *int64
 	if !drainMachineInfoGathers(2 * time.Minute) {
 		t.Fatal("a machine-info gather from an earlier test is still running; it would probe against this test's fixtures")
 	}
+	// Then the gate itself. Gathers are drained first because a gather can book
+	// a rung or a hold through the seed; after that, anything still inside a
+	// bracket, a rung still armed or a flag still set is a previous test's work
+	// that would refuse this test's post-run probe for spacing or replace its
+	// rung — named here rather than surfacing as a timed-out freshness wait.
+	requireClaudeGateQuiet(t)
 
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
@@ -81,9 +87,11 @@ func armClaudeUsageProbe(t *testing.T, handler http.HandlerFunc) (string, *int64
 	t.Setenv(claudeUsageProbeEndpointEnv, srv.URL)
 	t.Setenv(claudeUsageProbeMinIntervalEnv, "0")
 
-	resetClaudeUsageProbeGate()
+	if !resetClaudeUsageProbeGate() {
+		t.Fatalf("the reset could not drain a quiet gate [%s]", claudeProbeStateForTest(cache))
+	}
 	SetClaudeUsageProbeDisabled(false)
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 
 	return cache, &calls
 }
@@ -920,7 +928,7 @@ func TestClaudeUsageProbeObservedSince_StatusLineRenderCannotCoverAStaleWeeklyRo
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
 	resetClaudeUsageProbeGate()
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 
 	now := time.Now()
 	fresh := now.Add(-2 * time.Second)
@@ -1560,18 +1568,19 @@ func TestResetClaudeUsageProbeGate_StopsThePendingRetryRung(t *testing.T) {
 // The drain must be bounded: a probe that never releases the latch cannot be
 // allowed to hang the whole suite in a cleanup.
 //
-// The real deadline is shortened here rather than waited out. CI runs this
-// package under `go test -race -timeout 5m`, and sleeping the production five
-// seconds to assert one boolean is wall-clock the whole suite has to pay for.
-// Saving and restoring the package var is the same seam stubClaudeProbes uses.
+// The real deadline is shortened (pinClaudeDrainTimeout) rather than waited
+// out: sleeping the production five seconds, twice, to assert one boolean is
+// wall-clock the whole suite has to pay for.
 func TestResetClaudeUsageProbeGate_DrainIsBounded(t *testing.T) {
-	originalTimeout := claudeUsageProbeDrainTimeout
-	claudeUsageProbeDrainTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { claudeUsageProbeDrainTimeout = originalTimeout })
+	pinClaudeDrainTimeout(t, 50*time.Millisecond)
 
-	// A latch nothing will ever release — the wedged-probe case.
+	// A latch nothing will ever release — the wedged-probe case. Released in
+	// cleanup, and the gate then reset for real: registered first so it runs
+	// after the release (LIFO).
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 	claudeUsageProbe.mu.Lock()
 	claudeUsageProbe.inFlight = true
+	claudeUsageProbe.armed = true
 	claudeUsageProbe.mu.Unlock()
 	t.Cleanup(func() {
 		claudeUsageProbe.mu.Lock()
@@ -1580,13 +1589,11 @@ func TestResetClaudeUsageProbeGate_DrainIsBounded(t *testing.T) {
 	})
 
 	start := time.Now()
-	done := make(chan struct{})
-	go func() {
-		resetClaudeUsageProbeGate()
-		close(done)
-	}()
+	done := make(chan bool, 1)
+	go func() { done <- resetClaudeUsageProbeGate() }()
+	var drained bool
 	select {
-	case <-done:
+	case drained = <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("resetClaudeUsageProbeGate never gave up on a wedged probe")
 	}
@@ -1596,6 +1603,18 @@ func TestResetClaudeUsageProbeGate_DrainIsBounded(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < claudeUsageProbeDrainTimeout {
 		t.Errorf("gave up after %v, before the %v deadline — the drain did not run",
 			elapsed, claudeUsageProbeDrainTimeout)
+	}
+	if drained {
+		t.Error("the reset reported a drain while a probe still held the latch")
+	}
+	claudeUsageProbe.mu.Lock()
+	inFlight, armed := claudeUsageProbe.inFlight, claudeUsageProbe.armed
+	claudeUsageProbe.mu.Unlock()
+	if !inFlight {
+		t.Error("an undrained reset force-cleared the latch; a late finish would then clear the NEXT holder's")
+	}
+	if armed {
+		t.Error("an undrained reset must still leave the gate unarmed")
 	}
 }
 
@@ -1984,6 +2003,14 @@ func TestClaudeUsageProbe_SuppressedDuplicateDoesNotWedgeTheGate(t *testing.T) {
 // the probe that run earned — latestObservedAt would not advance, which is the
 // exact defect this file exists to fix.
 func TestClaudeUsageProbe_RecentPreRunObservationDoesNotSuppressPostRunProbe(t *testing.T) {
+	assertRecentPreRunObservationDoesNotSuppressPostRunProbe(t)
+}
+
+// assertRecentPreRunObservationDoesNotSuppressPostRunProbe is the test above's
+// body, shared with the ordered isolation test that runs it right after a
+// straggling run (cliagent_usage_claudecode_post_run_isolation_test.go).
+func assertRecentPreRunObservationDoesNotSuppressPostRunProbe(t *testing.T) {
+	t.Helper()
 	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
 	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":73,"resets_at":%d}]}`,
@@ -2243,12 +2270,15 @@ func TestRefreshClaudeUsageIfStale_MakesNoCredentialRead(t *testing.T) {
 // for minutes. That is the reported defect, reintroduced by the rate bound.
 func TestClaudeUsageProbe_ThrottledPostRunProbeStillLands(t *testing.T) {
 	base := time.Now()
-	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":77,"resets_at":%d}]}`,
 			base.Add(time.Hour).Unix())
 	})
-	t.Setenv(claudeUsageProbeMinIntervalEnv, "400")
-	pinTrailingProbeRungLadder(t)
+	// Long enough that the rung's booking can be read before it fires, short
+	// enough to keep the wait small.
+	const interval = 1500 * time.Millisecond
+	t.Setenv(claudeUsageProbeMinIntervalEnv, strconv.FormatInt(interval.Milliseconds(), 10))
+	bound := trailingProbeRungBound(pinTrailingProbeRungLadder(t), interval)
 
 	// A routine gather probes successfully just before the run.
 	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
@@ -2258,6 +2288,9 @@ func TestClaudeUsageProbe_ThrottledPostRunProbeStillLands(t *testing.T) {
 	if preRun.IsZero() {
 		t.Fatal("precondition: expected a pre-run observation")
 	}
+	claudeUsageProbe.mu.Lock()
+	preRunAttempt := claudeUsageProbe.lastAttempt
+	claudeUsageProbe.mu.Unlock()
 	// "Just before" has to mean an earlier MILLISECOND, which is the only
 	// resolution the cache keeps: claudeUsageObservationCovers deliberately
 	// treats a same-millisecond reading as covering the run, so that a probe
@@ -2270,11 +2303,39 @@ func TestClaudeUsageProbe_ThrottledPostRunProbeStillLands(t *testing.T) {
 	// which no probe can then settle and no amount of waiting can fix.
 	waitPastObservationMillisecond(t, preRun)
 
-	// The run completes INSIDE the throttle window.
+	// The run completes INSIDE the throttle window, and the throttle refusing
+	// it is this test's OWN pre-run probe — not a straggler from another test.
 	runCompleted := time.Now()
+	if code := claudeUsageProbe.refusal(runCompleted, false); code != claudeProbeSpacing {
+		t.Fatalf("precondition: the run's attempt would be refused as %q, want %q [%s]",
+			code, claudeProbeSpacing, claudeProbeStateForTest(cache))
+	}
 	triggerClaudeUsageProbeAfterRun()
 
-	waitForObservationAfter(t, runCompleted, 8*time.Second,
+	// The refusal persisted the debt at or after the run and booked a rung at
+	// the end of the spacing — read before the rung fires.
+	var due time.Time
+	waitForClaudeCondition(t, interval, "the refused run never persisted its debt and booked a rung", func() bool {
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		booked, armed := claudeRunDebtRetryDue()
+		due = booked
+		return ok && armed && snap.RefreshOwedAtMs >= runCompleted.Truncate(time.Millisecond).UnixMilli()
+	})
+	claudeUsageProbe.mu.Lock()
+	refusedBy, failures := claudeUsageProbe.lastAttempt, claudeUsageProbe.failures
+	claudeUsageProbe.mu.Unlock()
+	if !refusedBy.Equal(preRunAttempt) || failures != 0 {
+		t.Fatalf("the throttle moved under the run (lastAttempt %d -> %d ms, failures=%d) — another "+
+			"probe was admitted between the pre-run gather and the run's refusal [%s]",
+			preRunAttempt.UnixMilli(), refusedBy.UnixMilli(), failures, claudeProbeStateForTest(cache))
+	}
+	// Windows' coarse clock can put the booking one tick past the arithmetic.
+	if latest := preRunAttempt.Add(interval + claudeRunDebtRungSlack + 50*time.Millisecond); due.After(latest) {
+		t.Fatalf("rung due %d ms, want no later than spacingEnd + slack = %d ms [%s]",
+			due.UnixMilli(), latest.UnixMilli(), claudeProbeStateForTest(cache))
+	}
+
+	waitForPostRunObservation(t, runCompleted, bound,
 		"latestObservedAt never advanced past the run — the throttle discarded the post-run probe")
 	if got := atomic.LoadInt64(calls); got > 3 {
 		t.Errorf("request count=%d, want a small bounded number", got)
@@ -2290,7 +2351,7 @@ func TestClaudeUsageProbe_TrailingProbesCoalesceAcrossRuns(t *testing.T) {
 			base.Add(time.Hour).Unix())
 	})
 	t.Setenv(claudeUsageProbeMinIntervalEnv, "600")
-	pinTrailingProbeRungLadder(t)
+	bound := trailingProbeRungBound(pinTrailingProbeRungLadder(t), 600*time.Millisecond)
 
 	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
 		t.Fatal("precondition: the first probe should run")
@@ -2304,7 +2365,7 @@ func TestClaudeUsageProbe_TrailingProbesCoalesceAcrossRuns(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	waitForObservationAfter(t, last, 8*time.Second, "the coalesced trailing probe never landed")
+	waitForPostRunObservation(t, last, bound, "the coalesced trailing probe never landed")
 	// One pre-run probe plus one trailing probe. Anything near eight means the
 	// runs each bought their own request.
 	if got := atomic.LoadInt64(calls); got > 3 {
@@ -2379,42 +2440,104 @@ func TestClaudeUsageProbe_DebtSettledByAnotherWriterSkipsTheTrailingProbe(t *tes
 }
 
 // pinTrailingProbeRungLadder puts every retry rung inside the window a test
-// that waits for a TRAILING probe can afford.
+// that waits for a TRAILING probe can afford, and returns the longest rung it
+// pinned — the `bound` waitForPostRunObservation holds a later rung to.
 //
 // These tests assert that a post-run debt is eventually PAID, not how long
 // production waits before paying it — and in production an attempt that spent
-// budget and failed books the first budgeted rung, 15 s out, which is nearly
-// twice the 8 s they wait. One transient local failure is enough to reach it:
-// a cache write the merge could not complete answers `persist_failed`, which
-// deliberately grows the streak exactly as a 5xx does, so the rung lands past
-// the deadline and the test reads it as a DISCARDED probe. Reproduced here with
-// the debt intact on disk and its rung booked 16.5 s after the run — nothing
-// was dropped, the deadline was simply the wrong one to measure against.
+// budget and failed books the first budgeted rung, 15 s out. One transient
+// local failure is enough to reach it: a cache write the merge could not
+// complete answers `persist_failed`, which deliberately grows the streak
+// exactly as a 5xx does, so the rung lands past any fixed deadline and the test
+// reads it as a DISCARDED probe. Reproduced with the debt intact on disk and
+// its rung booked 16.5 s after the run — nothing was dropped, the deadline was
+// simply the wrong one to measure against.
 //
 // Pinned small the retry is a few hundred milliseconds, so a transient failure
 // costs one extra attempt instead of the whole test. The floor still spaces
 // what actually goes out, so the request counts these tests bound stay
 // meaningful.
-func pinTrailingProbeRungLadder(t *testing.T) {
+func pinTrailingProbeRungLadder(t *testing.T) time.Duration {
 	t.Helper()
-	pinClaudeRunDebtLadder(t,
-		[]time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second},
-		250*time.Millisecond, claudeRunDebtRungSlack)
+	ladder := []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second}
+	pinClaudeRunDebtLadder(t, ladder, 250*time.Millisecond, claudeRunDebtRungSlack)
+	return ladder[len(ladder)-1]
 }
 
-// waitForObservationAfter polls the merged cache until an observation newer than
-// `baseline` appears. The trailing probe is asynchronous by design, so polling
-// is the only honest way to assert it ran.
-func waitForObservationAfter(t *testing.T, baseline time.Time, within time.Duration, msg string) {
+// trailingProbeRungBound is the furthest out a rung may legitimately be booked
+// once a test pinned `ladder` with its throttle at `interval`: the longest
+// pinned rung, or a spacing / in-flight rung at the end of the interval, plus
+// the slack every timed rung carries. A rung booked further out than this came
+// from somewhere the test did not pin — a restored production ladder, or a
+// previous test's straggler.
+func trailingProbeRungBound(ladder, interval time.Duration) time.Duration {
+	if interval > ladder {
+		ladder = interval
+	}
+	return ladder + claudeRunDebtRungSlack
+}
+
+// claudePostRunObservationWaitCap bounds ONE waitForPostRunObservation, far
+// inside the package's 20 m `go test` budget.
+const claudePostRunObservationWaitCap = 60 * time.Second
+
+// claudeBookedRungDue is when the pending retry rung fires: the armed timer's
+// instant, else the persisted NextAttemptAtMs, else zero.
+func claudeBookedRungDue() time.Time {
+	if due, ok := claudeRunDebtRetryDue(); ok {
+		return due
+	}
+	if snap, ok := loadClaudeRateLimitSnapshot(os.Getenv("AIEXPEDITE_CLAUDE_RL_CACHE")); ok && snap.NextAttemptAtMs > 0 {
+		return time.UnixMilli(snap.NextAttemptAtMs)
+	}
+	return time.Time{}
+}
+
+// waitForPostRunObservation polls the merged cache until an observation newer
+// than `baseline` appears. The trailing probe is asynchronous by design, so
+// polling is the only honest way to assert it ran.
+//
+// The deadline is measured against the rung that was actually BOOKED rather
+// than a fixed figure: the first rung seen sets it to its due time plus one
+// whole probe (claudeUsageProbeWholeTimeout) plus 2 s. A rung booked after that
+// one — a failed attempt's retry — moves the deadline only when it is due
+// within `bound` of being seen; one due further out fails at once, because it
+// came from a ladder the test did not pin. Every wait is capped at
+// claudePostRunObservationWaitCap, and a failure prints the redacted gate and
+// schedule state (claudeProbeStateForTest).
+func waitForPostRunObservation(t *testing.T, baseline time.Time, bound time.Duration, msg string) {
 	t.Helper()
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
+	start := time.Now()
+	limit := start.Add(claudePostRunObservationWaitCap)
+	slack := claudeUsageProbeWholeTimeout + 2*time.Second
+	deadline := start.Add(slack)
+	var seen time.Time
+	for {
 		if latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")); latest.After(baseline) {
 			return
 		}
+		now := time.Now()
+		if due := claudeBookedRungDue(); !due.IsZero() && !due.Equal(seen) {
+			if !seen.IsZero() && due.Sub(now) > bound {
+				t.Fatalf("%s: a later rung was booked %v out, beyond the pinned %v (baseline %s) [%s]",
+					msg, due.Sub(now).Round(time.Millisecond), bound,
+					baseline.UTC().Format(time.RFC3339Nano), claudeProbeStateForTest(os.Getenv("AIEXPEDITE_CLAUDE_RL_CACHE")))
+			}
+			seen = due
+			if next := due.Add(slack); next.After(deadline) {
+				deadline = next
+			}
+		}
+		if deadline.After(limit) {
+			deadline = limit
+		}
+		if !now.Before(deadline) {
+			break
+		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatalf("%s (baseline %s)", msg, baseline.UTC().Format(time.RFC3339Nano))
+	t.Fatalf("%s (baseline %s, waited %v) [%s]", msg, baseline.UTC().Format(time.RFC3339Nano),
+		time.Since(start).Round(time.Millisecond), claudeProbeStateForTest(os.Getenv("AIEXPEDITE_CLAUDE_RL_CACHE")))
 }
 
 // waitPastObservationMillisecond blocks until the clock has left the
@@ -2497,6 +2620,7 @@ func TestClaudeUsageProbeAfterRun_ReadsCredentialsOncePerActualProbe(t *testing.
 	})
 	t.Setenv(claudeUsageProbeMinIntervalEnv, "500")
 	reads := countClaudeCredentialReads(t)
+	longestRung := pinTrailingProbeRungLadder(t)
 
 	// One run probes immediately; nine more land inside the throttle window and
 	// must coalesce onto a single retry rung. Turns of one session finish one
@@ -2525,7 +2649,7 @@ func TestClaudeUsageProbeAfterRun_ReadsCredentialsOncePerActualProbe(t *testing.
 	if span := time.Since(first); span >= window {
 		t.Fatalf("precondition: ten runs took %s, past the %s window derived from the first run", span, window)
 	}
-	waitForObservationAfter(t, last, window+8*time.Second, "the coalesced trailing probe never landed")
+	waitForPostRunObservation(t, last, trailingProbeRungBound(longestRung, window), "the coalesced trailing probe never landed")
 
 	if got := atomic.LoadInt64(calls); got > 2 {
 		t.Errorf("request count=%d, want <= 2 (immediate + one retry rung)", got)
@@ -3226,6 +3350,9 @@ func TestClaudeUsageProbeAfterRun_RetriesAfterSingleFlightRefusal(t *testing.T) 
 		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":51,"resets_at":%d}]}`,
 			base.Add(time.Hour).Unix())
 	})
+	// armClaudeUsageProbe zeroes the floor, so every rung here is the pinned
+	// ladder or the in-flight rung at the floor plus slack.
+	bound := trailingProbeRungBound(pinTrailingProbeRungLadder(t), 0)
 
 	// The winner: a routine gather already on the wire, holding the slot.
 	winnerDone := make(chan struct{})
@@ -3256,7 +3383,7 @@ func TestClaudeUsageProbeAfterRun_RetriesAfterSingleFlightRefusal(t *testing.T) 
 
 	// The run joined the winner, found its reading did not cover the debt, and
 	// booked a rung at the floor: the retry lands from the timer, not inline.
-	waitForObservationAfter(t, completed.Truncate(time.Millisecond), 8*time.Second,
+	waitForPostRunObservation(t, completed.Truncate(time.Millisecond), bound,
 		"the refused post-run probe was dropped — no rung paid the debt")
 	waitForClaudeCondition(t, 5*time.Second, "debt still outstanding after the retry", func() bool {
 		return claudeUsageProbe.owedObservation().IsZero()
@@ -3789,7 +3916,7 @@ func TestClaudeProbeResult_SharedNetworkAndPersistFailed(t *testing.T) {
 // request went out walks the budgeted ladder.
 func TestClaudeRunDebtRungFor_UnnamedPaths(t *testing.T) {
 	resetClaudeUsageProbeGate()
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 	for _, code := range []claudeProbeCode{"some_future_refusal", claudeProbeReserveFailed, claudeProbeOffline,
 		claudeProbeNoCredential, claudeProbeCredentialExpired, claudeProbeBadOverride} {
 		if kind, _ := claudeRunDebtRungFor(claudeProbeResult{code: code}); kind != claudeRungFree {
