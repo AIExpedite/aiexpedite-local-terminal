@@ -72,6 +72,9 @@ func setupOpenArgv(goos, destination, chrome string) ([]string, *browserError) {
 	return nil, browserErr(browserErrCommandInvalid, "unknown setup destination")
 }
 
+// linuxChromeInstallDir is where Google installs Chrome on Linux (deb and rpm).
+const linuxChromeInstallDir = "/opt/google/chrome/"
+
 // windowsChromeAppPaths reads the registry's App Paths\chrome.exe (HKCU, then
 // HKLM). Set on Windows (browser_setup_open_windows.go); nil elsewhere.
 var windowsChromeAppPaths = func() []string { return nil }
@@ -95,7 +98,7 @@ func chromeExecutableCandidates(goos string, env func(string) string, lookPath f
 			out = append(out, strings.TrimSuffix(home, "/")+"/Applications/"+inApp)
 		}
 	default:
-		out = append(out, "/opt/google/chrome/chrome")
+		out = append(out, linuxChromeInstallDir+"chrome")
 		for _, name := range []string{"google-chrome-stable", "google-chrome"} {
 			p, err := lookPath(name)
 			if err != nil {
@@ -106,10 +109,13 @@ func chromeExecutableCandidates(goos string, env func(string) string, lookPath f
 			}
 			// Debian's wrapper script (/opt/google/chrome/google-chrome) execs
 			// the sibling binary: that binary is what is verified and run.
-			if strings.HasPrefix(p, "/opt/google/chrome/") {
-				p = "/opt/google/chrome/chrome"
+			// Anything that resolves OUTSIDE Google's install directory is
+			// dropped: the path check alone would accept any `.../google/chrome`
+			// a user-writable PATH entry points at.
+			if !strings.HasPrefix(p, linuxChromeInstallDir) {
+				continue
 			}
-			out = append(out, p)
+			out = append(out, linuxChromeInstallDir+"chrome")
 		}
 	}
 	return out

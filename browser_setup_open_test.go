@@ -107,6 +107,15 @@ func TestChromeCandidates(t *testing.T) {
 			t.Fatalf("linux candidate %q", c)
 		}
 	}
+
+	// A PATH entry resolving outside Google's install directory is never a
+	// candidate, even though its path would pass the name-and-path check.
+	planted := func(p string) (string, error) { return "/home/a/bin/google/chrome", nil }
+	for _, c := range chromeExecutableCandidates("linux", env(nil), look, planted) {
+		if c != "/opt/google/chrome/chrome" {
+			t.Fatalf("planted PATH binary became a candidate: %q", c)
+		}
+	}
 }
 
 func TestResolveChromeExecutableVerifies(t *testing.T) {
