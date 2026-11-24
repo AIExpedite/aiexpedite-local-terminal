@@ -91,13 +91,7 @@ func TestPostUpdateColdStart_ClaudeCode(t *testing.T) {
 
 			var binDir string
 			if path == "direct run" {
-				binDir = installMockClaude(t, "claude-heartbeat-result")
-				m := NewClaudeNativeManager(nil)
-				id := "claude-cold-start-direct"
-				if err := m.Start(id, binDir, nil, "hello", "ws", "uid", func(resultMsg) {}, nil); err != nil {
-					t.Fatalf("Start: %v", err)
-				}
-				t.Cleanup(func() { _ = m.End(id) })
+				_, _, binDir = startNativeClaudeRun(t, "claude-heartbeat-result")
 			} else {
 				sm, id := startManagedClaudeSession(t, "claude-heartbeat-result")
 				t.Cleanup(func() { _ = sm.EndSession(id) })

@@ -22,18 +22,15 @@ import (
 // claudeFreshnessWaitIdle blocks until no probe or settlement is in flight.
 // Both the trailing probe and the startup replay are asynchronous by design,
 // so polling the gate is the only honest way to assert what they did.
+//
+// Same predicate as requireClaudeGateQuiet, without the rung check: a test
+// waits here while it legitimately has a rung booked.
 func claudeFreshnessWaitIdle(t *testing.T) {
 	t.Helper()
-	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
-		claudeUsageProbe.mu.Lock()
-		idle := !claudeUsageProbe.inFlight && claudeUsageProbe.settling == 0
-		claudeUsageProbe.mu.Unlock()
-		if idle {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+	if reason := waitClaudeGate(30*time.Second, claudeGateIdleLeak); reason != "" {
+		t.Fatalf("the gate is not idle after 30s: %s [%s]", reason,
+			claudeProbeStateForTest(os.Getenv("AIEXPEDITE_CLAUDE_RL_CACHE")))
 	}
-	t.Fatal("a probe or settlement is still in flight after 30s")
 }
 
 // claudeCacheSnapshot reads the pinned cache, failing the test when it is
@@ -4168,7 +4165,7 @@ func TestClaudeRunDebtAttempt_FutureRungLeavesTheRestoredDebtUnrecorded(t *testi
 // replacing the previously restored wait, is still adopted.
 func TestClaudeUsageProbe_RestoreAuthWaitKeepsANewerLocalWait(t *testing.T) {
 	resetClaudeUsageProbeGate()
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 	old := claudeCredStamp{modNs: 100, size: 1}
 	rewritten := claudeCredStamp{modNs: 200, size: 1}
 
@@ -4197,7 +4194,7 @@ func TestClaudeUsageProbe_RestoreAuthWaitKeepsANewerLocalWait(t *testing.T) {
 // drop it, or an automatic attempt resends the rejected credential.
 func TestClaudeUsageProbe_SameStampLocalWaitSurvivesAStaleRestoredClear(t *testing.T) {
 	resetClaudeUsageProbeGate()
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 	b := claudeCredStamp{modNs: 200, size: 1}
 
 	claudeUsageProbe.restoreAuthWait(b, claudeUsageProbe.authWaitReadSeq())
@@ -4214,7 +4211,7 @@ func TestClaudeUsageProbe_SameStampLocalWaitSurvivesAStaleRestoredClear(t *testi
 // later seed still leaves it standing.
 func TestClaudeUsageProbe_SameStampRestoreAfterLocalWaitKeepsItLocal(t *testing.T) {
 	resetClaudeUsageProbeGate()
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 	b := claudeCredStamp{modNs: 200, size: 1}
 
 	staleRead := claudeUsageProbe.authWaitReadSeq()

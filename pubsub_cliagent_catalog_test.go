@@ -156,7 +156,7 @@ func TestPrepareCLIUsageRefreshResult_CachesOnlyValidatedNormalizedSnapshot(t *t
 // not forced at all.
 func TestClaudeUsageRefreshForceReason(t *testing.T) {
 	resetClaudeUsageProbeGate()
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 	automatic := commandMsg{Command: "__cli_usage_refresh__"}
 	if got := claudeUsageRefreshForceReason(automatic); got != claudeForceNone {
 		t.Errorf("automatic refresh, nothing owed: reason=%v, want none", got)

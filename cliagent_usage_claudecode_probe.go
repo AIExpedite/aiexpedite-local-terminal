@@ -479,6 +479,14 @@ type claudeUsageProbeGate struct {
 	lastRefreshAt          time.Time
 	lastRefreshFingerprint string
 	lastRefreshShared      bool
+	// genCtx is the gate generation's context, created lazily by
+	// generationContext and cancelled ONLY by a resetClaudeUsageProbeGate whose
+	// drain timed out — a test-only seam, so production never cancels it. A
+	// probe derives its request context from it, so a straggler the reset could
+	// not wait out stops before it dials an endpoint or merges into a cache path
+	// the next test has since restored. A successful clear replaces it.
+	genCtx    context.Context
+	genCancel context.CancelFunc
 }
 
 var claudeUsageProbe claudeUsageProbeGate
@@ -608,7 +616,9 @@ var claudeUsageProbeDrainTimeout = 5 * time.Second
 
 // resetClaudeUsageProbeGate drains any in-flight probe, cancels any sleeping
 // retry rung, then clears the throttle/latch. Test-only seam, mirroring
-// resetOpenCodeReadinessCache.
+// resetOpenCodeReadinessCache. Reports whether the drain finished: false means
+// work an earlier caller started was still running when the reset gave up, and
+// the gate must NOT be treated as clean (see requireClaudeResetDrained).
 //
 // The drain is load-bearing, not tidiness. triggerClaudeUsageProbeAfterRun runs
 // the probe on a goroutine, and probeClaudeUsageResult resolves the endpoint AFTER
@@ -621,7 +631,17 @@ var claudeUsageProbeDrainTimeout = 5 * time.Second
 //
 // Bounded by claudeUsageProbeDrainTimeout so a wedged probe cannot hang the
 // suite; the probe's own 3s timeout means a live one drains far inside it.
-func resetClaudeUsageProbeGate() {
+//
+// A drain that times out does NOT clear around the work still running. Zeroing
+// inFlight / settling under a live straggler is what let its late endSettling
+// decrement the NEXT generation's counter and its late finish clear the next
+// holder's latch — the cross-test leak behind the full-suite post-run failures.
+// Instead the reset cancels the generation context (the straggler stops before
+// it dials or merges), abandons the auth-clear loop and any pending seed, waits
+// once more, and leaves the brackets standing until a later reset finds them
+// quiet. Whatever the straggler writes inside its own bracket is cleared by
+// that later reset, which armClaudeUsageProbe runs only on a quiet gate.
+func resetClaudeUsageProbeGate() bool {
 	// Unarm and stop the retry rung FIRST, before waiting for anything: a rung
 	// armed minutes ahead must not fire into the next test's cache, and an
 	// unarmed gate turns any attempt still starting into a prompt return, so the
@@ -631,15 +651,22 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.mu.Unlock()
 	stopClaudeRunDebtRetry()
 
-	deadline := time.Now().Add(claudeUsageProbeDrainTimeout)
-	for time.Now().Before(deadline) {
+	drained := claudeUsageProbe.waitQuiet(claudeUsageProbeDrainTimeout)
+	if !drained {
+		// Contain what is still running, then give it one more bounded chance.
 		claudeUsageProbe.mu.Lock()
-		inFlight, settling := claudeUsageProbe.inFlight, claudeUsageProbe.settling
+		claudeUsageProbe.cancelGenerationLocked()
+		claudeUsageProbe.abandonBackgroundLocked()
 		claudeUsageProbe.mu.Unlock()
-		if !inFlight && settling == 0 {
-			break
+		quiet := claudeUsageProbe.waitQuiet(claudeUsageProbeDrainTimeout)
+		// The straggler may have booked a rung while it was being cancelled.
+		stopClaudeRunDebtRetry()
+		if !quiet {
+			return false
 		}
-		time.Sleep(10 * time.Millisecond)
+		// The cancel let it finish: nothing is inside a bracket any more, so the
+		// clear below is as safe as after a clean drain. Still reported as a
+		// failed drain — the work outlived the caller that started it.
 	}
 	// Stop the rung AGAIN, now that nothing is running. The stop above cancels
 	// what was already sleeping; an attempt that had passed armedForProbe before
@@ -653,8 +680,8 @@ func resetClaudeUsageProbeGate() {
 
 	claudeUsageProbe.mu.Lock()
 	claudeUsageProbe.inFlight = false
-	// Release any joiner the drain gave up on, so it cannot outlive the reset
-	// blocked on a channel nothing will ever close.
+	// Nothing is in flight, so finish has already closed doneCh; kept defensive
+	// so no joiner can outlive the reset blocked on a channel nobody closes.
 	if claudeUsageProbe.doneCh != nil {
 		close(claudeUsageProbe.doneCh)
 		claudeUsageProbe.doneCh = nil
@@ -673,25 +700,81 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.authWaitNudged = claudeCredStamp{}
 	claudeUsageProbe.authWaitRestored = claudeCredStamp{}
 	claudeUsageProbe.authWaitSeq = 0
-	claudeUsageProbe.authClearPending = claudeCredStamp{}
-	claudeUsageProbe.authClearFingerprint = ""
-	claudeUsageProbe.authClearRetrying = false
-	claudeUsageProbe.authClearGen++
+	claudeUsageProbe.abandonBackgroundLocked()
 	claudeUsageProbe.owedBaseline = time.Time{}
 	claudeUsageProbe.owedSeeded = false
 	claudeUsageProbe.owedSeededFor = ""
 	claudeUsageProbe.owedSeededStampMod = 0
 	claudeUsageProbe.owedSeededStampSize = 0
 	claudeUsageProbe.owedSeededObservation = time.Time{}
-	// A seed still in flight closes its own channel when it returns; dropping the
-	// reference here only stops it from marking the NEXT generation as seeded.
-	claudeUsageProbe.seedingCh = nil
 	claudeUsageProbe.settling = 0
+	// A fresh generation: the context the previous one handed out (possibly
+	// already cancelled) is released, and the next probe creates a live one.
+	if claudeUsageProbe.genCancel != nil {
+		claudeUsageProbe.genCancel()
+	}
+	claudeUsageProbe.genCtx, claudeUsageProbe.genCancel = nil, nil
 	claudeUsageProbe.mu.Unlock()
 	claudeUsageProbeLog.mu.Lock()
 	claudeUsageProbeLog.category = ""
 	claudeUsageProbeLog.at = time.Time{}
 	claudeUsageProbeLog.mu.Unlock()
+	return drained
+}
+
+// waitQuiet polls until nothing is inside the inFlight or settling brackets,
+// reporting false when `timeout` passes first.
+func (g *claudeUsageProbeGate) waitQuiet(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		g.mu.Lock()
+		quiet := !g.inFlight && g.settling == 0
+		g.mu.Unlock()
+		if quiet {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// abandonBackgroundLocked retires the gate's two pieces of work that run
+// OUTSIDE the inFlight / settling brackets, on both reset outcomes. Bumping
+// authClearGen makes the background auth-clear loop exit at its next
+// authClearRetryCurrent check instead of retrying into whatever cache path the
+// environment points at by then; dropping seedingCh stops a seed still in
+// flight (it closes its own channel when it returns) from marking the NEXT
+// generation as seeded. Caller holds g.mu.
+func (g *claudeUsageProbeGate) abandonBackgroundLocked() {
+	g.authClearPending = claudeCredStamp{}
+	g.authClearFingerprint = ""
+	g.authClearRetrying = false
+	g.authClearGen++
+	g.seedingCh = nil
+}
+
+// generationContext returns the current generation's context, creating it on
+// first use. Production never resets the gate, so it is never cancelled there.
+func (g *claudeUsageProbeGate) generationContext() context.Context {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.genCtx == nil {
+		g.genCtx, g.genCancel = context.WithCancel(context.Background())
+	}
+	return g.genCtx
+}
+
+// cancelGenerationLocked cancels the current generation's context, creating
+// one first so a probe that has not fetched it yet also sees it cancelled. The
+// cancelled context stays in place until a reset that drains replaces it.
+// Caller holds g.mu.
+func (g *claudeUsageProbeGate) cancelGenerationLocked() {
+	if g.genCtx == nil {
+		g.genCtx, g.genCancel = context.WithCancel(context.Background())
+	}
+	g.genCancel()
 }
 
 // claudeUsageProbeMinIntervalValue is the effective throttle floor, honoring the
@@ -1991,6 +2074,16 @@ func probeClaudeUsageResult(
 	if ctx.Err() != nil {
 		return claudeProbeResult{code: claudeProbeCancelled}, false, time.Time{}
 	}
+	// The request also ends when the gate's generation is cancelled. Only a
+	// test reset that could not drain this probe does that, so a straggler
+	// stops before it dials an endpoint or merges into a cache path the next
+	// test has restored. Fetched BEFORE admission, so a generation cancelled
+	// while this probe was being admitted is still seen below.
+	genCtx := claudeUsageProbe.generationContext()
+	ctx, cancelGen := context.WithCancel(ctx)
+	defer cancelGen()
+	stopGen := context.AfterFunc(genCtx, cancelGen)
+	defer stopGen()
 	if code := claudeUsageProbe.admit(now, bypass); code != "" {
 		return claudeProbeResult{code: code}, false, time.Time{}
 	}
@@ -2112,6 +2205,13 @@ func probeClaudeUsageResult(
 		// buckets while the debt (and the trailing retry that would have
 		// corrected it) is already settled. See refreshClaudeUsageIfStale.
 		return result, false, sharedAt
+	}
+	if genCtx.Err() != nil {
+		// A reset gave up on this probe, and the environment the endpoint is
+		// resolved from may already belong to the next test. Nothing was sent.
+		result.issued = false
+		result.code = claudeProbeCancelled
+		return result, false, time.Time{}
 	}
 	endpoint := claudeUsageProbeURL()
 	if endpoint == "" {
@@ -2292,6 +2392,12 @@ func probeClaudeUsageResult(
 	// under, and the new login's own gather will probe for itself. probeErr stays
 	// nil for the same reason — the endpoint did nothing wrong, so this must not
 	// extend the failure backoff for the account that just signed in.
+	if genCtx.Err() != nil {
+		// The same containment for the write: the cache path is env-derived, and
+		// a reset that gave up on this probe may have handed it to the next test.
+		result.code = claudeProbeCancelled
+		return result, false, time.Time{}
+	}
 	persisted, err := mergeClaudeRateLimitCacheProbeReading(ctx, claudeRateLimitCachePath(), updates, reported, now,
 		identity.fingerprint, []string{scopeBefore}, identity.credStamp)
 	if err != nil {

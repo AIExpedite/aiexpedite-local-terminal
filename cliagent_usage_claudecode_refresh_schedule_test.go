@@ -22,12 +22,17 @@ func waitForClaudeCondition(t *testing.T, within time.Duration, msg string, cond
 
 // pinClaudeRunDebtLadder shrinks the retry ladder and the free rung so a test
 // can watch rungs fire without waiting minutes.
+//
+// The cleanup DRAINS the gate before it restores the ladder. Cleanups run
+// LIFO, so this one runs before armClaudeUsageProbe's: restoring first let an
+// attempt still settling book a 15 s production rung that then fired inside
+// the next test (and, under -race, read the ladder while it was written).
 func pinClaudeRunDebtLadder(t *testing.T, ladder []time.Duration, free, slack time.Duration) {
 	t.Helper()
 	origLadder, origFree, origSlack := claudeRunDebtRetryLadder, claudeRunDebtFreeRetryDelay, claudeRunDebtRungSlack
 	claudeRunDebtRetryLadder, claudeRunDebtFreeRetryDelay, claudeRunDebtRungSlack = ladder, free, slack
 	t.Cleanup(func() {
-		stopClaudeRunDebtRetry()
+		requireClaudeResetDrained(t)
 		claudeRunDebtRetryLadder, claudeRunDebtFreeRetryDelay, claudeRunDebtRungSlack = origLadder, origFree, origSlack
 	})
 }
