@@ -41,10 +41,16 @@ package main
 //     SEND arriving meanwhile is written into that turn (lower only) and can
 //     never raise it. Every instruction written into an open turn is queued
 //     and each `result` retires one, so several queued voice instructions
-//     each keep their own turn asking; the session returns to its default
-//     only once no queued asking instruction is left. If Claude had in fact
-//     merged queued instructions into one turn, later turns ask more than
-//     they needed to: the conservative side.
+//     each keep their own turn asking. A queue holding only chat or typed
+//     instructions keeps the oldest one's turn open under its own allow and
+//     instruction id, so its prompts are answered and attributed to it even
+//     in a session whose default asks. The session returns to its default
+//     only once the queue is empty. If Claude had in fact merged queued
+//     instructions into one turn, the turn state runs one `result` behind:
+//     later turns ask more than they needed to after a queued ask, and after
+//     a queued allow a turn Claude starts by itself before the next `result`
+//     follows that chat instruction instead of the default. A voice
+//     instruction written meanwhile still lowers it before its text lands.
 //   - A redelivered relay turn runs under the approval its FIRST claimed
 //     delivery carried (the turn inbox row pins it, relay_turn_inbox.go).
 //   - Anything but the literal "autoAllow" asks, and nothing is ever answered
@@ -191,22 +197,30 @@ func (a *claudeApprovalState) restore(prev claudeApprovalSnapshot) {
 // attributed to the oldest asking one, until further `result`s retire them:
 // writing another instruction to stdin does not mean a queued one has ended,
 // so a chat SEND meanwhile only joins and cannot turn their prompts into
-// allowed ones. With no asking instruction left, the disposition returns to
-// the session's default.
+// allowed ones. When every queued instruction allows, the oldest one's turn
+// stays OPEN under its own allow and instruction id, so a chat instruction
+// Claude runs as a separate turn auto-approves even in a session whose
+// default asks, and its marks name it. Only with nothing queued does the
+// disposition return to the session's default.
 func (a *claudeApprovalState) settle() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if len(a.queued) == 0 {
+		a.turnOpen = false
+		a.disposition, a.instruction = a.defaultDisp, ""
+		a.queued = nil
+		return
+	}
+	next := a.queued[0]
 	for _, q := range a.queued {
 		if q.Disposition == claudeApprovalAskPerson {
-			a.turnOpen = true
-			a.disposition, a.instruction = claudeApprovalAskPerson, q.InstructionID
-			a.queued = a.queued[1:]
-			return
+			next = q
+			break
 		}
 	}
-	a.turnOpen = false
-	a.disposition, a.instruction = a.defaultDisp, ""
-	a.queued = nil
+	a.turnOpen = true
+	a.disposition, a.instruction = next.Disposition, next.InstructionID
+	a.queued = a.queued[1:]
 }
 
 // decide returns the mark to answer a can_use_tool prompt with, or nil when a

@@ -147,9 +147,9 @@ func TestClaudeApproval_ChatSendCannotRaiseACarriedVoiceTurn(t *testing.T) {
 		t.Fatalf("running turn = %s/%s, want askPerson/voice-2", d, id)
 	}
 
-	a.settle() // voice-2's result; chat-3 runs next under the default
-	if a.decide() == nil {
-		t.Fatal("the chat turn after the voice turn did not allow")
+	a.settle() // voice-2's result; chat-3 runs next under its own allow
+	if mark := a.decide(); mark == nil || mark.InstructionID != "chat-3" {
+		t.Fatalf("the chat turn after the voice turn = %+v, want allowed as chat-3", mark)
 	}
 
 	// A further voice follow-up written into the carried turn chains: the
@@ -569,5 +569,53 @@ func TestClaudeApproval_EveryQueuedVoiceInstructionKeepsItsTurnAsking(t *testing
 	b.settle() // voice-4
 	if b.decide() == nil {
 		t.Fatal("the session did not return to its default after the last queued ask")
+	}
+}
+
+// A chat instruction written while a turn is open and run by Claude as its own
+// later turn keeps its own allow and instruction id: in a voice-started
+// session (default askPerson) it still auto-approves, and in a chat-started
+// one its marks name it rather than the session default. The session returns
+// to its default once that turn's own result retires it.
+func TestClaudeApproval_QueuedChatInstructionKeepsItsAllowAndAttribution(t *testing.T) {
+	voiceStarted := newClaudeApprovalState(true, claudeApprovalAskPerson)
+	voiceStarted.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-1"})
+	voiceStarted.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-2"})
+	if voiceStarted.decide() != nil {
+		t.Fatal("a chat SEND raised the running voice turn")
+	}
+	voiceStarted.settle() // voice-1's result; chat-2 runs next
+	if mark := voiceStarted.decide(); mark == nil || mark.InstructionID != "chat-2" {
+		t.Fatalf("queued chat turn in a voice-started session = %+v, want allowed as chat-2", mark)
+	}
+	voiceStarted.settle() // chat-2's result
+	if voiceStarted.decide() != nil {
+		t.Fatal("the queued chat allow outlived its own turn in a voice-started session")
+	}
+
+	chatStarted := newClaudeApprovalState(true, claudeApprovalAutoAllow)
+	chatStarted.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-1"})
+	chatStarted.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-2"})
+	chatStarted.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-3"})
+	chatStarted.settle() // chat-1's result
+	if mark := chatStarted.decide(); mark == nil || mark.InstructionID != "chat-2" {
+		t.Fatalf("after chat-1 = %+v, want allowed as chat-2", mark)
+	}
+	chatStarted.settle() // chat-2's result
+	if mark := chatStarted.decide(); mark == nil || mark.InstructionID != "chat-3" {
+		t.Fatalf("after chat-2 = %+v, want allowed as chat-3", mark)
+	}
+	chatStarted.settle() // chat-3's result
+	if d, id := chatStarted.current(); d != claudeApprovalAutoAllow || id != "" {
+		t.Fatalf("after the queue drained = %s/%q, want the default autoAllow with no instruction", d, id)
+	}
+
+	// A voice instruction written into the promoted chat turn still lowers it.
+	chatStarted.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-4"})
+	chatStarted.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-5"})
+	chatStarted.settle() // chat-4's result; chat-5 runs next
+	chatStarted.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-6"})
+	if d, id := chatStarted.current(); d != claudeApprovalAskPerson || id != "voice-6" {
+		t.Fatalf("voice into the promoted chat turn = %s/%s, want askPerson/voice-6", d, id)
 	}
 }
