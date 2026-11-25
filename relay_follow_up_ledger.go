@@ -1135,7 +1135,11 @@ func writeClaudeLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollow
 	// turn.
 	processedIn := followUpProcessedInCurrent
 	var refusedAtStdin *relayFollowUpRow
-	err := globalClaudeNativeManager.SendAccepting(cmd.SessionID, cmd.Input, func() error {
+	// The follow-up's signed disposition is applied under stdinMu, after the
+	// fence below passes and BEFORE its text is written: an asking (voice)
+	// follow-up lowers the open turn first, so no prompt it raises can be
+	// answered under the turn's earlier allow (claude_native_approval.go).
+	err := globalClaudeNativeManager.SendTurn(cmd.SessionID, cmd.Input, func() error {
 		recheck := check
 		recheck.Now = time.Now()
 		recheck.ApprovalPending = session.pendingApprovals.Load() > 0
@@ -1157,7 +1161,7 @@ func writeClaudeLiveFollowUp(publish func(relayFollowUpRow), ledger *relayFollow
 			processedIn = followUpProcessedInNext
 		}
 		return nil
-	})
+	}, claudeFollowUpApprovalOf(cmd))
 	if refusedAtStdin != nil {
 		publish(*refusedAtStdin)
 		return

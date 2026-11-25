@@ -53,7 +53,7 @@ func TestClaudeRelayTurnIsAcceptedBeforeTheWrite(t *testing.T) {
 		}
 	}
 	session := newRelayTestClaudeSession("relay-accept-order", stdin)
-	if err := m.writeUserTurnAccepting(session, "make it blue", func() error { accepted = true; return nil }); err != nil {
+	if err := m.writeUserTurnAccepting(session, "make it blue", func() error { accepted = true; return nil }, claudeTurnApproval{}); err != nil {
 		t.Fatalf("writeUserTurnAccepting: %v", err)
 	}
 	if !accepted || len(stdin.writes) != 1 {
@@ -67,7 +67,7 @@ func TestClaudeRelayTurnUnrecordedAcceptanceRefusesTheWrite(t *testing.T) {
 	session := newRelayTestClaudeSession("relay-accept-fail", stdin)
 	err := m.writeUserTurnAccepting(session, "make it blue", func() error {
 		return errors.New(relayAcceptanceNotRecorded + ": disk full")
-	})
+	}, claudeTurnApproval{})
 	if err == nil || !strings.Contains(err.Error(), relayAcceptanceNotRecorded) {
 		t.Fatalf("err = %v, want the acceptance refusal", err)
 	}
@@ -85,7 +85,7 @@ func TestClaudeRelayTurnRefusalDoesNotAccept(t *testing.T) {
 	session := newRelayTestClaudeSession("relay-ended", &recordingWriteCloser{})
 	session.status = "ended"
 	accepted := false
-	if err := m.writeUserTurnAccepting(session, "hi", func() error { accepted = true; return nil }); err == nil {
+	if err := m.writeUserTurnAccepting(session, "hi", func() error { accepted = true; return nil }, claudeTurnApproval{}); err == nil {
 		t.Fatal("write to an ended session succeeded")
 	}
 	if accepted {

@@ -155,6 +155,15 @@ type capabilitiesInfo struct {
 	// relay must not start Claude at all: an older agent would add the
 	// auto-approve flag regardless.
 	RelayPermissionPrompts bool `json:"relayPermissionPrompts"`
+	// RelayOriginApprovals (DEVICE_RELAY_CAPABILITIES.ORIGIN_APPROVALS): the
+	// agent honours a SIGNED `approvalDefault` on a Claude START and a SIGNED
+	// `approvalDisposition` (+ `instructionId`) on a SEND, a relay turn and a
+	// `relay_follow_up`, answers a can_use_tool prompt as allow itself only
+	// while the open turn is `autoAllow`, and marks every prompt it answers
+	// with `autoApproval` (claude_native_approval.go). terminal-service signs
+	// the fields, and launches a chat Claude session shareable, only when this
+	// is true: an older agent would reject the unknown signed fields.
+	RelayOriginApprovals bool `json:"relayOriginApprovals"`
 	// RelayCwdFence (shared-constants DEVICE_RELAY_CAPABILITIES.CWD_FENCE):
 	// the agent enforces a SIGNED `cwdFence` on a session_start admitted through
 	// an ancestor grant, refusing with CWD_OUTSIDE_GRANT_FOLDER if the resolved
@@ -427,6 +436,7 @@ func newMachineCapabilities() *capabilitiesInfo {
 		RelayFollowUps:           newRelayFollowUpsCapability(),
 		RelayAckWatermark:        true,
 		RelayPermissionPrompts:   true,
+		RelayOriginApprovals:     true,
 		RelayCwdFence:            true,
 		NativeLaunchArgs:         true,
 		OpenCodeAuthRefusalFrame: true,

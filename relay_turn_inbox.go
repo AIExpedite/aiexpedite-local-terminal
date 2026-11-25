@@ -169,6 +169,13 @@ type relayTurnRow struct {
 	// copy of it is refused as expired without a row; a refused row is kept
 	// until then. 0 keeps it until relayTurnInboxTTL.
 	FenceUntil int64 `json:"fenceUntil,omitempty"`
+	// ApprovalDisposition / InstructionID are the turn's SIGNED approval
+	// fields as its FIRST claimed delivery carried them
+	// (claude_native_approval.go). The turn always runs under these: a
+	// redelivery, whatever it carries, can never change the disposition of a
+	// turn this row already holds.
+	ApprovalDisposition string `json:"approvalDisposition,omitempty"`
+	InstructionID       string `json:"instructionId,omitempty"`
 }
 
 type relayTurnInboxFile struct {
@@ -539,8 +546,14 @@ func (b *relayTurnInbox) BeginFenced(cmd commandMsg, turnID, agentID string, ref
 			}
 			return relayTurnNoSlot, relayTurnRow{SessionID: cmd.SessionID, TurnID: turnID}, ""
 		}
-		r = &relayTurnRow{SessionID: cmd.SessionID, TurnID: turnID, ClaimedAt: now}
+		r = &relayTurnRow{
+			SessionID: cmd.SessionID, TurnID: turnID, ClaimedAt: now,
+			ApprovalDisposition: cmd.ApprovalDisposition, InstructionID: cmd.InstructionID,
+		}
 		b.rows[key] = r
+	} else if r.ApprovalDisposition == "" && r.InstructionID == "" {
+		// A row claimed by a build that did not record them.
+		r.ApprovalDisposition, r.InstructionID = cmd.ApprovalDisposition, cmd.InstructionID
 	}
 	r.State = relayTurnStateClaimed
 	r.FenceUntil = relayTurnFenceUntil(cmd)
@@ -802,6 +815,28 @@ func withRelayTurnAcceptance(ctx context.Context, accept func() error) context.C
 	return context.WithValue(ctx, relayTurnAcceptKey{}, accept)
 }
 
+// relayTurnApprovalKey carries the approval fields a relay turn's inbox row
+// recorded at its first claim through the dispatch ctx (claudeSendApproval).
+type relayTurnApprovalKey struct{}
+
+func withRelayTurnApproval(ctx context.Context, row relayTurnRow) context.Context {
+	return context.WithValue(ctx, relayTurnApprovalKey{}, claudeTurnApproval{
+		Disposition: row.ApprovalDisposition, InstructionID: row.InstructionID,
+	})
+}
+
+// claudeSendApproval is a Claude SEND's approval fields: the ones its relay
+// turn's inbox row pinned when it is one, else the command's own signed
+// fields.
+func claudeSendApproval(ctx context.Context, cmd commandMsg) claudeTurnApproval {
+	if ctx != nil {
+		if a, ok := ctx.Value(relayTurnApprovalKey{}).(claudeTurnApproval); ok {
+			return a
+		}
+	}
+	return claudeTurnApprovalOf(cmd)
+}
+
 // relayTurnAcceptor returns the acceptance callback of the relay turn being
 // dispatched on ctx, or nil for an ordinary command. Handlers hand it to their
 // manager, which calls it at its ownership boundary — after every refusal
@@ -978,7 +1013,7 @@ func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandM
 		})
 		return acceptErr
 	}
-	dispatch(withRelayTurnAcceptance(ctx, accept))
+	dispatch(withRelayTurnApproval(withRelayTurnAcceptance(ctx, accept), row))
 	if acceptRefusal != "" {
 		// Refused at the acceptance boundary: the manager wrote nothing, and
 		// the row is now refused, so a redelivery gets the same answer.

@@ -647,6 +647,9 @@ func runMockCLI(mode string) {
 	case "claude-native-echo":
 		runMockClaudeNative()
 
+	case "claude-native-ask":
+		runMockClaudeNativeAsk()
+
 	case "claude-native-delta-burst":
 		// The end of a turn as Claude Code prints it (seen on dev 2026-11-13):
 		// the message's partial-message deltas, its assistant recap and the
