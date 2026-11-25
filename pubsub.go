@@ -866,7 +866,8 @@ func isSigFailRateLimited() bool {
 // signaturePayload matches the exact JSON structure used by Node.js signCommand()
 // Field order must match: id, command, args, ts, type, sessionID, input, signal,
 // refreshId, riskLevel, executionId, cwd, conversationId, ackedTurnIds,
-// cliAgentCatalog, deliveryExpiresAt, cwdFence, readOnly
+// cliAgentCatalog, deliveryExpiresAt, cwdFence, approvalDefault,
+// approvalDisposition, instructionId, readOnly
 //
 // That list is a contract, not a description. Go marshals struct fields in
 // DECLARATION order, so moving any line below changes the canonical bytes and
@@ -993,6 +994,22 @@ type signaturePayload struct {
 	// with CWD_OUTSIDE_GRANT_FOLDER. Node's signCommand appends `canonical.cwdFence`
 	// immediately before `readOnly`.
 	CwdFence string `json:"cwdFence,omitempty"`
+	// ApprovalDefault, ApprovalDisposition and InstructionID decide how a
+	// shared Claude session's tool-use prompts are answered
+	// (claude_native_approval.go): `approvalDefault` on a START, the other two
+	// on a SEND, a relay turn and a `relay_follow_up`. Signed, because an
+	// `autoAllow` makes this device answer a prompt as allow with no person
+	// asked — an injected or upgraded value would let a voice turn run
+	// unconfirmed actions. Node's signCommand appends them after cwdFence and
+	// before readOnly, in this order, each only when a non-empty string;
+	// omitempty keeps every other command's canonical byte-identical.
+	// terminal-service sends them only to a device reporting
+	// capabilities.relayOriginApprovals — an older agent computes a canonical
+	// without them and rejects the command. Pinned by
+	// TestSignedApprovalFields_SitBetweenCwdFenceAndReadOnly.
+	ApprovalDefault     string `json:"approvalDefault,omitempty"`
+	ApprovalDisposition string `json:"approvalDisposition,omitempty"`
+	InstructionID       string `json:"instructionId,omitempty"`
 	// readOnly asks for an ENFORCED read-only session (readonly_session.go).
 	// Signed so it can be neither stripped (a read-only review would run
 	// writable) nor injected. Node's signCommand appends `canonical.readOnly =
@@ -1046,14 +1063,17 @@ func signatureCanonical(cmd commandMsg) ([]byte, error) {
 		// command carries one, so this must too or the two canonicals diverge.
 		ExecutionID: cmd.ExecutionID,
 		// Gated to match the Node signer — see the field comment.
-		Cwd:               signatureCwd(cmd),
-		ConversationID:    cmd.ConversationID,
-		AckedTurnIds:      cmd.AckedTurnIds,
-		CliAgentCatalog:   cliAgentCatalogSignatureJSON(cmd),
-		DeliveryExpiresAt: cmd.DeliveryExpiresAt,
-		ExpectedTurnID:    cmd.ExpectedTurnID,
-		CwdFence:          cmd.CwdFence,
-		ReadOnly:          cmd.ReadOnly,
+		Cwd:                 signatureCwd(cmd),
+		ConversationID:      cmd.ConversationID,
+		AckedTurnIds:        cmd.AckedTurnIds,
+		CliAgentCatalog:     cliAgentCatalogSignatureJSON(cmd),
+		DeliveryExpiresAt:   cmd.DeliveryExpiresAt,
+		ExpectedTurnID:      cmd.ExpectedTurnID,
+		CwdFence:            cmd.CwdFence,
+		ApprovalDefault:     cmd.ApprovalDefault,
+		ApprovalDisposition: cmd.ApprovalDisposition,
+		InstructionID:       cmd.InstructionID,
+		ReadOnly:            cmd.ReadOnly,
 	}
 
 	// Use json.NewEncoder with SetEscapeHTML(false) to match Node.js JSON.stringify behavior.
@@ -1277,6 +1297,14 @@ type commandMsg struct {
 	// with CWD_OUTSIDE_GRANT_FOLDER. SIGNED (see signaturePayload.CwdFence).
 	CwdFence string `json:"cwdFence,omitempty"`
 
+	// Shared-session approvals (claude_native_approval.go). SIGNED (see
+	// signaturePayload.ApprovalDefault): `approvalDefault` on a Claude START,
+	// `approvalDisposition` + `instructionId` on a Claude SEND, a relay turn
+	// and a `relay_follow_up`. "autoAllow" | "askPerson"; anything else asks.
+	ApprovalDefault     string `json:"approvalDefault,omitempty"`
+	ApprovalDisposition string `json:"approvalDisposition,omitempty"`
+	InstructionID       string `json:"instructionId,omitempty"`
+
 	// ReadOnly asks for an ENFORCED read-only coding-agent session
 	// (readonly_session.go): only a generic session_start of the bare `claude`
 	// or `codex` honours it; every other command carrying it is refused
@@ -1457,6 +1485,14 @@ type resultMsg struct {
 	//                    `_session/steering`, the follow-up ledger's outcome.
 	AcpHandoverTo   string `json:"acpHandoverTo,omitempty"`
 	AcpSteerOutcome string `json:"acpSteerOutcome,omitempty"`
+
+	// AutoApproval (shared-constants CODING_SESSION_AUTO_APPROVAL_FIELD): on a
+	// Claude `can_use_tool` control_request this device answered as allow
+	// itself (an `autoAllow` turn of a shared session), which instruction's
+	// turn allowed it. The stored chunk is the audit record of that
+	// auto-approval; terminal-service checks it against the instruction
+	// record. Output stays the CLI's line, verbatim.
+	AutoApproval *claudeAutoApprovalMark `json:"autoApproval,omitempty"`
 
 	// Follow-up answers (relay_follow_up_ledger.go): one attempt's durable
 	// outcome on `relay_follow_up_ack`, and a refused queued follow-up turn's
@@ -7901,7 +7937,7 @@ func handleClaudeNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd
 			})
 		}
 
-		err := globalClaudeNativeManager.StartForAgent(
+		err := globalClaudeNativeManager.StartForAgentWithApproval(
 			cmd.AgentID, // names this agent on the outside-writer frame when the config has no id
 			cmd.SessionID,
 			cmd.Cwd,
@@ -7909,6 +7945,9 @@ func handleClaudeNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd
 			cmd.Input, // optional initial user prompt (plain text)
 			cmd.WorkspaceID,
 			cmd.UID,
+			// Signed: the session's default approval disposition, and the
+			// initial prompt's instruction (claude_native_approval.go).
+			claudeStartApproval{Default: cmd.ApprovalDefault, InstructionID: cmd.InstructionID},
 			publishFn,
 			onStarted,
 		)
@@ -7927,7 +7966,9 @@ func handleClaudeNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd
 			return
 		}
 
-		if err := globalClaudeNativeManager.SendAccepting(cmd.SessionID, cmd.Input, relayTurnAcceptor(ctx)); err != nil {
+		// A relay turn runs under the disposition its inbox row recorded at
+		// its first claim, so a redelivered copy can never change it.
+		if err := globalClaudeNativeManager.SendTurn(cmd.SessionID, cmd.Input, relayTurnAcceptor(ctx), claudeSendApproval(ctx, cmd)); err != nil {
 			publishClaudeNativeError(ctx, topic, cmd, fmt.Sprintf("failed to send to claude native: %v", err))
 			return
 		}

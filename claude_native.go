@@ -122,6 +122,9 @@ type ClaudeNativeSession struct {
 	// answered: a live follow-up is never written while one is open (it would
 	// sit beside an approval a person must answer first).
 	pendingApprovals atomic.Int32
+	// approvals decides which can_use_tool prompts this device answers as
+	// allow itself (claude_native_approval.go). Set once at construction.
+	approvals *claudeApprovalState
 	// killUnconfirmed marks a session whose End escalated to Kill and then
 	// timed out waiting for the exit watcher. The session is RETAINED as a
 	// tombstone (see end_confirm.go): only probeProcessGone may convert it
@@ -235,6 +238,19 @@ func (m *ClaudeNativeManager) frameAgentID(commandAgentID string) string {
 // StartForAgent is Start for a start command addressed to commandAgentID (the
 // fallback for frameAgentID).
 func (m *ClaudeNativeManager) StartForAgent(commandAgentID, id, cwd string, extraArgs []string, initialPrompt, workspaceID, uid string, publishFn PublishFunc, onStarted func()) error {
+	return m.StartForAgentWithApproval(commandAgentID, id, cwd, extraArgs, initialPrompt, workspaceID, uid, claudeStartApproval{}, publishFn, onStarted)
+}
+
+// claudeStartApproval is a START's signed approval fields: the session's
+// default disposition, and the instruction id of its initial prompt.
+type claudeStartApproval struct {
+	Default       string
+	InstructionID string
+}
+
+// StartForAgentWithApproval is StartForAgent with the START's signed approval
+// fields (claude_native_approval.go). An empty Default asks.
+func (m *ClaudeNativeManager) StartForAgentWithApproval(commandAgentID, id, cwd string, extraArgs []string, initialPrompt, workspaceID, uid string, approval claudeStartApproval, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -337,6 +353,7 @@ func (m *ClaudeNativeManager) StartForAgent(commandAgentID, id, cwd string, extr
 		WorkspaceID:     workspaceID,
 		UID:             uid,
 		launchedVersion: launchedVersion,
+		approvals:       newClaudeApprovalState(claudeLaunchAsksEachAction(args), approval.Default),
 		status:          "running",
 		done:            make(chan struct{}),
 		processExited:   make(chan struct{}),
@@ -382,7 +399,10 @@ func (m *ClaudeNativeManager) StartForAgent(commandAgentID, id, cwd string, extr
 	// frame (waitForExit still emits claude_native_ended once the child
 	// exits) so the consumer sees the failure instead of a silent empty chat.
 	if prompt != "" {
-		if err := m.writeUserTurn(session, prompt); err != nil {
+		// The initial prompt is the START's own instruction: its turn follows
+		// the session's default.
+		startTurn := claudeTurnApproval{Disposition: approval.Default, InstructionID: approval.InstructionID}
+		if err := m.writeUserTurnAccepting(session, prompt, nil, startTurn); err != nil {
 			fmt.Printf("%s[claude-native] Failed to send initial prompt to %s: %v%s\n",
 				colorRed, id, err, colorReset)
 			seq := atomic.AddInt64(&session.seq, 1)
@@ -433,6 +453,14 @@ func (m *ClaudeNativeManager) Send(id string, text string) error {
 // look like a turn that never started, and the redelivery would run it twice.
 // An accept error (the acceptance could not be made durable) refuses the turn.
 func (m *ClaudeNativeManager) SendAccepting(id string, text string, accept func() error) error {
+	return m.SendTurn(id, text, accept, claudeTurnApproval{})
+}
+
+// SendTurn is SendAccepting with the instruction's signed approval fields
+// (claude_native_approval.go): the disposition the turn's tool-use prompts
+// follow, applied under stdinMu immediately before the text is written. An
+// empty Disposition inherits the most recent attributed turn's.
+func (m *ClaudeNativeManager) SendTurn(id string, text string, accept func() error, approval claudeTurnApproval) error {
 	session := m.Get(id)
 	if session == nil {
 		return fmt.Errorf("claude native session %s not found", id)
@@ -440,21 +468,22 @@ func (m *ClaudeNativeManager) SendAccepting(id string, text string, accept func(
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("payload is empty")
 	}
-	return m.writeUserTurnAccepting(session, text, accept)
+	return m.writeUserTurnAccepting(session, text, accept, approval)
 }
 
-// writeUserTurn serialises a single NDJSON user envelope to the child's stdin
-// with a fail-fast timeout. On a stalled write it closes stdin, marks the
-// session ended, and kills the child so waitForExit publishes the terminal
-// frame — this guarantees a later Send cannot interleave with an abandoned
-// write goroutine.
+// writeUserTurn is writeUserTurnAccepting with no acceptance callback and no
+// signed approval fields (the turn inherits).
 func (m *ClaudeNativeManager) writeUserTurn(session *ClaudeNativeSession, text string) error {
-	return m.writeUserTurnAccepting(session, text, nil)
+	return m.writeUserTurnAccepting(session, text, nil, claudeTurnApproval{})
 }
 
-// writeUserTurnAccepting is writeUserTurn with the relay acceptance callback
-// (see SendAccepting).
-func (m *ClaudeNativeManager) writeUserTurnAccepting(session *ClaudeNativeSession, text string, accept func() error) error {
+// writeUserTurnAccepting serialises a single NDJSON user envelope to the
+// child's stdin with a fail-fast timeout, after the relay acceptance callback
+// (see SendAccepting) and the turn's approval disposition. On a stalled write
+// it closes stdin, marks the session ended, and kills the child so
+// waitForExit publishes the terminal frame — this guarantees a later Send
+// cannot interleave with an abandoned write goroutine.
+func (m *ClaudeNativeManager) writeUserTurnAccepting(session *ClaudeNativeSession, text string, accept func() error, approval claudeTurnApproval) error {
 	envelope := claudeUserEnvelope(session.ID, text)
 
 	session.stdinMu.Lock()
@@ -476,6 +505,15 @@ func (m *ClaudeNativeManager) writeUserTurnAccepting(session *ClaudeNativeSessio
 	// dropping that turn's usage.
 	session.turnSettled.Store(false)
 
+	// The turn's approval disposition is set BEFORE its text reaches the
+	// child, under stdinMu, so no prompt this instruction raises can be
+	// answered under the turn's earlier disposition. Undone if the write
+	// fails (the instruction never reached the child).
+	var prevApproval claudeApprovalSnapshot
+	if session.approvals != nil {
+		prevApproval = session.approvals.beginTurn(approval)
+	}
+
 	writeDone := make(chan error, 1)
 	go func() {
 		_, err := fmt.Fprintln(session.Stdin, envelope)
@@ -484,6 +522,9 @@ func (m *ClaudeNativeManager) writeUserTurnAccepting(session *ClaudeNativeSessio
 	select {
 	case err := <-writeDone:
 		if err != nil {
+			if session.approvals != nil {
+				session.approvals.restore(prevApproval)
+			}
 			return fmt.Errorf("failed to write to claude native session %s stdin: %w", session.ID, err)
 		}
 	case <-time.After(claudeNativeStdinWriteBudget):
@@ -529,6 +570,18 @@ func (m *ClaudeNativeManager) SendControl(id string, raw string) error {
 	if session.Status() == "ended" {
 		return fmt.Errorf("claude native session %s has ended", session.ID)
 	}
+	if err := writeClaudeControlLocked(session, line); err != nil {
+		return err
+	}
+	// The person answered one open approval.
+	session.answerPendingApproval()
+	return nil
+}
+
+// writeClaudeControlLocked writes one validated control_response line to the
+// child's stdin (caller holds stdinMu): a person's answer (SendControl) or
+// this device's own allow for an autoAllow turn (autoAnswerCanUseTool).
+func writeClaudeControlLocked(session *ClaudeNativeSession, line string) error {
 	writeDone := make(chan error, 1)
 	go func() {
 		_, err := fmt.Fprintln(session.Stdin, line)
@@ -539,8 +592,6 @@ func (m *ClaudeNativeManager) SendControl(id string, raw string) error {
 		if err != nil {
 			return fmt.Errorf("failed to write control to claude native session %s: %w", session.ID, err)
 		}
-		// The person answered one open approval.
-		session.answerPendingApproval()
 		return nil
 	case <-time.After(claudeNativeStdinWriteBudget):
 		// Same teardown as a stalled user turn: releasing stdinMu with the
@@ -965,17 +1016,28 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 			if isClaudeStreamDeltaLine(trimmed) {
 				lane = deltaQueue
 			}
+			// A tool-use prompt in an autoAllow turn (a chat or typed
+			// instruction of a shared session) is answered here, as allow,
+			// before its chunk is published; the chunk carries the mark that
+			// records it. Every other prompt is published for a person.
+			var autoApproval *claudeAutoApprovalMark
+			isCanUseTool := false
+			if requestID, input, ok := claudeCanUseToolRequest(trimmed); ok {
+				isCanUseTool = true
+				autoApproval = m.autoAnswerCanUseTool(session, requestID, input)
+			}
 			if !publishOrFailTo(lane, resultMsg{
-				ID:          session.ID,
-				WorkspaceID: session.WorkspaceID,
-				UID:         session.UID,
-				Output:      trimmed,
-				Status:      "success",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Type:        "claude_native_message",
-				SessionID:   session.ID,
-				Seq:         int(seq),
+				ID:           session.ID,
+				WorkspaceID:  session.WorkspaceID,
+				UID:          session.UID,
+				Output:       trimmed,
+				Status:       "success",
+				Ts:           time.Now().UnixMilli(),
+				Version:      Version,
+				Type:         "claude_native_message",
+				SessionID:    session.ID,
+				Seq:          int(seq),
+				AutoApproval: autoApproval,
 			}, "claude_native_message") {
 				return
 			}
@@ -987,13 +1049,19 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 			// detectResultEvent is the same terminal-frame decision session.go
 			// makes for the managed path — one definition, so the two execution
 			// paths can never disagree about what "the run finished" means.
-			if strings.Contains(trimmed, `"control_request"`) && strings.Contains(trimmed, `"can_use_tool"`) {
+			// Only a prompt left for a person is open: an answered one holds
+			// no live follow-up back.
+			if isCanUseTool && autoApproval == nil {
 				session.pendingApprovals.Add(1)
 			}
 			if detectResultEvent("claude", trimmed) {
 				session.turnSettled.Store(true)
-				// A finished turn has no approval left open.
+				// A finished turn has no approval left open, and the next
+				// prompt follows the session's default until a turn opens.
 				session.pendingApprovals.Store(0)
+				if session.approvals != nil {
+					session.approvals.settle()
+				}
 				triggerClaudeUsageProbeAfterRun()
 			}
 		}
