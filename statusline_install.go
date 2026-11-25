@@ -1199,9 +1199,33 @@ func writeSettingsAtomic(settingsPath string, out []byte) error {
 	if err := statusLineWriteFile(tmp, out, 0o600); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, settingsPath); err != nil {
+	if err := renameClaudeSettings(tmp, settingsPath); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
 	return nil
+}
+
+// claudeSettingsRename is os.Rename behind a seam of its own (not
+// cacheFileRename), so a test refusing cache renames never refuses this one.
+var claudeSettingsRename = os.Rename
+
+// renameClaudeSettings renames tmp over settings.json, retrying a refused
+// rename on cacheFileGuard's short doubling backoff. On Windows Go opens files
+// without FILE_SHARE_DELETE, so the rename fails "Access is denied" while
+// anything has settings.json open for a moment: Claude Code reading its config,
+// the status-line hook, a scanner, or this process's own read. A failed
+// reconcile is throttled for claudeStatusLineRecheckInterval, so one unlucky
+// overlap used to leave the hooks missing for a minute.
+func renameClaudeSettings(tmp, settingsPath string) error {
+	var err error
+	for attempt := 1; attempt <= cacheFileAttempts; attempt++ {
+		if err = claudeSettingsRename(tmp, settingsPath); err == nil {
+			return nil
+		}
+		if attempt < cacheFileAttempts {
+			cacheFileSleep(cacheFileRetryDelay(attempt))
+		}
+	}
+	return err
 }

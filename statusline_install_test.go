@@ -1768,3 +1768,55 @@ func TestEnsureClaudeStatusLineHookIfStale_CollapsesDuplicateLiveRunEndHooks(t *
 		t.Fatalf("SessionEnd = %+v, want exactly one run-end hook after the repair", groups)
 	}
 }
+
+// A rename refused the way Windows refuses one while another handle has
+// settings.json open is retried, so the write lands instead of failing the
+// reconcile and leaving the hooks missing until the throttle lapses.
+func TestWriteSettingsAtomic_RetriesARefusedRename(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(path, []byte(`{"old":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prevRename, prevSleep := claudeSettingsRename, cacheFileSleep
+	t.Cleanup(func() { claudeSettingsRename, cacheFileSleep = prevRename, prevSleep })
+	cacheFileSleep = func(time.Duration) {}
+	refusals := 0
+	claudeSettingsRename = func(oldpath, newpath string) error {
+		if refusals < cacheFileAttempts-1 {
+			refusals++
+			return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: os.ErrPermission}
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	if err := writeSettingsAtomic(path, []byte(`{"new":true}`)); err != nil {
+		t.Fatalf("writeSettingsAtomic: %v", err)
+	}
+	if b, _ := os.ReadFile(path); string(b) != `{"new":true}` {
+		t.Fatalf("settings.json = %s", b)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("temp file left behind: %v", err)
+	}
+}
+
+// Every attempt refused: the error is returned and the temp file removed.
+func TestWriteSettingsAtomic_GivesUpAfterTheLastRefusal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	prevRename, prevSleep := claudeSettingsRename, cacheFileSleep
+	t.Cleanup(func() { claudeSettingsRename, cacheFileSleep = prevRename, prevSleep })
+	cacheFileSleep = func(time.Duration) {}
+	calls := 0
+	claudeSettingsRename = func(oldpath, newpath string) error {
+		calls++
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: os.ErrPermission}
+	}
+	if err := writeSettingsAtomic(path, []byte(`{}`)); err == nil {
+		t.Fatal("want an error")
+	}
+	if calls != cacheFileAttempts {
+		t.Fatalf("rename attempts = %d, want %d", calls, cacheFileAttempts)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("temp file left behind: %v", err)
+	}
+}
