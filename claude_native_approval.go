@@ -36,7 +36,12 @@ package main
 //   - A turn settling (Claude's `result`) returns the disposition to the
 //     session's default, so a turn Claude starts by itself follows the START —
 //     unless an asking instruction was written mid-turn: Claude may run it as
-//     the next turn, so that one asks too, until a SEND opens a turn of its own.
+//     the next turn, so that turn is treated as OPEN and asking until its own
+//     `result`. Nothing on stdout says when a queued instruction starts, so a
+//     SEND arriving meanwhile is written into that turn (lower only) and can
+//     never raise it. If Claude had in fact merged the instruction into the
+//     turn that just settled, the next turn asks once more than it needed to:
+//     the conservative side.
 //   - A redelivered relay turn runs under the approval its FIRST claimed
 //     delivery carried (the turn inbox row pins it, relay_turn_inbox.go).
 //   - Anything but the literal "autoAllow" asks, and nothing is ever answered
@@ -114,9 +119,9 @@ type claudeApprovalState struct {
 	lastAttributed *claudeTurnApproval
 	// carryAsk: an asking instruction was written while the turn was open.
 	// Claude may take it into the running turn or run it as the next one, and
-	// nothing tells the two apart, so the settle does not return to an
-	// allowing default: the turn after it asks too, until a SEND opens a
-	// turn of its own.
+	// nothing tells the two apart, so the settle keeps the turn open and
+	// asking: the next turn asks too, and a SEND arriving before its own
+	// `result` cannot raise it.
 	carryAsk         bool
 	carryInstruction string
 }
@@ -179,15 +184,19 @@ func (a *claudeApprovalState) restore(prev claudeApprovalSnapshot) {
 
 // settle ends the open turn (Claude's `result`): the disposition returns to
 // the session's default — except after an asking instruction was written
-// mid-turn (carryAsk), which Claude may still run as the next turn: that one
-// asks too.
+// mid-turn (carryAsk), which Claude may still run as the next turn. That turn
+// stays OPEN and asking until its own `result`: writing another instruction
+// to stdin does not mean it has ended, so a chat SEND meanwhile only joins it
+// and cannot turn its prompts into allowed ones.
 func (a *claudeApprovalState) settle() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.turnOpen = false
-	a.disposition, a.instruction = a.defaultDisp, ""
 	if a.carryAsk {
+		a.turnOpen = true
 		a.disposition, a.instruction = claudeApprovalAskPerson, a.carryInstruction
+	} else {
+		a.turnOpen = false
+		a.disposition, a.instruction = a.defaultDisp, ""
 	}
 	a.carryAsk, a.carryInstruction = false, ""
 }

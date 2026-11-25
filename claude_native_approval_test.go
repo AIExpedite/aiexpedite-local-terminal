@@ -100,7 +100,8 @@ func TestClaudeApproval_MidTurnOnlyLowers(t *testing.T) {
 }
 
 // A turn settling returns to the default, except after an asking instruction
-// was written mid-turn: Claude may run it as the next turn, which asks too.
+// was written mid-turn: Claude may run it as the next turn, which asks too and
+// stays open until its own result.
 func TestClaudeApproval_SettleReturnsToDefaultUnlessAnAskWasCarried(t *testing.T) {
 	a := newClaudeApprovalState(true, claudeApprovalAutoAllow)
 	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-1"})
@@ -115,13 +116,56 @@ func TestClaudeApproval_SettleReturnsToDefaultUnlessAnAskWasCarried(t *testing.T
 	if a.decide() != nil {
 		t.Fatal("a voice follow-up written mid-turn was allowed as the next turn")
 	}
+	if d, id := a.current(); d != claudeApprovalAskPerson || id != "voice-3" {
+		t.Fatalf("carried turn = %s/%s, want askPerson/voice-3", d, id)
+	}
+	a.settle() // the carried voice turn's own result
+	if a.decide() == nil {
+		t.Fatal("the carried ask outlived its own turn")
+	}
 	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-4"})
 	if a.decide() == nil {
 		t.Fatal("a chat SEND opening its own turn did not allow")
 	}
-	a.settle()
+}
+
+// A chat SEND arriving while a carried voice turn is (or may be) running joins
+// that turn and never raises it: the voice turn's later prompts still ask and
+// are never attributed to the chat instruction. Only that turn's own result
+// ends it.
+func TestClaudeApproval_ChatSendCannotRaiseACarriedVoiceTurn(t *testing.T) {
+	a := newClaudeApprovalState(true, claudeApprovalAutoAllow)
+	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-1"})
+	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-2"})
+	a.settle() // chat-1's result; Claude now runs voice-2 as the next turn
+
+	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-3"})
+	if a.decide() != nil {
+		t.Fatal("a chat SEND during the queued voice turn auto-approved its prompts")
+	}
+	if d, id := a.current(); d != claudeApprovalAskPerson || id != "voice-2" {
+		t.Fatalf("running turn = %s/%s, want askPerson/voice-2", d, id)
+	}
+
+	a.settle() // voice-2's result; chat-3 runs next under the default
 	if a.decide() == nil {
-		t.Fatal("the carried ask outlived the turn after it")
+		t.Fatal("the chat turn after the voice turn did not allow")
+	}
+
+	// A further voice follow-up written into the carried turn chains: the
+	// turn after it asks as well.
+	b := newClaudeApprovalState(true, claudeApprovalAutoAllow)
+	b.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-1"})
+	b.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-2"})
+	b.settle()
+	b.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-3"})
+	b.settle()
+	if d, id := b.current(); d != claudeApprovalAskPerson || id != "voice-3" {
+		t.Fatalf("chained carry = %s/%s, want askPerson/voice-3", d, id)
+	}
+	b.settle()
+	if b.decide() == nil {
+		t.Fatal("the chained carry outlived its own turn")
 	}
 }
 
