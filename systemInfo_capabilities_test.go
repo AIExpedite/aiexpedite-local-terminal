@@ -97,8 +97,11 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// Antigravity on their long-lived ACP drivers, and `mspDrivers` with
 			// Muse Code on `muse serve` (both always present, an empty list when
 			// no installed CLI qualifies); `browserControl` with the AI working
-			// in the person's own Chrome (browser_*.go).
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode","codex","grok","opencode","antigravity","museCode"],"protocol":3},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]},"mspDrivers":{"protocol":2,"agents":[]},"browserControl":`+string(bcRaw)+`}` {
+			// in the person's own Chrome (browser_*.go); `relayOriginApprovals`
+			// with shared voice/chat sessions (claude_native_approval.go: the
+			// app answers a chat turn's Claude prompts itself, a voice turn's
+			// wait for a person).
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayOriginApprovals":true,"relayCwdFence":true,"nativeLaunchArgs":true,"openCodeAuthRefusalFrame":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode","codex","grok","opencode","antigravity","museCode"],"protocol":3},"worktreeBuiltIns":true,"signedExecutionId":true,"signedCommandExpiry":true,"whatsapp":`+string(waRaw)+`,"acpDrivers":{"protocol":1,"agents":[]},"mspDrivers":{"protocol":2,"agents":[]},"browserControl":`+string(bcRaw)+`}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})
