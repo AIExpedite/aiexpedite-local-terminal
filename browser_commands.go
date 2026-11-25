@@ -42,6 +42,9 @@ type browserDispatcher struct {
 	now  func() time.Time
 	// done is called after a command's result was posted (tests wait on it).
 	done func(commandID string)
+	// setup opens a fixed setup destination (openSetup). It needs neither
+	// DevTools nor AppleScript, so it never goes through route / open.
+	setup func(ctx context.Context, destination string) (map[string]any, *browserError)
 }
 
 type browserTabLock struct {
@@ -63,9 +66,10 @@ func newBrowserDispatcher() *browserDispatcher {
 		route: func(ctx context.Context, tabRoute string) (browserRouteChoice, *browserError) {
 			return chooseBrowserRoute(ctx, runtime.GOOS, tabRoute, discoverChromeDevTools)
 		},
-		open: openBrowserBackend,
-		hold: globalCDPManager.holdFor,
-		now:  time.Now,
+		open:  openBrowserBackend,
+		hold:  globalCDPManager.holdFor,
+		now:   time.Now,
+		setup: newBrowserSetupOpener().open,
 	}
 }
 
@@ -262,6 +266,13 @@ func (d *browserDispatcher) lockTab(ctx context.Context, tabID string) (func(), 
 func (d *browserDispatcher) execute(id string, start, deadline time.Time, p browserParams, stop *atomic.Bool) {
 	ctx, cancel := context.WithDeadline(context.Background(), deadline.Add(-browserResultMargin))
 	defer cancel()
+	if p.Op == browserOpOpenSetup {
+		// No tab, no route choice, no DevTools: a fixed, compiled-in action.
+		result, berr := d.setup(ctx, p.Destination)
+		logBrowser(id, "openSetup "+p.Destination)
+		d.finish(id, start, "", result, berr)
+		return
+	}
 	if p.TabID != "" {
 		unlock, err := d.lockTab(ctx, p.TabID)
 		if err != nil {

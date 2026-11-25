@@ -1230,7 +1230,7 @@ func TestEnsureClaudeStatusLineHookIfStale_RestoresBothHooksAfterARewrite(t *tes
 	home, settingsPath := armStatusLineReconcile(t)
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1306,7 +1306,7 @@ func TestEnsureClaudeStatusLineHookIfStale_ForeignRewriteDuringRepairIsRepairedN
 			home, settingsPath := armStatusLineReconcile(t)
 			resetClaudeUsageProbeGate()
 			SetClaudeUsageProbeDisabled(false)
-			t.Cleanup(resetClaudeUsageProbeGate)
+			t.Cleanup(func() { requireClaudeResetDrained(t) })
 			if tc.initial != "" {
 				if err := os.WriteFile(settingsPath, []byte(tc.initial), 0o600); err != nil {
 					t.Fatal(err)
@@ -1357,7 +1357,7 @@ func TestEnsureClaudeStatusLineHookIfStale_ProbeOptOutRemovesTheRunEndHook(t *te
 	home, settingsPath := armStatusLineReconcile(t)
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 	if _, err := ensureClaudeStatusLineHookIfStale(home); err != nil {
 		t.Fatal(err)
 	}
@@ -1392,7 +1392,7 @@ func TestEnsureClaudeStatusLineHookIfStale_PreservesActivePeerHooks(t *testing.T
 	home, settingsPath := armStatusLineReconcile(t)
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(true) // local process opts out of probing
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 
 	// Create a dummy peer executable that exists on disk.
 	peerExe := filepath.Join(t.TempDir(), "peer-agent")
@@ -1458,7 +1458,7 @@ func TestEnsureClaudeStatusLineHookIfStale_RepairsWhenPeerBinaryDeleted(t *testi
 	home, settingsPath := armStatusLineReconcile(t)
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 
 	// Peer executable path that does NOT exist on disk.
 	deadExe := filepath.Join(t.TempDir(), "deleted-agent")
@@ -1515,7 +1515,7 @@ func TestEnsureClaudeStatusLineHookIfStale_InstallsRunEndWhenPeerOnlyHasStatusLi
 	home, settingsPath := armStatusLineReconcile(t)
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 
 	peerExe := filepath.Join(t.TempDir(), "peer-agent")
 	if err := os.WriteFile(peerExe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
@@ -1585,7 +1585,7 @@ func TestEnsureClaudeStatusLineHookIfStale_RepairsAMatcherRestrictedRunEndHook(t
 	home, settingsPath := armStatusLineReconcile(t)
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 
 	peerExe := filepath.Join(t.TempDir(), "peer-agent")
 	if err := os.WriteFile(peerExe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
@@ -1621,7 +1621,7 @@ func TestEnsureClaudeStatusLineHookIfStale_RepairsANonExecutablePeerBinary(t *te
 	home, settingsPath := armStatusLineReconcile(t)
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 
 	peerExe := filepath.Join(t.TempDir(), "peer-agent")
 	if err := os.WriteFile(peerExe, []byte("#!/bin/sh\nexit 0\n"), 0o644); err != nil {
@@ -1648,7 +1648,7 @@ func TestEnsureClaudeStatusLineHookIfStale_RepairsAMistimedRunEndHook(t *testing
 	home, settingsPath := armStatusLineReconcile(t)
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 
 	peerExe := filepath.Join(t.TempDir(), "peer-agent")
 	if err := os.WriteFile(peerExe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
@@ -1707,7 +1707,7 @@ func TestClaudeRunEndHookReconciled_ProbeDisabledFlagsOurMistimedHook(t *testing
 	armStatusLineReconcile(t)
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(true)
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 
 	ours, ok := ourClaudeHookCommand(claudeRunEndHookArg)
 	if !ok {
@@ -1728,7 +1728,7 @@ func TestEnsureClaudeStatusLineHookIfStale_CollapsesDuplicateLiveRunEndHooks(t *
 	home, settingsPath := armStatusLineReconcile(t)
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 
 	peerExe := filepath.Join(t.TempDir(), "peer-agent")
 	if err := os.WriteFile(peerExe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {

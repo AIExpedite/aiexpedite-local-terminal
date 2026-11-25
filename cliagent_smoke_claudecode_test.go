@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -646,34 +645,6 @@ func TestClaudeRetryableArgvFlags_DerivedFromTheLadder(t *testing.T) {
 			}
 		}
 	}
-}
-
-// captureStdout redirects os.Stdout for the duration of fn and returns whatever
-// was written. Used to prove what actually reaches this device's log, rather
-// than trusting the call site to be well-behaved.
-func captureStdout(t *testing.T, fn func()) string {
-	t.Helper()
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	original := os.Stdout
-	os.Stdout = writer
-
-	done := make(chan string, 1)
-	go func() {
-		var buf bytes.Buffer
-		_, _ = io.Copy(&buf, reader)
-		done <- buf.String()
-	}()
-
-	fn()
-
-	os.Stdout = original
-	_ = writer.Close()
-	captured := <-done
-	_ = reader.Close()
-	return captured
 }
 
 // The device's own log is NOT a safe place for vendor text either: it rotates

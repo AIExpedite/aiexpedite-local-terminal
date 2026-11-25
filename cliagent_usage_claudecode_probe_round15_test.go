@@ -13,7 +13,7 @@ import (
 
 func TestClaudeUsageProbePayRecordedRunNeverResurrectsASettledDebt(t *testing.T) {
 	resetClaudeUsageProbeGate() // unarmed: eligibility refuses, nothing probes
-	t.Cleanup(resetClaudeUsageProbeGate)
+	t.Cleanup(func() { requireClaudeResetDrained(t) })
 
 	completed := time.Now().Add(-time.Second)
 	// The trigger's synchronous record, then a gather observes at/after the

@@ -1568,6 +1568,11 @@ func claudeClearProvenAuthWaitDurably(fingerprint string, allowedScopes []string
 // reads (claudeRetryPendingAuthClear) keep retrying for the life of the process.
 var claudePendingAuthClearRetryDelays = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute}
 
+// claudePendingAuthClearRetry is the background loop's retry, a var only so a
+// test can count whether an abandoned loop still retries. Production leaves it
+// as claudeRetryPendingAuthClear.
+var claudePendingAuthClearRetry = claudeRetryPendingAuthClear
+
 // claudeQueuePendingAuthClear remembers a durable clear the cache refused and
 // starts the one background loop that retries it.
 func claudeQueuePendingAuthClear(fingerprint string, probed claudeCredStamp) {
@@ -1575,12 +1580,12 @@ func claudeQueuePendingAuthClear(fingerprint string, probed claudeCredStamp) {
 	if !start {
 		return
 	}
-	delays := claudePendingAuthClearRetryDelays
+	delays, retry := claudePendingAuthClearRetryDelays, claudePendingAuthClearRetry
 	go func() {
 		defer claudeUsageProbe.endPendingAuthClearRetry(gen)
 		for _, delay := range delays {
 			time.Sleep(delay)
-			if IsShutdownInProgress() || !claudeUsageProbe.authClearRetryCurrent(gen) || claudeRetryPendingAuthClear() {
+			if IsShutdownInProgress() || !claudeUsageProbe.authClearRetryCurrent(gen) || retry() {
 				return
 			}
 		}

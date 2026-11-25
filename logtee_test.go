@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -168,5 +170,63 @@ func TestLogTeeConsoleSwap(t *testing.T) {
 	teeActive.Store(false)
 	if setLogTeeConsole(c1, c1) {
 		t.Fatal("setLogTeeConsole returned true while the tee is inactive")
+	}
+}
+
+// logLocalOnly is the one writer for diagnostics that must never leave the
+// computer: it lands in agent.log and NOT on the console mirror, which in a
+// terminal-managed run is published back to the server as command output.
+func TestLogLocalOnlyWritesTheFileAndNeverTheConsole(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "logs", logFileName)
+	rw, err := newRotatingWriter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rw.f.Close() })
+
+	consoleR, consoleW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consoleR.Close()
+
+	prevOut, prevErr := teeOutConsole.Load(), teeErrConsole.Load()
+	teeOutConsole.Store(consoleW)
+	teeErrConsole.Store(consoleW)
+	teeFile.Store(rw)
+	t.Cleanup(func() {
+		teeFile.Store(nil)
+		teeOutConsole.Store(prevOut)
+		teeErrConsole.Store(prevErr)
+	})
+
+	const secret = `C:\Users\someone\checkouts\private-repo`
+	logLocalOnly("root %q is inside %q", secret, secret)
+	_ = consoleW.Close()
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b); !strings.Contains(got, "private-repo") || !strings.HasSuffix(got, "\n") || strings.Count(got, "\n") != 1 {
+		t.Fatalf("agent.log = %q, want exactly one line naming the path", got)
+	}
+	console, _ := io.ReadAll(consoleR)
+	if len(console) != 0 {
+		t.Fatalf("logLocalOnly reached the console: %q", console)
+	}
+}
+
+// With no tee (go test, or file logging disabled) logLocalOnly is a silent no-op.
+func TestLogLocalOnlyIsANoOpWithoutATee(t *testing.T) {
+	prev := teeFile.Load()
+	teeFile.Store(nil)
+	t.Cleanup(func() { teeFile.Store(prev) })
+
+	out := captureStdoutStderr(t, func() {
+		logLocalOnly("nothing should be written: %s", "x")
+	})
+	if out != "" {
+		t.Fatalf("logLocalOnly wrote %q with the tee inactive", out)
 	}
 }

@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -135,13 +137,52 @@ func sandboxTestConfigDir() func() {
 	setEnvOrDie("TEMP", tempDir)
 	setEnvOrDie("TMP", tempDir)
 
+	fenceSandboxFromEnclosingRepositories(dir)
+
 	baseDir = resolveBaseDir(runtime.GOOS, EnvConfigSuffix, dir, appData, xdgConfigHome)
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "sandboxTestConfigDir: cannot create %s: %v\n", baseDir, err)
 		os.Exit(1)
 	}
 
-	return func() { _ = os.RemoveAll(dir) }
+	return func() {
+		worktreeParentWalkCeiling = ""
+		_ = os.RemoveAll(dir)
+	}
+}
+
+// fenceSandboxFromEnclosingRepositories makes the suite independent of WHERE
+// the sandbox was created. A terminal-managed run puts TEMP inside the coding
+// agent's own worktree, and a home folder can be a dotfiles repository; either
+// way a `.git` sits above every fixture, and without a fence every
+// __worktree_ensure__ under test is refused as parent_inside_repository.
+//
+// Must run AFTER HOME/USERPROFILE point at the sandbox: the core.longpaths
+// write below is to the SANDBOX's global config, never the developer's.
+func fenceSandboxFromEnclosingRepositories(dir string) {
+	// The Go walk: a `.git` above the sandbox cannot reach a test, and one a
+	// test creates inside it is still found. Production leaves this empty.
+	worktreeParentWalkCeiling = dir
+	// Git's own discovery: a git command run in a non-repository fixture folder
+	// (fx.Base, the control worktrees) cannot find an enclosing repository.
+	setEnvOrDie("GIT_CEILING_DIRECTORIES", dir)
+
+	// Windows only, and required: the fixture's `git push` into remote.git runs
+	// before any worktree exists, so createWorktree's own core.longpaths write
+	// comes too late, and in a deep temp folder the push failed with
+	// "Filename too long". No git on PATH: skipped, and the git fixtures skip
+	// on their own. Git present but the write failing: setup fails, because a
+	// silently missing setting brings the flake back.
+	if runtime.GOOS != "windows" {
+		return
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		return
+	}
+	if out, err := exec.Command("git", "config", "--global", "core.longpaths", "true").CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "sandboxTestConfigDir: cannot set the sandbox's global core.longpaths: %v: %s\n", err, out)
+		os.Exit(1)
+	}
 }
 
 func setEnvOrDie(key, value string) {
@@ -166,4 +207,62 @@ func setTestOffline(t *testing.T, offline bool) {
 		isOffline = was
 		offlineMutex.Unlock()
 	})
+}
+
+// captureStdout redirects os.Stdout for the duration of fn and returns whatever
+// was written. Used to prove what actually reaches this device's log, rather
+// than trusting the call site to be well-behaved.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	return captureProcessOutput(t, fn, &os.Stdout)
+}
+
+// captureStdoutStderr is captureStdout for BOTH streams: everything a
+// terminal-managed run would publish as command output.
+func captureStdoutStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	return captureProcessOutput(t, fn, &os.Stdout, &os.Stderr)
+}
+
+// captureProcessOutput points every stream in streams at one pipe while fn
+// runs, then restores them and returns what was written.
+//
+// The cleanup is also deferred, for a fn that exits early through t.Fatal:
+// the streams are put back so later tests do not write into this pipe, and both
+// ends are closed so neither the descriptors nor the reader goroutine leak.
+// A second Close on the normal path is harmless.
+func captureProcessOutput(t *testing.T, fn func(), streams ...**os.File) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originals := make([]*os.File, len(streams))
+	for i, s := range streams {
+		originals[i], *s = *s, writer
+	}
+	restore := func() {
+		for i, s := range streams {
+			*s = originals[i]
+		}
+	}
+	defer func() {
+		restore()
+		_ = writer.Close()
+		_ = reader.Close()
+	}()
+
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(reader)
+		done <- string(b)
+	}()
+
+	fn()
+
+	restore()
+	_ = writer.Close()
+	captured := <-done
+	_ = reader.Close()
+	return captured
 }

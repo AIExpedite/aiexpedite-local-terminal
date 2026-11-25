@@ -26,7 +26,13 @@ import (
 // all that survives.
 func simulateClaudeAgentRestart(t *testing.T) {
 	t.Helper()
-	resetClaudeUsageProbeGate()
+	// A half-reset gate is not a restart: the work the reset could not drain
+	// still holds the latch or a settlement, and the "new process" would run
+	// beside it. Stop rather than assert anything on top of it.
+	if !resetClaudeUsageProbeGate() {
+		t.Fatalf("the simulated restart could not drain the previous process's probe [%s]",
+			claudeProbeStateForTest(os.Getenv("AIEXPEDITE_CLAUDE_RL_CACHE")))
+	}
 	SetClaudeUsageProbeDisabled(false)
 }
 

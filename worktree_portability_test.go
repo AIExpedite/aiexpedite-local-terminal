@@ -15,9 +15,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -99,7 +102,52 @@ func TestEnsureRefusesAWorktreeParentInsideARepository(t *testing.T) {
 	if status := wtMustGit(t, fx.MainRepo, "status", "--porcelain"); status != "" {
 		t.Fatalf("the root checkout is no longer clean:\n%s", status)
 	}
+	// The refusal travels to the server, so it names the rule and the remedy
+	// and NOT the paths.
+	assertNoLocalPaths(t, "the refusal", err.Error(), fx.Base, fx.MainRepo)
+
+	// The same request, the way the server sends it. What a terminal-managed
+	// run publishes is the returned error AND whatever reached stdout/stderr.
+	args, merr := json.Marshal(req)
+	if merr != nil {
+		t.Fatal(merr)
+	}
+	var derr error
+	printed := captureStdoutStderr(t, func() {
+		_, derr = runWorktreeDeviceCommand(context.Background(), commandMsg{
+			Command: worktreeEnsureCommand,
+			Args:    []string{string(args)},
+		})
+	})
+	if derr == nil || !strings.Contains(derr.Error(), ruleParentInsideRepository) {
+		t.Fatalf("runWorktreeDeviceCommand = %v, want a %s refusal", derr, ruleParentInsideRepository)
+	}
+	assertNoLocalPaths(t, "the device command's error", derr.Error(), fx.Base, fx.MainRepo)
+	assertNoLocalPaths(t, "stdout/stderr", printed, fx.Base, fx.MainRepo)
 }
+
+// assertNoLocalPaths fails when text names any of paths (or the suite's
+// sandbox), in any spelling it could travel in: native, slash-separated or
+// JSON-escaped. On Windows it also refuses anything shaped like a drive path.
+func assertNoLocalPaths(t *testing.T, what, text string, paths ...string) {
+	t.Helper()
+	for _, p := range append(paths, testSandboxDir) {
+		if p == "" {
+			continue
+		}
+		escaped, _ := json.Marshal(p)
+		for _, spelling := range []string{p, filepath.ToSlash(p), strings.Trim(string(escaped), `"`)} {
+			if strings.Contains(strings.ToLower(text), strings.ToLower(spelling)) {
+				t.Fatalf("%s names the local path %q: %q", what, p, text)
+			}
+		}
+	}
+	if runtime.GOOS == "windows" && windowsDrivePath.MatchString(text) {
+		t.Fatalf("%s carries an absolute Windows path: %q", what, text)
+	}
+}
+
+var windowsDrivePath = regexp.MustCompile(`(?i)\b[a-z]:[\\/]`)
 
 // An EXISTING worktree under such a root is reported, never retro-refused.
 //
@@ -124,8 +172,199 @@ func TestEnsureReportsRatherThanRefusesAnExistingWorktreeUnderARepositoryRoot(t 
 	if res.Created {
 		t.Fatalf("res.Created = true, want the existing worktree reused: %+v", res)
 	}
-	if !strings.Contains(strings.Join(res.Notes, "\n"), ruleParentInsideRepository) {
+	notes := strings.Join(res.Notes, "\n")
+	if !strings.Contains(notes, ruleParentInsideRepository) {
 		t.Fatalf("notes do not name the rule: %q", res.Notes)
+	}
+	if !strings.Contains(notes, "Default working directory") {
+		t.Fatalf("the note does not say what to change: %q", res.Notes)
+	}
+	// The note travels to the server as data; it must not carry a path.
+	assertNoLocalPaths(t, "the reuse note", notes, fx.Base, fx.MainRepo)
+
+	// IDEMPOTENT: a second ensure reuses the same worktree, at the same commit.
+	again, err := ensureWorktree(context.Background(), req)
+	if err != nil {
+		t.Fatalf("the second ensureWorktree refused the existing worktree: %v", err)
+	}
+	if again.Created || !again.Registered || again.Head != res.Head || again.Head == "" {
+		t.Fatalf("second ensure = {Created:%v Registered:%v Head:%q}, want {false true %q}",
+			again.Created, again.Registered, again.Head, res.Head)
+	}
+	assertNoLocalPaths(t, "the second reuse note", strings.Join(again.Notes, "\n"), fx.Base, fx.MainRepo)
+}
+
+// A REGISTERED worktree whose directory is gone counts as NEW under a nested
+// root: recreating it would build exactly the nested tree the rule exists to
+// stop. The refusal comes before the stale admin record is cleared, so git's
+// bookkeeping is left exactly as it was.
+func TestEnsureRefusesRecreatingARegisteredWorktreeWhoseDirectoryIsGone(t *testing.T) {
+	fx := newWorktreeFixture(t)
+
+	req := fx.ensureReq("feature/gone")
+	req.Root = fx.MainRepo
+	abs := filepath.Join(fx.MainRepo, req.Path)
+	wtMustGit(t, fx.MainRepo, "worktree", "add", "-b", "feature/gone", abs, "HEAD")
+	// Deleted by hand, NOT with `git worktree remove`: the admin record stays.
+	if err := os.RemoveAll(abs); err != nil {
+		t.Fatal(err)
+	}
+	adminRoot := filepath.Join(fx.MainRepo, ".git", "worktrees")
+	before, err := os.ReadDir(adminRoot)
+	if err != nil || len(before) == 0 {
+		t.Fatalf("precondition: no admin record under %s (%v)", adminRoot, err)
+	}
+
+	_, err = ensureWorktree(context.Background(), req)
+	if rule := worktreePolicyRuleOf(err); rule != ruleParentInsideRepository {
+		t.Fatalf("rule = %q, want %q (err: %v)", rule, ruleParentInsideRepository, err)
+	}
+	if _, serr := os.Stat(abs); serr == nil {
+		t.Fatal("the worktree directory was recreated under a root inside a repository")
+	}
+	after, err := os.ReadDir(adminRoot)
+	if err != nil || len(after) != len(before) {
+		t.Fatalf("the stale admin record was touched: before %d entries, after %d (%v)", len(before), len(after), err)
+	}
+}
+
+// ─── the walk's ceiling: a test-only seam ───────────────────────────────────
+
+// restoreSuiteCeiling puts back the ceiling TestMain set. Registered BEFORE a
+// test changes it, so a failing test still restores it. No test that changes
+// the ceiling may call t.Parallel(): it is process-wide.
+func restoreSuiteCeiling(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() { worktreeParentWalkCeiling = testSandboxDir })
+}
+
+func TestEnclosingRepositoryWalkStopsAtTheCeiling(t *testing.T) {
+	restoreSuiteCeiling(t)
+	base := tempRootDir(t)
+	outer := filepath.Join(base, "outer")
+	inner := filepath.Join(outer, "inner")
+	plain := filepath.Join(inner, "plain")
+	innerRepo := filepath.Join(inner, "repo")
+	for _, dir := range []string{filepath.Join(outer, ".git"), plain, filepath.Join(innerRepo, ".git"), filepath.Join(innerRepo, "sub")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unrelated := filepath.Join(base, "unrelated")
+
+	for _, tc := range []struct {
+		name, dir, ceiling, want string
+	}{
+		{"a .git above the ceiling is not reached", plain, inner, ""},
+		{"a walk starting outside its ceiling is unbounded", plain, unrelated, outer},
+		{"a .git inside the ceiling is still found", filepath.Join(innerRepo, "sub"), inner, innerRepo},
+		{"no ceiling walks to the volume root", plain, "", outer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := enclosingRepositoryWithin(tc.dir, tc.ceiling); got != tc.want {
+				t.Fatalf("enclosingRepositoryWithin(%q, %q) = %q, want %q", tc.dir, tc.ceiling, got, tc.want)
+			}
+		})
+	}
+
+	// PRODUCTION IGNORES GIT'S VARIABLE. The rule protects the owner from their
+	// own later `git clean -fdx`, which runs in their shell; an inherited
+	// environment variable must not switch it off.
+	worktreeParentWalkCeiling = ""
+	t.Setenv("GIT_CEILING_DIRECTORIES", inner)
+	if got := enclosingRepositoryOf(plain); got != outer {
+		t.Fatalf("enclosingRepositoryOf(%q) with GIT_CEILING_DIRECTORIES=%q = %q, want %q", plain, inner, got, outer)
+	}
+}
+
+// The RESOLVED walk's ceiling follows the ceiling's own resolved spelling: a
+// root reached through a ceiling that is itself a junction resolves OUTSIDE the
+// lexical ceiling, and without that rule the walk would climb to the
+// repository above it and refuse.
+//
+// The root is the junction ITSELF rather than a folder beneath it: measured on
+// Go 1.26/Windows, filepath.EvalSymlinks fails ("cannot find the path
+// specified") for a path BENEATH a junction, so checkWorktreePathLinkFree
+// would refuse such a root as root_unreadable before this rule is reached. The
+// shape under test is unchanged: the root is lexically inside the ceiling and
+// resolves outside it.
+func TestEnsureCreatesWhenTheCeilingIsReachedThroughAJunction(t *testing.T) {
+	restoreSuiteCeiling(t)
+	fx := newWorktreeFixture(t)
+	wtMustGit(t, fx.Base, "init") // a repository ABOVE the ceiling
+
+	if err := os.MkdirAll(filepath.Join(fx.Base, "ceil-real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(fx.Base, "ceil-link")
+	makeDirLink(t, "ceil-real", link)
+	worktreeParentWalkCeiling = link
+
+	req := fx.ensureReq("feature/junction-ceiling")
+	req.Root = link
+	res, err := ensureWorktree(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ensureWorktree under a junctioned ceiling: %v", err)
+	}
+	if !res.Created {
+		t.Fatalf("res = %+v, want the worktree created", res)
+	}
+}
+
+// The resolved walk STILL RUNS under a ceiling: an alias inside the ceiling that
+// points into a repository also inside it is refused.
+func TestEnsureRefusesAnAliasIntoARepositoryInsideTheCeiling(t *testing.T) {
+	fx := newWorktreeFixture(t)
+	wtMustGit(t, fx.Base, "init")
+
+	restoreSuiteCeiling(t)
+	ceil := filepath.Join(fx.Base, "ceil")
+	proj := filepath.Join(ceil, "proj")
+	scratch := filepath.Join(proj, "scratch")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wtMustGit(t, proj, "init")
+	alias := filepath.Join(ceil, "alias")
+	makeDirLink(t, filepath.Join("proj", "scratch"), alias)
+	worktreeParentWalkCeiling = ceil
+
+	if got := enclosingRepositoryOf(alias); got != "" {
+		t.Fatalf("enclosingRepositoryOf(%q) = %q; the alias was expected to look clean lexically", alias, got)
+	}
+
+	req := fx.ensureReq("feature/alias-in-ceiling")
+	req.Root = alias
+	_, err := ensureWorktree(context.Background(), req)
+	if rule := worktreePolicyRuleOf(err); rule != ruleParentInsideRepository {
+		t.Fatalf("rule = %q, want %q (err: %v)", rule, ruleParentInsideRepository, err)
+	}
+	if _, serr := os.Stat(filepath.Join(scratch, worktreeRootSegment)); serr == nil {
+		t.Fatalf("%s was created inside the repository through the alias", worktreeRootSegment)
+	}
+}
+
+// Guards the harness against a later TestMain edit: without the fence, a
+// `.git` above the sandbox turns every ensure into a refusal.
+func TestWorktreeSuiteIsFencedFromAnEnclosingRepository(t *testing.T) {
+	if testSandboxDir == "" {
+		t.Fatal("the suite sandbox is not set up")
+	}
+	if worktreeParentWalkCeiling != testSandboxDir {
+		t.Fatalf("worktreeParentWalkCeiling = %q, want the sandbox %q", worktreeParentWalkCeiling, testSandboxDir)
+	}
+	if got := os.Getenv("GIT_CEILING_DIRECTORIES"); got != testSandboxDir {
+		t.Fatalf("GIT_CEILING_DIRECTORIES = %q, want the sandbox %q", got, testSandboxDir)
+	}
+	if runtime.GOOS != "windows" {
+		return
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not on PATH")
+	}
+	out, err := exec.Command("git", "config", "--global", "--get", "core.longpaths").Output()
+	if err != nil || strings.TrimSpace(string(out)) != "true" {
+		t.Fatalf("sandbox global core.longpaths = %q (%v), want true", out, err)
 	}
 }
 
@@ -417,5 +656,35 @@ func TestEnsureRefusesARootAliasedIntoARepository(t *testing.T) {
 	}
 	if _, serr := os.Stat(filepath.Join(target, worktreeRootSegment)); serr == nil {
 		t.Fatalf("%s was created inside the repository through the alias", worktreeRootSegment)
+	}
+}
+
+// A coding agent's own worktree lives under an `aixwt` folder, so under the
+// test ceiling only the components BELOW it decide whether a path is a
+// worktree. Production (no ceiling) still reads every component.
+func TestWorktreeRootSegmentCheckStopsAtTheCeiling(t *testing.T) {
+	restoreSuiteCeiling(t)
+	base := filepath.Join(tempRootDir(t), "aixwt", "feature", "repo-abc123", "tmp")
+	plain := filepath.Join(base, "root", "demo")
+	nested := filepath.Join(base, "root", "aixwt", "feature", "demo-abc123")
+
+	worktreeParentWalkCeiling = base
+	if pathHasWorktreeRootSegment(plain) {
+		t.Fatalf("%q was read as a worktree because of an aixwt folder above the ceiling", plain)
+	}
+	if !pathHasWorktreeRootSegment(nested) {
+		t.Fatalf("%q was not read as a worktree although aixwt sits below the ceiling", nested)
+	}
+
+	// A ceiling BESIDE the path: only the shared prefix is the host's.
+	worktreeParentWalkCeiling = filepath.Join(base, "elsewhere")
+	if pathHasWorktreeRootSegment(plain) || !pathHasWorktreeRootSegment(nested) {
+		t.Fatalf("with a sibling ceiling: plain=%v nested=%v, want false true",
+			pathHasWorktreeRootSegment(plain), pathHasWorktreeRootSegment(nested))
+	}
+
+	worktreeParentWalkCeiling = ""
+	if !pathHasWorktreeRootSegment(plain) {
+		t.Fatalf("production read %q as a root checkout despite the aixwt folder above it", plain)
 	}
 }

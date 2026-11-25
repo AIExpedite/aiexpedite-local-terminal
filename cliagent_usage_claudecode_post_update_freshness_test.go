@@ -79,14 +79,7 @@ func TestClaudePostUpdateFreshness_DirectRun(t *testing.T) {
 	skipIfUnsupportedOS(t)
 	cache, healthy := armPostUpdateEndpoint(t)
 	seedStaleClaudeObservation(t, cache)
-	tmpDir := installMockClaude(t, "claude-heartbeat-result")
-
-	m := NewClaudeNativeManager(nil)
-	id := fmt.Sprintf("claude-post-update-%d", time.Now().UnixNano())
-	if err := m.Start(id, tmpDir, nil, "hello", "ws", "uid", func(resultMsg) {}, nil); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	t.Cleanup(func() { _ = m.End(id) })
+	startNativeClaudeRun(t, "claude-heartbeat-result")
 
 	payAfterUpdate(t, cache, healthy)
 	requireNumericClaudeRows(t)
@@ -369,13 +362,7 @@ func runStaleMirrorSequence(t *testing.T, run func()) {
 func TestClaudeStaleMirror_DirectRunCommitWakesOneSignedRefresh(t *testing.T) {
 	skipIfUnsupportedOS(t)
 	runStaleMirrorSequence(t, func() {
-		tmpDir := installMockClaude(t, "claude-heartbeat-result")
-		m := NewClaudeNativeManager(nil)
-		id := fmt.Sprintf("claude-stale-mirror-%d", time.Now().UnixNano())
-		if err := m.Start(id, tmpDir, nil, "hello", "ws", "uid", func(resultMsg) {}, nil); err != nil {
-			t.Fatalf("Start: %v", err)
-		}
-		t.Cleanup(func() { _ = m.End(id) })
+		startNativeClaudeRun(t, "claude-heartbeat-result")
 	})
 }
 

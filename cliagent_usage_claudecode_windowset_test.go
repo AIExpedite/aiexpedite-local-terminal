@@ -237,7 +237,7 @@ func TestClaudeUltraReply_ClaudeCodesCachedReplyNamesTheWindowsWithoutAProbe(t *
 		disarm func()
 	}{
 		{"probe opted out", func() { SetClaudeUsageProbeDisabled(true) }},
-		{"probe never armed", resetClaudeUsageProbeGate},
+		{"probe never armed", func() { resetClaudeUsageProbeGate() }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stubClaudeProbes(t, true, true)
