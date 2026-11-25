@@ -39,9 +39,12 @@ package main
 //     the next turn, so that turn is treated as OPEN and asking until its own
 //     `result`. Nothing on stdout says when a queued instruction starts, so a
 //     SEND arriving meanwhile is written into that turn (lower only) and can
-//     never raise it. If Claude had in fact merged the instruction into the
-//     turn that just settled, the next turn asks once more than it needed to:
-//     the conservative side.
+//     never raise it. Every instruction written into an open turn is queued
+//     and each `result` retires one, so several queued voice instructions
+//     each keep their own turn asking; the session returns to its default
+//     only once no queued asking instruction is left. If Claude had in fact
+//     merged queued instructions into one turn, later turns ask more than
+//     they needed to: the conservative side.
 //   - A redelivered relay turn runs under the approval its FIRST claimed
 //     delivery carried (the turn inbox row pins it, relay_turn_inbox.go).
 //   - Anything but the literal "autoAllow" asks, and nothing is ever answered
@@ -117,13 +120,13 @@ type claudeApprovalState struct {
 	// lastAttributed is the most recent turn whose command named a
 	// disposition; a SEND naming none inherits it.
 	lastAttributed *claudeTurnApproval
-	// carryAsk: an asking instruction was written while the turn was open.
-	// Claude may take it into the running turn or run it as the next one, and
-	// nothing tells the two apart, so the settle keeps the turn open and
-	// asking: the next turn asks too, and a SEND arriving before its own
-	// `result` cannot raise it.
-	carryAsk         bool
-	carryInstruction string
+	// queued: every instruction written while a turn was open, oldest first,
+	// not yet retired by a `result`. Claude may take each into the running
+	// turn or run it as a later one, and nothing tells the two apart, so
+	// while any queued instruction asks, settle keeps the turn open and
+	// asking: those turns ask too, and a SEND arriving before their own
+	// `result` cannot raise them.
+	queued []claudeTurnApproval
 }
 
 func newClaudeApprovalState(promptTool bool, approvalDefault string) *claudeApprovalState {
@@ -133,12 +136,11 @@ func newClaudeApprovalState(promptTool bool, approvalDefault string) *claudeAppr
 
 // claudeApprovalSnapshot restores a state whose turn write failed.
 type claudeApprovalSnapshot struct {
-	turnOpen         bool
-	disposition      string
-	instruction      string
-	lastAttributed   *claudeTurnApproval
-	carryAsk         bool
-	carryInstruction string
+	turnOpen       bool
+	disposition    string
+	instruction    string
+	lastAttributed *claudeTurnApproval
+	queued         []claudeTurnApproval
 }
 
 // beginTurn records that an instruction is about to be written to the child,
@@ -147,7 +149,7 @@ type claudeApprovalSnapshot struct {
 func (a *claudeApprovalState) beginTurn(t claudeTurnApproval) claudeApprovalSnapshot {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	prev := claudeApprovalSnapshot{a.turnOpen, a.disposition, a.instruction, a.lastAttributed, a.carryAsk, a.carryInstruction}
+	prev := claudeApprovalSnapshot{a.turnOpen, a.disposition, a.instruction, a.lastAttributed, append([]claudeTurnApproval(nil), a.queued...)}
 	var resolved string
 	if t.Disposition == "" {
 		resolved = a.defaultDisp
@@ -162,13 +164,14 @@ func (a *claudeApprovalState) beginTurn(t claudeTurnApproval) claudeApprovalSnap
 	case !a.turnOpen:
 		// A turn of its own: its instruction decides.
 		a.disposition, a.instruction = resolved, t.InstructionID
-		a.carryAsk, a.carryInstruction = false, ""
-	case resolved == claudeApprovalAskPerson:
-		// Written into an open turn: lower only, never raise.
-		if a.disposition != claudeApprovalAskPerson {
+		a.queued = nil
+	default:
+		// Written into an open turn: queued until a `result` retires it, and
+		// it can only lower the running turn, never raise it.
+		a.queued = append(a.queued, claudeTurnApproval{Disposition: resolved, InstructionID: t.InstructionID})
+		if resolved == claudeApprovalAskPerson && a.disposition != claudeApprovalAskPerson {
 			a.disposition, a.instruction = claudeApprovalAskPerson, t.InstructionID
 		}
-		a.carryAsk, a.carryInstruction = true, t.InstructionID
 	}
 	a.turnOpen = true
 	return prev
@@ -179,26 +182,31 @@ func (a *claudeApprovalState) restore(prev claudeApprovalSnapshot) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.turnOpen, a.disposition, a.instruction, a.lastAttributed = prev.turnOpen, prev.disposition, prev.instruction, prev.lastAttributed
-	a.carryAsk, a.carryInstruction = prev.carryAsk, prev.carryInstruction
+	a.queued = prev.queued
 }
 
-// settle ends the open turn (Claude's `result`): the disposition returns to
-// the session's default — except after an asking instruction was written
-// mid-turn (carryAsk), which Claude may still run as the next turn. That turn
-// stays OPEN and asking until its own `result`: writing another instruction
-// to stdin does not mean it has ended, so a chat SEND meanwhile only joins it
-// and cannot turn its prompts into allowed ones.
+// settle ends the open turn (Claude's `result`) and retires the oldest queued
+// instruction, which Claude may now be running as the next turn. While that
+// one or any later queued instruction asks, the turn stays OPEN and asking,
+// attributed to the oldest asking one, until further `result`s retire them:
+// writing another instruction to stdin does not mean a queued one has ended,
+// so a chat SEND meanwhile only joins and cannot turn their prompts into
+// allowed ones. With no asking instruction left, the disposition returns to
+// the session's default.
 func (a *claudeApprovalState) settle() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.carryAsk {
-		a.turnOpen = true
-		a.disposition, a.instruction = claudeApprovalAskPerson, a.carryInstruction
-	} else {
-		a.turnOpen = false
-		a.disposition, a.instruction = a.defaultDisp, ""
+	for _, q := range a.queued {
+		if q.Disposition == claudeApprovalAskPerson {
+			a.turnOpen = true
+			a.disposition, a.instruction = claudeApprovalAskPerson, q.InstructionID
+			a.queued = a.queued[1:]
+			return
+		}
 	}
-	a.carryAsk, a.carryInstruction = false, ""
+	a.turnOpen = false
+	a.disposition, a.instruction = a.defaultDisp, ""
+	a.queued = nil
 }
 
 // decide returns the mark to answer a can_use_tool prompt with, or nil when a

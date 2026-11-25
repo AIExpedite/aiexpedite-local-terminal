@@ -523,3 +523,51 @@ func TestClaudeApproval_AppliedBeforeTheTextIsWritten(t *testing.T) {
 		t.Fatalf("disposition when the follow-up text was written = %q, want askPerson", atWrite)
 	}
 }
+
+// Two voice instructions written during one chat turn may each run as their
+// own later turn: every one of those turns asks, and the session returns to
+// its default only once both have been retired by their own results. A chat
+// instruction queued between them does not end the asking early.
+func TestClaudeApproval_EveryQueuedVoiceInstructionKeepsItsTurnAsking(t *testing.T) {
+	a := newClaudeApprovalState(true, claudeApprovalAutoAllow)
+	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-1"})
+	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-2"})
+	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-3"})
+
+	a.settle() // chat-1's result; voice-2 runs next
+	if d, id := a.current(); d != claudeApprovalAskPerson || id != "voice-2" {
+		t.Fatalf("after chat-1 = %s/%s, want askPerson/voice-2", d, id)
+	}
+	a.settle() // voice-2's result; voice-3 runs next
+	if a.decide() != nil {
+		t.Fatal("the second queued voice instruction's turn auto-approved")
+	}
+	if d, id := a.current(); d != claudeApprovalAskPerson || id != "voice-3" {
+		t.Fatalf("after voice-2 = %s/%s, want askPerson/voice-3", d, id)
+	}
+	a.settle() // voice-3's result
+	if a.decide() == nil {
+		t.Fatal("the queued asks outlived their own turns")
+	}
+
+	// chat-1, then voice-2, chat-3, voice-4 queued: the chat turn between the
+	// two voice turns may in fact be voice-4 (merged writes), so it asks too.
+	b := newClaudeApprovalState(true, claudeApprovalAutoAllow)
+	b.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-1"})
+	b.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-2"})
+	b.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-3"})
+	b.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-4"})
+	b.settle() // chat-1
+	b.settle() // voice-2
+	if d, id := b.current(); d != claudeApprovalAskPerson || id != "voice-4" {
+		t.Fatalf("while voice-4 is queued = %s/%s, want askPerson/voice-4", d, id)
+	}
+	b.settle() // chat-3
+	if b.decide() != nil {
+		t.Fatal("voice-4's turn auto-approved")
+	}
+	b.settle() // voice-4
+	if b.decide() == nil {
+		t.Fatal("the session did not return to its default after the last queued ask")
+	}
+}
