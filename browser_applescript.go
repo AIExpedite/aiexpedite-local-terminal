@@ -193,7 +193,7 @@ func friendlyAppleScriptError(msg string, code int) *browserError {
 	case code == -1743 || strings.Contains(msg, "Not authorized to send Apple events"):
 		return browserErr(browserErrChromeDenied, "macOS has not allowed AI Expedite to control Google Chrome: allow it in System Settings > Privacy & Security > Automation")
 	case strings.Contains(msg, "Executing JavaScript through AppleScript is turned off"), strings.Contains(msg, "JavaScript through AppleScript"):
-		return browserErr(browserErrChromeNotReachable, "in Chrome, turn on View > Developer > Allow JavaScript from Apple Events (or turn on remote debugging at chrome://inspect/#remote-debugging)")
+		return browserErr(browserErrChromeNotReachable, "in Chrome, turn on View > Developer > Allow JavaScript from Apple Events (or turn on remote debugging from the setup card in the chat)")
 	case strings.Contains(msg, "chrome-not-running"):
 		return browserErr(browserErrChromeNotReachable, "Google Chrome is not running")
 	case strings.Contains(msg, "tab-not-found"):
@@ -470,7 +470,7 @@ func (p *asPage) GuardWrites(ctx context.Context, on bool) error {
 	return errBrowserUnsupported
 }
 func (p *asPage) Screenshot(ctx context.Context, full bool) (browserShot, error) {
-	return browserShot{}, browserErr(browserErrScreenshotUnsupport, "screenshots need Chrome's remote debugging: turn it on at chrome://inspect/#remote-debugging")
+	return browserShot{}, browserErr(browserErrScreenshotUnsupport, "screenshots need Chrome's remote debugging: turn it on from the setup card in the chat")
 }
 
 func (p *asPage) Navigate(ctx context.Context, url string) error {

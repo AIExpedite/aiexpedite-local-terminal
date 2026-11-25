@@ -22,8 +22,8 @@ const browserDeviceCommand = "__browser__"
 // to a computer whose protocol is at least the minimum.
 const (
 	browserControlCapabilityKey = "browserControl"
-	// 2: the `current` op (BROWSER_OP_MIN_AGENT_PROTOCOL).
-	browserAgentProtocol = 2
+	// 2: the `current` op; 3: the `openSetup` op (BROWSER_OP_MIN_AGENT_PROTOCOL).
+	browserAgentProtocol = 3
 	// The params envelope version (`v`) this build reads.
 	browserParamsVersion = 1
 )
@@ -47,6 +47,8 @@ const (
 	browserOpPrepareSubmit = "prepareSubmit"
 	browserOpSubmit        = "submit"
 	browserOpStop          = "stop"
+	// Platform-only: a fixed setup destination (browser_setup_open.go).
+	browserOpOpenSetup = "openSetup"
 )
 
 // BROWSER_NAVIGATE_ACTIONS.

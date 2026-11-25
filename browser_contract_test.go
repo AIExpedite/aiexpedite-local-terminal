@@ -41,6 +41,13 @@ func TestBrowserContractPins(t *testing.T) {
 		{browserOpPrepareSubmit, "prepareSubmit"},
 		{browserOpSubmit, "submit"},
 		{browserOpStop, "stop"},
+		{browserOpOpenSetup, "openSetup"},
+		{browserSetupChromeRemoteDebugging, "chromeRemoteDebugging"},
+		{browserSetupMacOSAutomation, "macosAutomation"},
+		{browserSetupOutcomeOpened, "opened"},
+		{browserSetupOutcomeChromeNotInstalled, "chrome_not_installed"},
+		// shared-constants CHROME_REMOTE_DEBUGGING_ADDRESS (the catalog's displayAddress).
+		{setupChromeRemoteDebuggingAddress, "chrome://inspect/#remote-debugging"},
 		{browserNavBack, "back"},
 		{browserNavForward, "forward"},
 		{browserNavReload, "reload"},
@@ -106,13 +113,14 @@ func TestBrowserContractPins(t *testing.T) {
 
 // capabilities.browserControl is what isBrowserControlCapable reads:
 // `supported === true` and a numeric protocol >= BROWSER_CONTROL_MIN_AGENT_PROTOCOL (1).
-// Protocol 2 is BROWSER_OP_MIN_AGENT_PROTOCOL.current: terminal-service sends
-// `current` only to an agent at 2 or above.
+// Protocol 2 is BROWSER_OP_MIN_AGENT_PROTOCOL.current and 3 is .openSetup:
+// terminal-service sends
+// `current` only to an agent at 2 or above, `openSetup` only at 3 or above.
 func TestBrowserControlCapabilityShape(t *testing.T) {
 	for goos, want := range map[string]string{
-		"darwin":  `{"supported":true,"protocol":2,"routes":["devtools","applescript"]}`,
-		"windows": `{"supported":true,"protocol":2,"routes":["devtools"]}`,
-		"linux":   `{"supported":true,"protocol":2,"routes":["devtools"]}`,
+		"darwin":  `{"supported":true,"protocol":3,"routes":["devtools","applescript"]}`,
+		"windows": `{"supported":true,"protocol":3,"routes":["devtools"]}`,
+		"linux":   `{"supported":true,"protocol":3,"routes":["devtools"]}`,
 	} {
 		raw, _ := json.Marshal(&browserControlCapability{Supported: true, Protocol: browserAgentProtocol, Routes: browserRoutesFor(goos)})
 		if string(raw) != want {
@@ -121,7 +129,7 @@ func TestBrowserControlCapabilityShape(t *testing.T) {
 	}
 	// newMachineCapabilities carries it: systemInfo_capabilities_test.go pins
 	// the whole capabilities object, browserControl included.
-	if c := currentBrowserControlCapability(); !c.Supported || c.Protocol != 2 || c.Routes[0] != browserRouteDevTools {
+	if c := currentBrowserControlCapability(); !c.Supported || c.Protocol != 3 || c.Routes[0] != browserRouteDevTools {
 		t.Fatalf("%+v", c)
 	}
 }

@@ -7,7 +7,8 @@
 // The agent reads that file in the DEFAULT profile's dir, checks the port is
 // listened on by Google Chrome itself (on macOS: codesigned by Google), and
 // dials ws://127.0.0.1:<port><path>. It never passes --remote-debugging-port
-// and never launches Chrome.
+// and never launches Chrome to control it (openSetup only starts Chrome on its
+// own setup page, browser_setup_open.go).
 //
 // AppleScript route (macOS only): Chrome's `execute javascript`, used when
 // remote debugging is off.
@@ -299,11 +300,11 @@ func chooseBrowserRoute(ctx context.Context, goos, tabRoute string, discover fun
 	}
 	if tabRoute == browserRouteDevTools {
 		return browserRouteChoice{}, browserErr(browserErrChromeNotReachable,
-			"Chrome's remote debugging is off now, so that tab cannot be reached; turn it on at chrome://inspect/#remote-debugging or list the tabs again")
+			"Chrome's remote debugging is off now, so that tab cannot be reached; turn it on from the setup card in the chat, or list the tabs again")
 	}
 	if goos == "darwin" {
 		return browserRouteChoice{Route: browserRouteAppleScript}, nil
 	}
 	return browserRouteChoice{}, browserErr(browserErrChromeNotReachable,
-		"Chrome is not running, or its remote debugging is off: in Chrome open chrome://inspect/#remote-debugging and tick \"Allow remote debugging for this browser instance\"")
+		"Chrome is not running, or its remote debugging is off: the setup card in the chat opens Chrome's setup page; tick \"Allow remote debugging for this browser instance\" there")
 }

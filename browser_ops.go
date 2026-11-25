@@ -510,7 +510,7 @@ type browserScreenshotResult struct {
 
 func (r *browserOpRun) screenshot(ctx context.Context) (any, error) {
 	if r.be.Route() != browserRouteDevTools {
-		return nil, browserErr(browserErrScreenshotUnsupport, "screenshots need Chrome's remote debugging: turn it on at chrome://inspect/#remote-debugging")
+		return nil, browserErr(browserErrScreenshotUnsupport, "screenshots need Chrome's remote debugging: turn it on from the setup card in the chat")
 	}
 	pg, _, err := r.page(ctx)
 	if err != nil {
