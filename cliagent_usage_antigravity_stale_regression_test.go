@@ -811,19 +811,45 @@ func helperGather(t *testing.T, home string) *cliAgentUsage {
 	return usage
 }
 
-// A direct run on a gated build, paid by a Code Assist reply in which Google
-// disabled the weekly bucket: the newer reading replaces the seeded one whose
-// weekly bucket was charted, the card shows only the enabled 5h row — and it
-// still does after a restart (live-run state gone), with no refresh owed.
+// helperStaleRegressionTransports are the two ways a managed run arrives: a
+// direct `agy` execute and the Windows terminal transport (encoded PowerShell).
+var helperStaleRegressionTransports = []struct {
+	name string
+	run  func(*testing.T, helperStaleRegression)
+}{
+	{"direct agy", helperRunDirectAgy},
+	{"windows encoded powershell", helperRunEncodedPowerShellAgy},
+}
+
+// A run on a gated build, paid by a Code Assist reply in which Google disabled
+// the weekly bucket: the newer reading replaces the seeded one whose weekly
+// bucket was charted, the card shows only the enabled 5h row — and it still
+// does after a restart (live-run state and in-memory notes gone), with no
+// refresh owed. Both transports.
 func TestAntigravityStaleRegression_DisabledBucketLeavesTheCard(t *testing.T) {
+	for _, tc := range helperStaleRegressionTransports {
+		t.Run(tc.name, func(t *testing.T) {
+			helperAssertDisabledBucketLeavesTheCard(t, tc.run)
+		})
+	}
+}
+
+// helperAssertDisabledBucketLeavesTheCard is the whole disabled-bucket flow on
+// its own fixture: one run through `run`, the paid refresh, the card, and the
+// simulated post-update restart.
+func helperAssertDisabledBucketLeavesTheCard(t *testing.T, run func(*testing.T, helperStaleRegression)) {
+	t.Helper()
 	f := helperStaleRegressionFixtureQuota(t, helperStoredLogin(),
 		func(string) (int, string) { return http.StatusOK, helperDisabledWeeklyCodeAssistFixture }, helperUserinfoAda)
 
-	helperRunDirectAgy(t, f)
+	run(t, f)
 	helperDrainAntigravityRefreshSchedule(t)
 	snap := helperAwaitPaidRefresh(t, f.cache, f.stale)
 	if len(snap.DisabledBuckets) != 1 || snap.SchemaVersion != antigravityQuotaSchemaVersion {
 		t.Fatalf("snap=%+v, want the disabled weekly bucket recorded under schema %d", snap, antigravityQuotaSchemaVersion)
+	}
+	if got := atomic.LoadInt32(f.quotaCalls); got != 1 {
+		t.Errorf("Code Assist reads=%d, want exactly one for one run [%s]", got, antigravityStateForTest(f.cache))
 	}
 
 	assertOnlyTheSessionRow := func(why string) {
@@ -836,44 +862,60 @@ func TestAntigravityStaleRegression_DisabledBucketLeavesTheCard(t *testing.T) {
 	}
 	assertOnlyTheSessionRow("after the run")
 
-	// The next process: nothing in memory, only the schema-2 cache.
-	reads := atomic.LoadInt32(f.quotaCalls)
+	// The next process: nothing in memory, only the schema-2 cache. The read
+	// baseline is taken only once the schedule is stopped and PROVEN quiet, so
+	// a read still in flight from the run (or anything else) is never charged
+	// to the restart gather below.
 	helperStopAntigravityRefreshSchedule()
+	requireAntigravityStateQuiet(t)
+	reads := atomic.LoadInt32(f.quotaCalls)
 	helperResetAntigravityLiveRuns()
 	helperResetAntigravityNudgeCooldown(t)
+	resetAntigravityProcessMemory()
 	assertOnlyTheSessionRow("after a restart")
-	antigravityUsageRefreshWaitIdle()
+	if !antigravityUsageRefreshWaitIdleFor(antigravityStateQuietBound) {
+		t.Fatalf("the restart gather left a write in flight [%s]", antigravityStateForTest(f.cache))
+	}
 	if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
-		t.Errorf("state=%+v, want no refresh owed for a schema-%d reading", state, antigravityQuotaSchemaVersion)
+		t.Errorf("state=%+v, want no refresh owed for a schema-%d reading [%s]",
+			state, antigravityQuotaSchemaVersion, antigravityStateForTest(f.cache))
 	}
 	if got := atomic.LoadInt32(f.quotaCalls); got != reads {
-		t.Errorf("Code Assist reads=%d after the restart gather, want still %d", got, reads)
+		t.Errorf("Code Assist reads=%d after the restart gather, want still %d [%s]",
+			got, reads, antigravityStateForTest(f.cache))
 	}
 }
 
 // Every bucket disabled: the reply is still the run's reading. It replaces the
 // seeded rows, settles the run's debt, and the card falls back to the two
-// Unknown placeholders.
+// Unknown placeholders. Both transports.
 func TestAntigravityStaleRegression_AllDisabledReplyShowsPlaceholders(t *testing.T) {
-	f := helperStaleRegressionFixtureQuota(t, helperStoredLogin(),
-		func(string) (int, string) { return http.StatusOK, helperAllDisabledCodeAssistFixture }, helperUserinfoAda)
+	for _, tc := range helperStaleRegressionTransports {
+		t.Run(tc.name, func(t *testing.T) {
+			f := helperStaleRegressionFixtureQuota(t, helperStoredLogin(),
+				func(string) (int, string) { return http.StatusOK, helperAllDisabledCodeAssistFixture }, helperUserinfoAda)
 
-	helperRunDirectAgy(t, f)
-	helperDrainAntigravityRefreshSchedule(t)
-	snap := helperAwaitPaidRefresh(t, f.cache, f.stale)
-	if len(snap.Buckets) != 0 || len(snap.DisabledBuckets) != 2 {
-		t.Fatalf("snap=%+v, want a reading of two disabled buckets", snap)
-	}
-	if state := helperFreshnessState(t); state.RunFloorMs != 0 || state.RefreshOwedAtMs != 0 {
-		t.Errorf("state=%+v, want the run floor settled", state)
-	}
-	usage := helperGather(t, f.home)
-	if len(usage.Metrics) != 2 {
-		t.Fatalf("metrics=%+v, want the two placeholders", usage.Metrics)
-	}
-	for i, want := range []string{"5-hour session window", "Weekly quota"} {
-		if m := usage.Metrics[i]; m.Label != want || !m.Unknown || m.Consumed != nil {
-			t.Errorf("metric %d = %+v, want the Unknown %q placeholder", i, m, want)
-		}
+			tc.run(t, f)
+			helperDrainAntigravityRefreshSchedule(t)
+			snap := helperAwaitPaidRefresh(t, f.cache, f.stale)
+			if len(snap.Buckets) != 0 || len(snap.DisabledBuckets) != 2 {
+				t.Fatalf("snap=%+v, want a reading of two disabled buckets", snap)
+			}
+			if got := atomic.LoadInt32(f.quotaCalls); got != 1 {
+				t.Errorf("Code Assist reads=%d, want exactly one for one run [%s]", got, antigravityStateForTest(f.cache))
+			}
+			if state := helperFreshnessState(t); state.RunFloorMs != 0 || state.RefreshOwedAtMs != 0 {
+				t.Errorf("state=%+v, want the run floor settled [%s]", state, antigravityStateForTest(f.cache))
+			}
+			usage := helperGather(t, f.home)
+			if len(usage.Metrics) != 2 {
+				t.Fatalf("metrics=%+v, want the two placeholders", usage.Metrics)
+			}
+			for i, want := range []string{"5-hour session window", "Weekly quota"} {
+				if m := usage.Metrics[i]; m.Label != want || !m.Unknown || m.Consumed != nil {
+					t.Errorf("metric %d = %+v, want the Unknown %q placeholder", i, m, want)
+				}
+			}
+		})
 	}
 }

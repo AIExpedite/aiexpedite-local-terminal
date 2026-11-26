@@ -203,6 +203,14 @@ func TestMain(m *testing.M) {
 	// install — see sandboxTestConfigDir for the incident this pins.
 	// Called explicitly rather than deferred: os.Exit skips defers.
 	restoreSandbox := sandboxTestConfigDir()
+	// …and the developer's real `agy` is not on PATH, as on every CI runner: a
+	// stray classified spawn then retires its debt as "not installed" instead
+	// of starting a worker that outlives the test (pruneRealAntigravityFromPath).
+	// Counts only: the removed entries are paths on the developer's computer.
+	if removed, keptForTools := pruneRealAntigravityFromPath(); removed > 0 || keptForTools > 0 {
+		fmt.Fprintf(os.Stderr, "test sandbox: removed %d PATH entr(ies) holding a real agy; kept %d that also hold a tool the suite runs\n",
+			removed, keptForTools)
+	}
 	code := m.Run()
 	restoreSandbox()
 	os.Exit(code)

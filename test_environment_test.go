@@ -43,6 +43,12 @@ func useRealUserProfile(t *testing.T) {
 	if strings.HasPrefix(os.Getenv("XDG_CONFIG_HOME"), testSandboxDir) {
 		t.Setenv("XDG_CONFIG_HOME", filepath.Join(realHomeAtStartup, ".config"))
 	}
+	// The real `agy` TestMain took off PATH (pruneRealAntigravityFromPath):
+	// an opt-in real-binary run (the agy live certification) needs it back.
+	if len(prunedAntigravityPathEntries) > 0 {
+		t.Setenv("PATH", strings.Join(append([]string{os.Getenv("PATH")}, prunedAntigravityPathEntries...),
+			string(os.PathListSeparator)))
+	}
 }
 
 // ─────────────────────────── suite-wide sandbox ───────────────────────────
@@ -183,6 +189,69 @@ func fenceSandboxFromEnclosingRepositories(dir string) {
 		fmt.Fprintf(os.Stderr, "sandboxTestConfigDir: cannot set the sandbox's global core.longpaths: %v: %s\n", err, out)
 		os.Exit(1)
 	}
+}
+
+// prunedAntigravityPathEntries are the PATH entries pruneRealAntigravityFromPath
+// removed, kept so a test can assert the pruning happened. Never printed: they
+// are paths on the developer's computer.
+var prunedAntigravityPathEntries []string
+
+// antigravityPathKeepTools are the tools the suite itself runs. A PATH entry
+// holding one of them is kept even when it also holds `agy` (a macOS
+// /usr/local/bin with git in it), so on such a computer a real `agy` stays
+// visible, exactly as before this pruning existed.
+var antigravityPathKeepTools = []string{"git", "go", "node", "npm", "sh", "bash", "pwsh", "powershell"}
+
+// pruneRealAntigravityFromPath drops every PATH entry holding a real `agy`, so
+// a developer's install behaves like the CI runners, which have none. Without
+// it a non-Antigravity test that spawns a classified `agy` creates a debt that
+// is WORKED (the shipped 5 s retry, minute-long rungs) instead of retired as
+// "not installed", and that worker outlives the test. Tests that need `agy`
+// put their own first on PATH (helperFakeAgyOnPath / helperMockAgyOnPath).
+// Empty entries are left as they are. It returns how many entries it removed
+// and how many it kept because they also hold a needed tool.
+func pruneRealAntigravityFromPath() (removed, keptForTools int) {
+	entries := filepath.SplitList(os.Getenv("PATH"))
+	kept := make([]string, 0, len(entries))
+	prunedAntigravityPathEntries = nil
+	for _, entry := range entries {
+		if entry == "" || !pathDirHoldsCommand(entry, "agy") {
+			kept = append(kept, entry)
+			continue
+		}
+		holdsTool := false
+		for _, tool := range antigravityPathKeepTools {
+			if pathDirHoldsCommand(entry, tool) {
+				holdsTool = true
+				break
+			}
+		}
+		if holdsTool {
+			keptForTools++
+			kept = append(kept, entry)
+			continue
+		}
+		prunedAntigravityPathEntries = append(prunedAntigravityPathEntries, entry)
+	}
+	if removed = len(prunedAntigravityPathEntries); removed > 0 {
+		setEnvOrDie("PATH", strings.Join(kept, string(os.PathListSeparator)))
+	}
+	return removed, keptForTools
+}
+
+// pathDirHoldsCommand reports whether dir holds an executable file named
+// command (with its Windows spellings).
+func pathDirHoldsCommand(dir, command string) bool {
+	names := []string{command}
+	if runtime.GOOS == "windows" {
+		names = []string{command + ".exe", command + ".cmd", command + ".bat", command}
+	}
+	for _, name := range names {
+		if info, err := os.Stat(filepath.Join(dir, name)); err == nil && !info.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 func setEnvOrDie(key, value string) {
