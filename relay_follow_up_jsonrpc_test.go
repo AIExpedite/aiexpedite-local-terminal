@@ -526,6 +526,17 @@ func (s *streamLog) indexOf(marker string) int {
 	return -1
 }
 
+// hasOutput reports whether any stream frame, of whatever type, contains
+// marker.
+func (s *streamLog) hasOutput(marker string) bool {
+	for _, f := range s.snapshot() {
+		if strings.Contains(f.Output, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *streamLog) countOf(marker string) int {
 	n := 0
 	for _, f := range s.snapshot() {
@@ -626,19 +637,27 @@ func (h *liveFollowUpHarness) finish() {
 
 func newCodexLiveHarness(t *testing.T, tracked bool) (*liveFollowUpHarness, *CodexAppServerSession) {
 	t.Helper()
+	return newCodexLiveHarnessAt(t, tracked, "0.168.0")
+}
+
+// newCodexLiveHarnessAt starts a Codex session launched from launchedVersion.
+// Its launch fields are set in the literal, before its reader runs.
+func newCodexLiveHarnessAt(t *testing.T, tracked bool, launchedVersion string) (*liveFollowUpHarness, *CodexAppServerSession) {
+	t.Helper()
 	pinLiveFollowUpKinds(t, map[string]string{claudeCodeCliAgentID: "2.1.322", codexCliAgentID: "0.168.0"})
 	h := newLiveFollowUpHarness(t, "cx1")
 	m := NewCodexAppServerManager(nil)
 	prev := globalCodexAppServerManager
 	globalCodexAppServerManager = m
 	t.Cleanup(func() { globalCodexAppServerManager = prev })
+	var tracker *liveFollowUpTracker
+	if tracked {
+		tracker = newLiveFollowUpTrackerFor(codexCliAgentID)
+	}
 	s := &CodexAppServerSession{
 		ID: h.sid, Stdin: h.child.stdinW, Stdout: h.child.stdoutR, Stderr: h.child.stderrR,
 		status: "running", done: make(chan struct{}), processExited: make(chan struct{}), streamDone: make(chan struct{}),
-		launchedVersion: "0.168.0",
-	}
-	if tracked {
-		s.liveFollowUps = newLiveFollowUpTrackerFor(codexCliAgentID)
+		launchedVersion: launchedVersion, liveFollowUps: tracker,
 	}
 	m.sessions[h.sid] = s
 	h.done = s.streamDone
@@ -913,8 +932,7 @@ func TestACodexLiveFollowUpIsFencedBeforeAnythingIsWritten(t *testing.T) {
 // A session launched before an in-place upgrade stays queued: Codex is gated
 // on its launched version too.
 func TestACodexLiveFollowUpIsGatedOnTheLaunchedVersion(t *testing.T) {
-	h, s := newCodexLiveHarness(t, true)
-	s.launchedVersion = "0.167.9"
+	h, _ := newCodexLiveHarnessAt(t, true, "0.167.9")
 	h.handle(h.codexCmd("att-v", "text"))
 	if n := len(h.child.framesWithMethod(codexMethodTurnSteer)); n != 0 {
 		t.Fatalf("a session launched below the minimum was written to")
