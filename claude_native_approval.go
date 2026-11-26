@@ -202,12 +202,46 @@ func (a *claudeApprovalState) restore(prev claudeApprovalSnapshot) {
 // Claude runs as a separate turn auto-approves even in a session whose
 // default asks, and its marks name it. Only with nothing queued does the
 // disposition return to the session's default.
+// stricterClaudeApproval returns whichever of two dispositions asks. Used to
+// keep an idle session from being more permissive than either its own default
+// or the last instruction that ran in it.
+func stricterClaudeApproval(a, b string) string {
+	if a == claudeApprovalAskPerson || b == claudeApprovalAskPerson {
+		return claudeApprovalAskPerson
+	}
+	return claudeApprovalAutoAllow
+}
+
 func (a *claudeApprovalState) settle() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if len(a.queued) == 0 {
 		a.turnOpen = false
-		a.disposition, a.instruction = a.defaultDisp, ""
+		// An idle session is never MORE permissive than its default, nor than
+		// the last instruction that ran. Work a turn starts outlives that
+		// turn's `result` - Claude runs its Agent tool in the background by
+		// default, and a sub-agent's messages "arrive after the session's own
+		// turn has ended" (shared-resources cliTurnCompletion.util.js, from
+		// the 2026-11-07 incident) - and its tool uses arrive as further
+		// can_use_tool prompts on the same channel. Idling straight back to
+		// the SESSION default would answer the tail of a VOICE instruction
+		// with a chat-started session's autoAllow, which is the one thing
+		// shared sessions must never do. So the idle disposition is the
+		// stricter of the default and the last attributed instruction. A chat
+		// session whose turns were all chat still idles autoAllow, exactly as
+		// before; it is only a session in which a VOICE instruction ran that
+		// keeps asking, until the next SEND names a disposition again. It
+		// keeps that instruction's id too, because an allow the device cannot
+		// attribute is read as a mismatch server-side (sessionInstructions
+		// verifyAutoAllowedApproval) and latches the session to asking.
+		idle, idleID := a.defaultDisp, ""
+		if a.lastAttributed != nil {
+			idle = stricterClaudeApproval(idle, a.lastAttributed.Disposition)
+			if idle == a.lastAttributed.Disposition {
+				idleID = a.lastAttributed.InstructionID
+			}
+		}
+		a.disposition, a.instruction = idle, idleID
 		a.queued = nil
 		return
 	}
@@ -228,7 +262,12 @@ func (a *claudeApprovalState) settle() {
 func (a *claudeApprovalState) decide() *claudeAutoApprovalMark {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !a.promptTool || a.disposition != claudeApprovalAutoAllow {
+	// Never answer a prompt this device cannot attribute to an instruction.
+	// An allow carrying no instruction id is read as a mismatch server-side,
+	// and a state with no attribution is one no instruction asked for: a
+	// prompt before the session's first SEND, or one after a turn whose
+	// instruction asked. Both must reach a person.
+	if !a.promptTool || a.disposition != claudeApprovalAutoAllow || a.instruction == "" {
 		return nil
 	}
 	return &claudeAutoApprovalMark{InstructionID: a.instruction, Disposition: claudeApprovalAutoAllow}
