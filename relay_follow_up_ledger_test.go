@@ -1415,6 +1415,14 @@ func (r *followUpStdinRecorder) written() int {
 // ledger and a capturing publisher for handleRelayFollowUpCommand.
 func installLiveFollowUpSession(t *testing.T) (*relayFollowUpLedger, *ClaudeNativeSession, *followUpStdinRecorder, *[]resultMsg) {
 	t.Helper()
+	return installLiveFollowUpSessionAt(t, "1.2.3")
+}
+
+// installLiveFollowUpSessionAt is installLiveFollowUpSession for a session
+// launched from launchedVersion (the installed Claude stays certified at
+// 1.2.3), set in the literal as Start sets it.
+func installLiveFollowUpSessionAt(t *testing.T, launchedVersion string) (*relayFollowUpLedger, *ClaudeNativeSession, *followUpStdinRecorder, *[]resultMsg) {
+	t.Helper()
 	resetFencedSessions(t)
 	l, _ := newEstablishedTestFollowUpLedger(t)
 	prevLedger := globalRelayFollowUpLedger
@@ -1425,7 +1433,7 @@ func installLiveFollowUpSession(t *testing.T) (*relayFollowUpLedger, *ClaudeNati
 	globalClaudeNativeManager = NewClaudeNativeManager(nil)
 	t.Cleanup(func() { globalClaudeNativeManager = prevManager })
 	stdin := &followUpStdinRecorder{}
-	session := &ClaudeNativeSession{ID: "s1", Stdin: stdin, status: "running", launchedVersion: "1.2.3"}
+	session := &ClaudeNativeSession{ID: "s1", Stdin: stdin, status: "running", launchedVersion: launchedVersion}
 	globalClaudeNativeManager.sessions["s1"] = session
 	var (
 		mu      sync.Mutex
@@ -1516,10 +1524,9 @@ func TestALiveFollowUpWithinItsExpiryIsWrittenAtTheStdinBoundary(t *testing.T) {
 func TestALiveFollowUpIsGatedOnTheSessionsLaunchedVersion(t *testing.T) {
 	for _, launched := range []string{"1.2.2", ""} {
 		t.Run("launched="+launched, func(t *testing.T) {
-			l, session, stdin, answers := installLiveFollowUpSession(t)
 			// The installed binary is certified (pinned at 1.2.3); the running
 			// child is not.
-			session.launchedVersion = launched
+			l, _, stdin, answers := installLiveFollowUpSessionAt(t, launched)
 			now := time.Now()
 			cmd := commandMsg{
 				ID:                       relayFollowUpEnvelopePrefix + "att-3",

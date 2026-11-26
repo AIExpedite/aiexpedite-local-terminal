@@ -20,11 +20,33 @@ const (
 	mspOtherTurn   = "01a1dc92-31ef-7000-8000-000000000099"
 )
 
-// newMSPLiveHarness starts a Muse Code MSP session on a fake host, through
-// the handshake terminal-service sends.
+// mspLiveHarnessOpts is what a Muse Code MSP session is launched with: the
+// version its child was started from, and the Muse minimum certified for live
+// follow-ups ("" leaves Muse off the list). Both are fixed before the session
+// exists, as Start fixes them: nothing writes a session's launch fields once
+// its reader runs (TestSessionLaunchFieldsAreSetOnlyInTheirLiteral).
+type mspLiveHarnessOpts struct {
+	LaunchedVersion string
+	CertifiedMin    string
+}
+
+// newMSPLiveHarness starts a certified Muse Code MSP session on a fake host,
+// through the handshake terminal-service sends.
 func newMSPLiveHarness(t *testing.T) (*liveFollowUpHarness, *ACPSession) {
 	t.Helper()
-	pinLiveFollowUpKinds(t, map[string]string{claudeCodeCliAgentID: "2.1.322", museCodeCliAgentID: museCodeMSPMinVersion})
+	return newMSPLiveHarnessWith(t, mspLiveHarnessOpts{LaunchedVersion: "1.4.20", CertifiedMin: museCodeMSPMinVersion})
+}
+
+// newMSPLiveHarnessWith starts a Muse Code MSP session launched as opts says.
+// Its tracker comes from the constructor Start uses, so a session launched
+// uncertified has none, from launch.
+func newMSPLiveHarnessWith(t *testing.T, opts mspLiveHarnessOpts) (*liveFollowUpHarness, *ACPSession) {
+	t.Helper()
+	certified := map[string]string{claudeCodeCliAgentID: "2.1.322"}
+	if opts.CertifiedMin != "" {
+		certified[museCodeCliAgentID] = opts.CertifiedMin
+	}
+	pinLiveFollowUpKinds(t, certified)
 	h := newLiveFollowUpHarness(t, "msp1")
 	m := newACPManager(nil, museCodeMSPProfile)
 	prev := globalMuseCodeMSPManager
@@ -37,8 +59,8 @@ func newMSPLiveHarness(t *testing.T) (*liveFollowUpHarness, *ACPSession) {
 	s := &ACPSession{
 		ID: h.sid, Stdin: h.child.stdinW, Stdout: h.child.stdoutR, Stderr: h.child.stderrR,
 		status: "running", done: make(chan struct{}), processExited: make(chan struct{}), streamDone: make(chan struct{}),
-		firstFrame: make(chan struct{}), launchedVersion: "1.4.20", WorkspaceRoot: root,
-		liveFollowUps: newLiveFollowUpTrackerFor(museCodeCliAgentID), fence: newACPClientFence(museCodeMSPProfile),
+		firstFrame: make(chan struct{}), launchedVersion: opts.LaunchedVersion, WorkspaceRoot: root,
+		liveFollowUps: newLiveFollowUpTracker(museCodeCliAgentID, opts.LaunchedVersion), fence: newACPClientFence(museCodeMSPProfile),
 	}
 	m.sessions[h.sid] = s
 	h.done = s.streamDone
@@ -54,7 +76,12 @@ func newMSPLiveHarness(t *testing.T) (*liveFollowUpHarness, *ACPSession) {
 			t.Fatal(err)
 		}
 	}
-	waitForLive(t, "the MSP session", func() bool { return s.liveFollowUps.mspSession() == mspTestSession })
+	waitForLive(t, "the MSP session", func() bool {
+		if s.liveFollowUps == nil {
+			return h.stream.hasOutput(`"id":"relay-msp-start","result"`)
+		}
+		return s.liveFollowUps.mspSession() == mspTestSession
+	})
 	return h, s
 }
 
@@ -92,7 +119,13 @@ func startMSPTurn(t *testing.T, h *liveFollowUpHarness, s *ACPSession) {
 	if err := globalMuseCodeMSPManager.Send(h.sid, `{"jsonrpc":"2.0","id":"relay-turn-t1","method":"turn/start","params":{"commandId":"`+mspTestTurn+`","sessionId":"`+mspTestSession+`","ifBusy":"queue","input":[{"type":"text","text":"Count slowly"}]}}`); err != nil {
 		t.Fatal(err)
 	}
-	waitForLive(t, "the running turn", func() bool { turn, _ := s.liveFollowUps.mspTurn(); return turn == mspTestTurn })
+	waitForLive(t, "the running turn", func() bool {
+		if s.liveFollowUps == nil {
+			return h.stream.hasOutput(`"method":"turn/started","params":{"turnId":"` + mspTestTurn + `"`)
+		}
+		turn, _ := s.liveFollowUps.mspTurn()
+		return turn == mspTestTurn
+	})
 }
 
 func (h *liveFollowUpHarness) mspCmd(attemptID, text, expectedTurnID string) commandMsg {
@@ -601,21 +634,87 @@ func TestAMuseCodeFollowUpRedeliveredWhileItsAnswerIsPendingPublishesNothing(t *
 }
 
 // A Muse Code the device does not list as certified (the list pinned here
-// without it, as before its 1.4.20 run) gets no tracker, and every live
-// attempt is refused notLiveKind, nothing written.
+// without it, as before its 1.4.20 run) is launched with no tracker, and every
+// live attempt is refused notLiveKind, nothing written.
 func TestAnUncertifiedMuseCodeSessionTakesNoLiveFollowUp(t *testing.T) {
-	h, s := newMSPLiveHarness(t)
+	h, s := newMSPLiveHarnessWith(t, mspLiveHarnessOpts{LaunchedVersion: "1.4.20"})
 	startMSPTurn(t, h, s)
-	pinLiveFollowUpKinds(t, map[string]string{claudeCodeCliAgentID: "2.1.322"})
-	s.liveFollowUps = newLiveFollowUpTracker(museCodeCliAgentID, s.launchedVersion)
+	wantMSPFollowUpRefusedNotLiveKind(t, h, s, "msp-u")
+}
+
+// Listed but too old at launch: a Muse Code started below the shipped minimum
+// gets no tracker, and its live attempts are refused notLiveKind.
+func TestAMuseCodeSessionLaunchedBelowItsMinimumTakesNoLiveFollowUp(t *testing.T) {
+	h, s := newMSPLiveHarnessWith(t, mspLiveHarnessOpts{LaunchedVersion: "1.4.19", CertifiedMin: shippedMuseCodeLiveMin(t)})
+	startMSPTurn(t, h, s)
+	wantMSPFollowUpRefusedNotLiveKind(t, h, s, "msp-old")
+}
+
+// The verdict is the launch's: whatever the installed Muse reads as afterwards,
+// a running session keeps the live eligibility it was started with.
+func TestAMuseCodeSessionKeepsItsLaunchVerdictAfterMuseIsUpdated(t *testing.T) {
+	for _, installed := range []struct {
+		name string
+		bin  mspDriverBinary
+	}{
+		{"uninstalled", mspDriverBinary{}},
+		{"downgraded", qualifyingMuse(filepath.Join(t.TempDir(), "muse"), "1.4.14")},
+	} {
+		t.Run("launched certified, then "+installed.name, func(t *testing.T) {
+			h, s := newMSPLiveHarness(t)
+			startMSPTurn(t, h, s)
+			pinMSPDriverBinary(t, installed.bin)
+			if v := liveFollowUpInstalledVersion(museCodeCliAgentID); v != "" {
+				t.Fatalf("the installed Muse still reads as live-capable: %q", v)
+			}
+			h.child.setRespond(mspHostAnswers(mspAbsorbed))
+			h.handle(h.mspCmd("msp-up-"+installed.name, "still here?", mspTestTurn))
+			if n := len(h.child.framesWithMethod(mspMethodTurnSteer)); n != 1 {
+				t.Fatalf("want one steer, got %d", n)
+			}
+			wantAck(t, h.acks.snapshot()[0], followUpOutcomeWritten, "", followUpProcessedInCurrent)
+		})
+	}
+	t.Run("launched below the minimum, then upgraded", func(t *testing.T) {
+		minVersion := shippedMuseCodeLiveMin(t)
+		h, s := newMSPLiveHarnessWith(t, mspLiveHarnessOpts{LaunchedVersion: "1.4.19", CertifiedMin: minVersion})
+		startMSPTurn(t, h, s)
+		pinMSPDriverBinary(t, qualifyingMuse(filepath.Join(t.TempDir(), "muse"), minVersion))
+		if v := liveFollowUpInstalledVersion(museCodeCliAgentID); v != minVersion {
+			t.Fatalf("the upgraded Muse reads as %q", v)
+		}
+		wantMSPFollowUpRefusedNotLiveKind(t, h, s, "msp-upgraded")
+	})
+}
+
+// shippedMuseCodeLiveMin is the Muse minimum liveFollowUpCertified ships,
+// read before any test pins the list.
+func shippedMuseCodeLiveMin(t *testing.T) string {
+	t.Helper()
+	v := liveFollowUpCertified[museCodeCliAgentID]
+	if v != "1.4.20" {
+		t.Fatalf("the shipped Muse minimum is %q; the launch versions here assume 1.4.20", v)
+	}
+	return v
+}
+
+// wantMSPFollowUpRefusedNotLiveKind checks a session launched uncertified:
+// it has no tracker, and a follow-up into its running turn is answered
+// notWritten/notLiveKind with no steer written.
+func wantMSPFollowUpRefusedNotLiveKind(t *testing.T, h *liveFollowUpHarness, s *ACPSession, attemptID string) {
+	t.Helper()
 	if s.liveFollowUps != nil {
 		t.Fatal("an uncertified Muse session got a tracker")
 	}
-	h.handle(h.mspCmd("msp-u", "x", mspTestTurn))
+	h.handle(h.mspCmd(attemptID, "x", mspTestTurn))
 	if n := len(h.child.framesWithMethod(mspMethodTurnSteer)); n != 0 {
 		t.Fatalf("%d steers written", n)
 	}
-	wantAck(t, h.acks.snapshot()[0], followUpOutcomeNotWritten, followUpReasonNotLiveKind, "")
+	acks := h.acks.snapshot()
+	if len(acks) != 1 {
+		t.Fatalf("want one ack, got %+v", acks)
+	}
+	wantAck(t, acks[0], followUpOutcomeNotWritten, followUpReasonNotLiveKind, "")
 }
 
 // The tracker's own reading of the host: the session from the setup answer,
