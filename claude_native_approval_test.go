@@ -102,15 +102,25 @@ func TestClaudeApproval_MidTurnOnlyLowers(t *testing.T) {
 // A turn settling returns to the default, except after an asking instruction
 // was written mid-turn: Claude may run it as the next turn, which asks too and
 // stays open until its own result.
-func TestClaudeApproval_SettleReturnsToDefaultUnlessAnAskWasCarried(t *testing.T) {
+// An idle session is never more permissive than the last instruction that ran
+// in it. Work a turn starts outlives that turn's `result` - Claude runs its
+// Agent tool in the background and a sub-agent's messages "arrive after the
+// session's own turn has ended" (shared-resources cliTurnCompletion.util.js,
+// 2026-11-07) - and its tool uses arrive as further can_use_tool prompts. So a
+// settled VOICE turn must leave a chat-started session asking until the next
+// SEND names a disposition, or that voice instruction's tail is auto-approved.
+func TestClaudeApproval_SettledVoiceTurnKeepsAskingUntilTheNextSend(t *testing.T) {
 	a := newClaudeApprovalState(true, claudeApprovalAutoAllow)
 	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-1"})
 	a.settle()
-	if a.decide() == nil {
-		t.Fatal("a settled voice turn left the chat session asking (it opened no follow-up)")
+	if a.decide() != nil {
+		t.Fatal("the tail of a settled voice turn was auto-approved in a chat session")
 	}
 
 	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-2"})
+	if a.decide() == nil {
+		t.Fatal("a chat SEND after a voice turn did not restore its own allow")
+	}
 	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-3"})
 	a.settle()
 	if a.decide() != nil {
@@ -120,8 +130,8 @@ func TestClaudeApproval_SettleReturnsToDefaultUnlessAnAskWasCarried(t *testing.T
 		t.Fatalf("carried turn = %s/%s, want askPerson/voice-3", d, id)
 	}
 	a.settle() // the carried voice turn's own result
-	if a.decide() == nil {
-		t.Fatal("the carried ask outlived its own turn")
+	if a.decide() != nil {
+		t.Fatal("the tail of the carried voice turn was auto-approved")
 	}
 	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-4"})
 	if a.decide() == nil {
@@ -164,8 +174,8 @@ func TestClaudeApproval_ChatSendCannotRaiseACarriedVoiceTurn(t *testing.T) {
 		t.Fatalf("chained carry = %s/%s, want askPerson/voice-3", d, id)
 	}
 	b.settle()
-	if b.decide() == nil {
-		t.Fatal("the chained carry outlived its own turn")
+	if b.decide() != nil {
+		t.Fatal("the tail of the chained voice carry was auto-approved")
 	}
 }
 
@@ -173,9 +183,17 @@ func TestClaudeApproval_ChatSendCannotRaiseACarriedVoiceTurn(t *testing.T) {
 // session's default when there is none.
 func TestClaudeApproval_UnattributedSendInherits(t *testing.T) {
 	a := newClaudeApprovalState(true, claudeApprovalAutoAllow)
-	a.beginTurn(claudeTurnApproval{})
+	a.beginTurn(claudeTurnApproval{InstructionID: "chat-0"})
 	if a.decide() == nil {
 		t.Fatal("an unattributed first SEND did not take the autoAllow default")
+	}
+	// A SEND naming NO instruction either is never answered by this device:
+	// an allow it cannot attribute is read as a mismatch server-side, so it
+	// goes to a person instead.
+	nameless := newClaudeApprovalState(true, claudeApprovalAutoAllow)
+	nameless.beginTurn(claudeTurnApproval{})
+	if nameless.decide() != nil {
+		t.Fatal("a SEND naming no instruction was auto-approved")
 	}
 	a.settle()
 	a.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAskPerson, InstructionID: "voice-1"})
@@ -546,8 +564,8 @@ func TestClaudeApproval_EveryQueuedVoiceInstructionKeepsItsTurnAsking(t *testing
 		t.Fatalf("after voice-2 = %s/%s, want askPerson/voice-3", d, id)
 	}
 	a.settle() // voice-3's result
-	if a.decide() == nil {
-		t.Fatal("the queued asks outlived their own turns")
+	if a.decide() != nil {
+		t.Fatal("the tail of the queued voice turns was auto-approved")
 	}
 
 	// chat-1, then voice-2, chat-3, voice-4 queued: the chat turn between the
@@ -567,8 +585,13 @@ func TestClaudeApproval_EveryQueuedVoiceInstructionKeepsItsTurnAsking(t *testing
 		t.Fatal("voice-4's turn auto-approved")
 	}
 	b.settle() // voice-4
-	if b.decide() == nil {
-		t.Fatal("the session did not return to its default after the last queued ask")
+	if b.decide() != nil {
+		t.Fatal("the tail of the last queued voice turn was auto-approved")
+	}
+	// Only a SEND naming a disposition puts the session back on chat's allow.
+	b.beginTurn(claudeTurnApproval{Disposition: claudeApprovalAutoAllow, InstructionID: "chat-5"})
+	if mark := b.decide(); mark == nil || mark.InstructionID != "chat-5" {
+		t.Fatalf("the chat SEND after the queue drained = %+v, want allowed as chat-5", mark)
 	}
 }
 
@@ -606,8 +629,15 @@ func TestClaudeApproval_QueuedChatInstructionKeepsItsAllowAndAttribution(t *test
 		t.Fatalf("after chat-2 = %+v, want allowed as chat-3", mark)
 	}
 	chatStarted.settle() // chat-3's result
-	if d, id := chatStarted.current(); d != claudeApprovalAutoAllow || id != "" {
-		t.Fatalf("after the queue drained = %s/%q, want the default autoAllow with no instruction", d, id)
+	// The drained session idles on the last instruction that ran: its allow,
+	// and its id. The id matters - work chat-3 started in the background
+	// raises prompts after its own result, and an allow carrying no id is
+	// read as a mismatch server-side and latches the session to asking.
+	if d, id := chatStarted.current(); d != claudeApprovalAutoAllow || id != "chat-3" {
+		t.Fatalf("after the queue drained = %s/%q, want autoAllow attributed to chat-3", d, id)
+	}
+	if mark := chatStarted.decide(); mark == nil || mark.InstructionID != "chat-3" {
+		t.Fatalf("the drained chat session's own background work = %+v, want allowed as chat-3", mark)
 	}
 
 	// A voice instruction written into the promoted chat turn still lowers it.
