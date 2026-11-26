@@ -191,6 +191,16 @@ func (a *claudeApprovalState) restore(prev claudeApprovalSnapshot) {
 	a.queued = prev.queued
 }
 
+// stricterClaudeApproval returns whichever of two dispositions asks. Used to
+// keep an idle session from being more permissive than either its own default
+// or the last instruction that ran in it.
+func stricterClaudeApproval(a, b string) string {
+	if a == claudeApprovalAskPerson || b == claudeApprovalAskPerson {
+		return claudeApprovalAskPerson
+	}
+	return claudeApprovalAutoAllow
+}
+
 // settle ends the open turn (Claude's `result`) and retires the oldest queued
 // instruction, which Claude may now be running as the next turn. While that
 // one or any later queued instruction asks, the turn stays OPEN and asking,
@@ -202,16 +212,6 @@ func (a *claudeApprovalState) restore(prev claudeApprovalSnapshot) {
 // Claude runs as a separate turn auto-approves even in a session whose
 // default asks, and its marks name it. Only with nothing queued does the
 // disposition return to the session's default.
-// stricterClaudeApproval returns whichever of two dispositions asks. Used to
-// keep an idle session from being more permissive than either its own default
-// or the last instruction that ran in it.
-func stricterClaudeApproval(a, b string) string {
-	if a == claudeApprovalAskPerson || b == claudeApprovalAskPerson {
-		return claudeApprovalAskPerson
-	}
-	return claudeApprovalAutoAllow
-}
-
 func (a *claudeApprovalState) settle() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
