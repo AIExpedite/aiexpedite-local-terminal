@@ -10,9 +10,9 @@ import (
 )
 
 // sessionLaunchFields are set once, in a session's literal, from what its
-// child was launched with. Every stream reader reads them without a lock
-// (ACPManager.readStream reads liveFollowUps on every frame), which is correct
-// only while nothing writes them after construction.
+// child was launched with. The stream readers and the follow-up gate read them
+// without a lock (ACPManager.readStream reads liveFollowUps on every frame),
+// which is correct only while nothing writes them after construction.
 var sessionLaunchFields = map[string]bool{"liveFollowUps": true, "launchedVersion": true}
 
 // A write to a launch field after the session literal — in a test or in the
@@ -29,7 +29,7 @@ func TestSessionLaunchFieldsAreSetOnlyInTheirLiteral(t *testing.T) {
 	var violations []string
 	literalKeys := map[string]bool{}
 	for _, name := range files {
-		file, err := parser.ParseFile(fset, name, nil, 0)
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}

@@ -642,12 +642,17 @@ func TestAnUncertifiedMuseCodeSessionTakesNoLiveFollowUp(t *testing.T) {
 	wantMSPFollowUpRefusedNotLiveKind(t, h, s, "msp-u")
 }
 
-// Listed but too old at launch: a Muse Code started below the shipped minimum
-// gets no tracker, and its live attempts are refused notLiveKind.
+// Listed but not certified at launch: a Muse Code started below the shipped
+// minimum, or whose launch version could not be read, gets no tracker, and its
+// live attempts are refused notLiveKind.
 func TestAMuseCodeSessionLaunchedBelowItsMinimumTakesNoLiveFollowUp(t *testing.T) {
-	h, s := newMSPLiveHarnessWith(t, mspLiveHarnessOpts{LaunchedVersion: "1.4.19", CertifiedMin: shippedMuseCodeLiveMin(t)})
-	startMSPTurn(t, h, s)
-	wantMSPFollowUpRefusedNotLiveKind(t, h, s, "msp-old")
+	for _, launched := range []string{"1.4.19", ""} {
+		t.Run("launched="+launched, func(t *testing.T) {
+			h, s := newMSPLiveHarnessWith(t, mspLiveHarnessOpts{LaunchedVersion: launched, CertifiedMin: shippedMuseCodeLiveMin(t)})
+			startMSPTurn(t, h, s)
+			wantMSPFollowUpRefusedNotLiveKind(t, h, s, "msp-old")
+		})
+	}
 }
 
 // The verdict is the launch's: whatever the installed Muse reads as afterwards,
