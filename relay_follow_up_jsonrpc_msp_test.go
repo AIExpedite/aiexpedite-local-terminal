@@ -677,7 +677,11 @@ func TestAMuseCodeSessionKeepsItsLaunchVerdictAfterMuseIsUpdated(t *testing.T) {
 			if n := len(h.child.framesWithMethod(mspMethodTurnSteer)); n != 1 {
 				t.Fatalf("want one steer, got %d", n)
 			}
-			wantAck(t, h.acks.snapshot()[0], followUpOutcomeWritten, "", followUpProcessedInCurrent)
+			acks := h.acks.snapshot()
+			if len(acks) != 1 {
+				t.Fatalf("want one ack, got %+v", acks)
+			}
+			wantAck(t, acks[0], followUpOutcomeWritten, "", followUpProcessedInCurrent)
 		})
 	}
 	t.Run("launched below the minimum, then upgraded", func(t *testing.T) {
