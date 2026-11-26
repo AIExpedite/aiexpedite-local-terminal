@@ -29,11 +29,15 @@ import (
 // leak on purpose shortens it.
 var antigravityStateQuietBound = 30 * time.Second
 
-// antigravityStateLeak names the first condition that makes the process unfit
-// to arm a new Antigravity test on, or "" when it is quiet. Flags come first:
-// they are a previous test's cleanup that never ran, and no amount of waiting
-// clears them.
-func antigravityStateLeak() string {
+// antigravityStateFlagLeak names the first NON-DRAINABLE condition, or "" when
+// there is none. These two are a previous test's cleanup that never ran, and
+// nothing clears them on its own: only Finish closes antigravityCaptureStop,
+// and the capture goroutine blocks on <-stop in every exit path. So waiting on
+// one spends the whole bound and then fails anyway - with 62 fixture call
+// sites and a suite CI measures at 530-600 s against `go test -timeout 20m`,
+// one leaked poller would walk the package into its deadline, taking every
+// later test's result with it. Report these on the first look.
+func antigravityStateFlagLeak() string {
 	if antigravityDiscoveryRunning() {
 		return "the discovery tick is still running"
 	}
@@ -42,6 +46,13 @@ func antigravityStateLeak() string {
 	default:
 		return "a capture poller is still running"
 	}
+	return ""
+}
+
+// antigravityStateDrainingLeak names the first condition a wait CAN clear - a
+// worker claim, a pending re-arm, writes in flight, an armed rung - or "" when
+// none holds. This is the only set worth polling to a deadline.
+func antigravityStateDrainingLeak() string {
 	antigravityRefreshWorkerMu.Lock()
 	running, rearm := antigravityRefreshWorkerRunning, antigravityRefreshWorkerRearm
 	antigravityRefreshWorkerMu.Unlock()
@@ -58,6 +69,26 @@ func antigravityStateLeak() string {
 		return "a run-debt retry rung is still armed"
 	}
 	return ""
+}
+
+// antigravityStateLeak names the first condition that makes the process unfit
+// to arm a new Antigravity test on, or "" when it is quiet. Flags come first:
+// they are a previous test's cleanup that never ran, and no amount of waiting
+// clears them.
+func antigravityStateLeak() string {
+	if reason := antigravityStateFlagLeak(); reason != "" {
+		return reason
+	}
+	return antigravityStateDrainingLeak()
+}
+
+// antigravityQuietLeak reports the first condition still holding after giving
+// the DRAINABLE ones up to `within` to clear, and a flag immediately.
+func antigravityQuietLeak(within time.Duration) string {
+	if reason := antigravityStateFlagLeak(); reason != "" {
+		return reason
+	}
+	return waitAntigravityQuiet(within, antigravityStateDrainingLeak)
 }
 
 // waitAntigravityQuiet polls `leak` until it reports nothing or `within`
@@ -80,7 +111,7 @@ func waitAntigravityQuiet(within time.Duration, leak func() string) string {
 // when one was booked during that stop's own wait.
 func requireAntigravityStateQuiet(tb testing.TB) {
 	tb.Helper()
-	if reason := waitAntigravityQuiet(antigravityStateQuietBound, antigravityStateLeak); reason != "" {
+	if reason := antigravityQuietLeak(antigravityStateQuietBound); reason != "" {
 		tb.Fatalf("Antigravity usage state is not quiet: %s — a previous test's cleanup did not run "+
 			"or did not drain [%s]", reason, antigravityStateForTest(antigravityQuotaCachePath()))
 	}
@@ -94,7 +125,7 @@ func requireAntigravityStateQuiet(tb testing.TB) {
 func requireAntigravityDrained(tb testing.TB) {
 	tb.Helper()
 	helperStopAntigravityRefreshSchedule()
-	if reason := waitAntigravityQuiet(antigravityStateQuietBound, antigravityStateLeak); reason != "" {
+	if reason := antigravityQuietLeak(antigravityStateQuietBound); reason != "" {
 		tb.Errorf("this test left Antigravity usage state running past its end: %s [%s]",
 			reason, antigravityStateForTest(antigravityQuotaCachePath()))
 	}

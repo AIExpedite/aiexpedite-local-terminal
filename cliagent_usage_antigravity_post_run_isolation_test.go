@@ -375,3 +375,74 @@ func TestPruneRealAntigravityFromPath_DropsOnlyAgyDirs(t *testing.T) {
 		t.Errorf("pruned=%q, want only the agy-only dir", prunedAntigravityPathEntries)
 	}
 }
+
+// A FLAG - the discovery tick or a capture poller - is a previous test's
+// cleanup that never ran, and nothing clears it on its own: only Finish closes
+// antigravityCaptureStop, and the capture goroutine blocks on <-stop in every
+// exit path. Polling one to the 30 s bound spends the bound and then fails
+// anyway, and with 62 fixture call sites against `go test -timeout 20m` over a
+// suite CI measures at 530-600 s, one leaked poller would walk the whole
+// package into its deadline - losing every later test's result, not just this
+// one's. So a flag is reported on the first look; only the drainable
+// conditions get the wait.
+func TestAntigravityStateQuiet_FlagIsReportedWithoutWaiting(t *testing.T) {
+	home, cache := helperIsolateAntigravityCapture(t, "50ms")
+	_, _ = home, cache
+
+	origBound := antigravityStateQuietBound
+	// Far longer than this test may take: if the flag were polled, the call
+	// below would sit here for the whole bound.
+	antigravityStateQuietBound = 30 * time.Second
+	t.Cleanup(func() { antigravityStateQuietBound = origBound })
+
+	finish := startAntigravityQuotaCapture("flag leak").Finish
+
+	rec := &helperRecordingTB{TB: t}
+	started := time.Now()
+	requireAntigravityStateQuiet(rec)
+	elapsed := time.Since(started)
+
+	helperStopCapture(t, finish)
+
+	got := rec.recorded()
+	if !strings.Contains(got, "a capture poller is still running") {
+		t.Errorf("recorded=%q, want the running poller named", got)
+	}
+	// Generous against a loaded CI box, and still two orders of magnitude
+	// below the bound it must not have waited.
+	if elapsed > 2*time.Second {
+		t.Errorf("requireAntigravityStateQuiet took %s on a non-drainable flag, want it reported "+
+			"on the first look (bound was %s)", elapsed, antigravityStateQuietBound)
+	}
+}
+
+// The drainable half keeps its wait: a condition that clears on its own must
+// not be reported the instant it is seen.
+func TestAntigravityStateQuiet_DrainableConditionStillWaits(t *testing.T) {
+	helperStopAntigravityRefreshSchedule()
+	if reason := antigravityStateFlagLeak(); reason != "" {
+		t.Skipf("a flag from an earlier test holds (%s); this case needs a quiet process", reason)
+	}
+
+	cleared := make(chan struct{})
+	calls := 0
+	leak := func() string {
+		calls++
+		select {
+		case <-cleared:
+			return ""
+		default:
+			return "pretend write in flight"
+		}
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		close(cleared)
+	}()
+	if reason := waitAntigravityQuiet(5*time.Second, leak); reason != "" {
+		t.Errorf("waitAntigravityQuiet=%q, want it to wait the condition out", reason)
+	}
+	if calls < 2 {
+		t.Errorf("leak polled %d time(s), want it polled until it cleared", calls)
+	}
+}
