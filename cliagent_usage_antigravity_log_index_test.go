@@ -884,6 +884,9 @@ func TestAntigravityDiscovery_TickStartsAndStops(t *testing.T) {
 	orig := antigravityDiscoveryInterval
 	antigravityDiscoveryInterval = 5 * time.Millisecond
 	defer func() { antigravityDiscoveryInterval = orig }()
+	// A t.Fatal before the stop below would otherwise leave the tick running
+	// for the rest of the process (stopAntigravityDiscovery is idempotent).
+	t.Cleanup(stopAntigravityDiscovery)
 	startAntigravityDiscovery()
 	startAntigravityDiscovery() // no second ticker
 	if !antigravityDiscoveryRunning() {

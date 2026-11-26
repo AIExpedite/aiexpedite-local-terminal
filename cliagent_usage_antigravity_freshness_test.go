@@ -283,10 +283,14 @@ func helperAwaitDebt(t *testing.T, why string) antigravityUsageFreshness {
 // returns the reading that paid it.
 func helperAwaitPaidRefresh(t *testing.T, cache string, after time.Time) antigravityQuotaSnapshot {
 	t.Helper()
-	antigravityUsageRefreshWaitIdle()
+	// Checked, not best effort: a worker still in flight after the bound
+	// would otherwise surface later as a miscounted read.
+	if !antigravityUsageRefreshWaitIdleFor(antigravityStateQuietBound) {
+		t.Fatalf("the refresh worker never went idle [%s]", antigravityStateForTest(cache))
+	}
 	snap := helperAwaitSnapshot(t, cache, after, "the Code Assist reading the finished run owed")
 	if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
-		t.Errorf("the debt survived the reading that covers it: %+v", state)
+		t.Errorf("the debt survived the reading that covers it: %+v [%s]", state, antigravityStateForTest(cache))
 	}
 	return snap
 }

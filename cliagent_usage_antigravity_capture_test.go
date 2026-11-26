@@ -76,23 +76,25 @@ func helperStartCaptureServerFunc(t *testing.T, base string, quotaJSON func() st
 }
 
 // helperIsolateAntigravityCapture points HOME, the quota cache, the capture
-// tick and the post-release tail window at test-owned locations, and asserts no previous poller is still alive.
-// Capture state is process-global by design (one poller for every concurrent
-// `agy` run), so these tests must not run in parallel with each other.
+// tick and the post-release tail window at test-owned locations, and asserts
+// nothing an earlier test started is still running: no poller, no discovery
+// tick, no debt worker or re-arm, no background write, no rung
+// (requireAntigravityStateQuiet). Capture state is process-global by design
+// (one poller for every concurrent `agy` run), so these tests must not run in
+// parallel with each other.
 func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache string) {
 	t.Helper()
-	select {
-	case <-antigravityCaptureStopped():
-	default:
-		t.Fatal("a capture poller from an earlier test is still running")
-	}
+	// A rung a non-Antigravity test left on the shipped ladder is cancelled
+	// here, as before, rather than failing every Antigravity test after it.
 	helperStopAntigravityRefreshSchedule()
+	requireAntigravityStateQuiet(t)
 	antigravityCaptureArms.Store(0)
 	antigravityCaptureFinishes.Store(0)
 	antigravityCaptureSnapshots.Store(0)
 	antigravityCaptureTailProbes.Store(0)
 	antigravityCaptureLastPersistedMs.Store(0)
 	helperResetAntigravityLiveRuns()
+	resetAntigravityProcessMemory()
 	// The run-completion debt is process-global too, and a run that captures
 	// nothing now owes an OUTBOUND Google read. Point the state file at the
 	// test's own dir and stub that read, so no test reaches the network or the
@@ -108,6 +110,11 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 		helperStopAntigravityRefreshSchedule()
 		antigravityRefreshAfterRunRetryDelay = origRetry
 	})
+	// Registered after the restore above, so it runs BEFORE it (cleanups run
+	// last-in, first-out) and fails the test that leaked rather than the next
+	// one. It stops the schedule itself first, so running ahead of the stop
+	// above reports nothing that stop would have cancelled.
+	t.Cleanup(func() { requireAntigravityDrained(t) })
 	// A debt is retired WITHOUT an attempt when `agy` is not on the machine, so
 	// whether a capture test exercises the worker at all would otherwise depend
 	// on the developer happening to have the CLI installed — green on a dev box,

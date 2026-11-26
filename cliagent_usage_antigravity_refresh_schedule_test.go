@@ -37,7 +37,9 @@ func helperDrainAntigravityRefreshSchedule(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the refresh schedule never drained")
+			t.Fatalf("the refresh schedule never drained: %s [%s]",
+				firstNonEmpty(antigravityStateLeak(), "nothing still holds"),
+				antigravityStateForTest(antigravityQuotaCachePath()))
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
